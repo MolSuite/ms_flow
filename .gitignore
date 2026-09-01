@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Benchmark output (disposable, large)
+.bench_runs/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# Envs
+.venv/
+venv/
+
+# Artefactos de corridas (ejemplos, proyectos de prueba)
+demo_project/
+chunk_payloads/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Agentes / herramientas locales
+.claude/
+.aiassistant/
+
+.idea/

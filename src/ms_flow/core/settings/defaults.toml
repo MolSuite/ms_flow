@@ -1,0 +1,42 @@
+data_dir = "data"
+
+[general]
+poll_interval = 0.1
+log_level = "INFO"
+
+[operational_limits]
+operational_profile = "balanced"
+max_inline_chunk_payload_bytes = 524288
+max_spool_payload_bytes = 67108864
+staging_max_workers = 8
+default_max_inflight_tasks = 16
+default_max_inflight_items = 256
+progress_flush_interval_s = 2.0
+output_sink_flush_retries = 3
+output_sink_retry_backoff_s = 0.05
+output_sink_max_buffer_factor = 10
+output_sink_max_buffer_bytes = 16777216
+output_sink_max_payload_bytes = 4194304
+output_sink_max_pending_chunks = 1024
+output_sink_max_pending_bytes = 268435456
+
+[logging]
+max_file_size_mb = 10
+backup_count = 10
+retention_days = 30
+queue_size = 10000
+app_level = "INFO"
+executor_level = "INFO"
+project_level = "INFO"
+console_level = "INFO"
+
+[database]
+connection_timeout = 30
+
+[resources.local]
+cpus = -1
+gpus = -1
+max_threads = -1
+max_processes = -1
+
+[workers]

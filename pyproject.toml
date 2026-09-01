@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=77,<=84.0.0", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ms_flow"
+dynamic = ["version"]  # from the git tag, see [tool.setuptools_scm]
+description = "In-process, desktop-first, domain-agnostic job/task/executor orchestrator for massive data flows."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Mario S. Valdés-Tresanco" },
+    { name = "Mario E. Valdés-Tresanco" },
+    { name = "Ernesto Moreno" },
+    { name = "Pedro A. Valiente" },
+]
+keywords = ["orchestration", "executor", "jobs", "pipeline", "scientific-computing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+
+# Core runtime: control plane + SQLite-backed persistence. loky is the local
+# compute backend (hard dependency); ray and the PySide6 UI are optional —
+# see [project.optional-dependencies].
+dependencies = [
+    "blinker>=1.6",
+    "loky>=3.0",
+    "pydantic>=2.0",
+    "sqlalchemy>=2.0",
+    "sqlmodel>=0.0.14",
+    "toml>=0.10",
+]
+
+[project.optional-dependencies]
+# Ray executor (native and external modes) for distributed compute.
+ray = ["ray>=2.6"]
+# Optional PostgreSQL operational/project stores.
+postgresql = ["psycopg2-binary>=2.9"]
+# Desktop UI components (project browser, monitor, table views).
+ui = ["PySide6>=6.5"]
+# Test + development tooling.
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/MolSuite/ms_flow"
+Documentation = "https://github.com/MolSuite/ms_flow/tree/main/docs"
+Issues = "https://github.com/MolSuite/ms_flow/issues"
+
+# The release tag is the only version there is: nothing to bump by hand, and
+# a tag that does not match the metadata becomes impossible.
+[tool.setuptools_scm]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ms_flow = ["core/settings/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `ms_flow` vive en src/ y los benchmarks en benchmarks/. Con esto pytest los pone en
+# sys.path el solo: ningun test necesita tocar sys.path a mano.
+pythonpath = ["src", "."]
+markers = [
+    "slow: tarda segundos (benchmarks y escenarios de concurrencia). Excluir con -m 'not slow'.",
+]
+# Quieten the multiprocessing fork warning emitted by process-pool benchmarks.
+filterwarnings = [
+    "ignore::DeprecationWarning:multiprocessing.popen_fork",
+]
