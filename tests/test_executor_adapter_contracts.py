@@ -153,3 +153,41 @@ def test_process_pool_loky_adapter_reports_progress():
         assert latest_progress is None or latest_progress >= 25.0
     finally:
         adapter.shutdown()
+
+
+@pytest.mark.skipif(not LOKY_INSTALLED, reason="loky is not installed")
+def test_process_pool_loky_cancels_one_job_without_killing_another():
+    adapter = LokyProcessExecutorAdapter(
+        name="process-pool-loky-cooperative-cancel",
+        max_workers=2,
+        timeout_s=10.0,
+        kill_workers_on_shutdown=True,
+    )
+    try:
+        first = adapter.submit(
+            "job-a", "chunk-a", {"steps": 100, "sleep": 0.02},
+            {"module": __name__, "fn": "_contract_progress"}, lambda _value: None,
+        )
+        second = adapter.submit(
+            "job-b", "chunk-b", {"steps": 10, "sleep": 0.02},
+            {"module": __name__, "fn": "_contract_progress"}, lambda _value: None,
+        )
+        deadline = time.time() + 5.0
+        while time.time() < deadline and adapter.drain_progress(first) is None:
+            time.sleep(0.01)
+        assert adapter.cancel(first) is True
+
+        states = {}
+        while time.time() < deadline and len(states) < 2:
+            for name, handle in (("first", first), ("second", second)):
+                if name in states:
+                    continue
+                state, payload, error = adapter.poll(handle)
+                if state != "RUNNING":
+                    states[name] = (state, payload, error)
+            time.sleep(0.01)
+        assert states["first"][0] == "FAILED"
+        assert "cancel" in str(states["first"][2]).lower()
+        assert states["second"][:2] == ("DONE", {"result": {"steps": 10}})
+    finally:
+        adapter.shutdown()

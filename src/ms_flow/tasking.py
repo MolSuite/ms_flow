@@ -345,6 +345,8 @@ class JobDefinition:
     params_model: Optional[type[BaseModel]] = None
     chunker: Optional[Callable[..., Any]] = None
     chunker_ref: str = ""
+    chunk_counter: Optional[Callable[..., Any]] = None
+    chunk_counter_ref: str = ""
     setup: Optional[Callable[..., Any]] = None
     setup_ref: str = ""
     stage_chunk: Optional[Callable[..., Any]] = None
@@ -385,6 +387,9 @@ class JobDefinition:
         object.__setattr__(self, "cpu_required", max(1, int(self.cpu_required or self.task.cpu_required)))
 
         chunker_ref = self.chunker_ref or (callable_ref(self.chunker) if self.chunker is not None else "")
+        chunk_counter_ref = self.chunk_counter_ref or (
+            callable_ref(self.chunk_counter) if self.chunk_counter is not None else ""
+        )
         setup_ref = self.setup_ref or (callable_ref(self.setup) if self.setup is not None else "")
         stage_chunk_ref = self.stage_chunk_ref or (callable_ref(self.stage_chunk) if self.stage_chunk is not None else "")
         finalize_ref = self.finalize_ref or (callable_ref(self.finalize) if self.finalize is not None else "")
@@ -399,6 +404,11 @@ class JobDefinition:
                 "Use 'fail_fast' or 'continue_with_threshold'."
             )
         object.__setattr__(self, "chunker_ref", validate_importable_ref(chunker_ref, label="chunker_ref"))
+        object.__setattr__(
+            self,
+            "chunk_counter_ref",
+            validate_importable_ref(chunk_counter_ref, label="chunk_counter_ref"),
+        )
         object.__setattr__(self, "setup_ref", validate_importable_ref(setup_ref, label="setup_ref"))
         object.__setattr__(self, "stage_chunk_ref", validate_importable_ref(stage_chunk_ref, label="stage_chunk_ref"))
         object.__setattr__(self, "finalize_ref", validate_importable_ref(finalize_ref, label="finalize_ref"))
@@ -419,6 +429,8 @@ class JobDefinition:
             data["task"] = self.task
         if "chunker" not in data:
             data["chunker"] = self.chunker
+        if "chunk_counter" not in data:
+            data["chunk_counter"] = self.chunk_counter
         if "setup" not in data:
             data["setup"] = self.setup
         if "stage_chunk" not in data:
@@ -464,6 +476,16 @@ class JobDefinition:
                 yield self.task.validate_payload(item)
 
         return _iter()
+
+    def count_chunks(self, params: dict | BaseModel, *, config: Optional[dict] = None) -> int | None:
+        """Return the declared feed size without materializing its chunks, when available."""
+        counter = self.chunk_counter
+        if counter is None and self.chunk_counter_ref:
+            counter = resolve_callable_ref(self.chunk_counter_ref)
+        if counter is None:
+            return None
+        value = _call_with_optional_config(counter, self.validate_params(params), dict(config or {}))
+        return max(0, int(value))
 
     def build_result_handler(self, *args, **kwargs):
         if self.result_handler_factory is not None:
@@ -630,12 +652,14 @@ class JobSpec:
         stage_chunk = cls._optional_callable("stage_chunk")
         finalize = cls._optional_callable("finalize")
         result_handler_factory = cls._optional_callable("result_handler_factory")
+        chunk_counter = cls._optional_callable("count_chunks")
         return JobDefinition(
             name=normalized_name,
             task=cls.to_task_definition(),
             description=str(cls.description or ""),
             params_model=cls.params_model,
             chunker=cls.build_chunks,
+            chunk_counter=chunk_counter,
             setup=setup,
             stage_chunk=stage_chunk,
             finalize=finalize,

@@ -264,6 +264,7 @@ class MolSuiteJobApiMixin:
 
         prepared_chunks = chunks
         deferred_chunk_build = False
+        resolved_total_chunks = total_chunks
         if prepared_chunks is None:
             if params is None:
                 raise ValueError(
@@ -288,6 +289,8 @@ class MolSuiteJobApiMixin:
                 deferred_chunk_build = True
             else:
                 prepared_chunks = job.build_chunks(params, config=job_config)
+                if resolved_total_chunks is None:
+                    resolved_total_chunks = job.count_chunks(params, config=job_config)
 
         handler_instance = result_handler
         if handler_instance is None:
@@ -346,6 +349,7 @@ class MolSuiteJobApiMixin:
                 "_operational_profile": operational_policy,
                 "_supported_executors": list(job.supported_executors),
                 "_chunker_ref": job.chunker_ref,
+                "_chunk_counter_ref": job.chunk_counter_ref,
                 "_chunker_params": params,
                 "_dispatch_policy": DispatchPolicy(
                     max_inflight_tasks=effective_max_inflight_tasks,
@@ -382,8 +386,8 @@ class MolSuiteJobApiMixin:
             output_spec=effective_output_spec,
             output_flush_every=effective_output_flush_every,
             total_chunks=(
-                max(0, int(total_chunks))
-                if total_chunks is not None
+                max(0, int(resolved_total_chunks))
+                if resolved_total_chunks is not None
                 else len(prepared_chunks) if isinstance(prepared_chunks, list) else None
             ),
             chunk_fail_fast_min_processed=chunk_fail_fast_min_processed,
@@ -412,6 +416,13 @@ class MolSuiteJobApiMixin:
             if row.status in terminal:
                 return row
             time.sleep(max(0.05, float(poll_s)))
+
+    def get_executor_job(self, job_id: str) -> JobSnapshot | None:
+        """Return the current executor snapshot without waiting."""
+        self._require_runtime()
+        if self.executor_manager is None:
+            raise RuntimeError("ExecutorManager no inicializado.")
+        return self.executor_manager.get_job(str(job_id))
 
     def purge_job_history(self, *, older_than_days: float = 30.0) -> dict[str, int]:
         """Prune chunks and events of finished jobs. Runs by itself when a project opens."""

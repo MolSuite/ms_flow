@@ -311,6 +311,19 @@ class PydanticConfiguration:
             self._global_overrides = target
         self._refresh()
 
+    def set_global_value(self, path: str, value: Any) -> None:
+        """Persist a user-level override even while a project is active."""
+        overrides = deepcopy(self._global_overrides)
+        set_path_value(overrides, path, value)
+        candidate = self._validate_layers(overrides)
+        normalized = get_path_value(candidate.model_dump(mode="json"), path)
+        set_path_value(overrides, path, normalized)
+        # A project override may depend on another global value through model validation.
+        self._validate_layers(overrides, self._project_overrides)
+        self._save_overrides(self.global_path, overrides)
+        self._global_overrides = overrides
+        self._refresh()
+
     def reset_value(self, path: str, target: Literal["global", "default"]) -> None:
         if target == "global":
             if not self.has_project:

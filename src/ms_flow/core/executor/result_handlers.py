@@ -103,6 +103,10 @@ class ResultHandler:
     def flush(self) -> None:
         pass
 
+    def on_job_terminal(self, status: str) -> None:
+        """Optional lifecycle notification immediately before ``close()``."""
+        pass
+
 
 class BufferedResultHandler(ResultHandler):
     def __init__(self, flush_every: int = 500):

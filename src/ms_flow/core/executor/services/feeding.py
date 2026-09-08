@@ -48,7 +48,7 @@ class FeedingService:
         payload = _safe_json_loads(job.payload_json)
         lifecycle_meta = payload.get("_lifecycle") or {}
         try:
-            item_source, resources = self.manager.submission_service.restore_chunk_source(
+            item_source, resources, total_chunks = self.manager.submission_service.restore_chunk_source(
                 job=job,
                 payload=payload,
                 lifecycle_meta=lifecycle_meta,
@@ -60,9 +60,13 @@ class FeedingService:
             return False
 
         payload["_deferred_chunk_build_pending"] = False
+        if total_chunks is not None:
+            payload["_total_chunks"] = total_chunks
         with feed.lock:
             feed.item_source = item_source
             feed.source_ready = True
+            if total_chunks is not None:
+                feed.total_chunks = total_chunks
             feed.attached_resources.extend(resources)
 
         if self.manager.executor_db is not None:
@@ -70,6 +74,8 @@ class FeedingService:
                 job_row = session.exec(select(ExecutorJob).where(ExecutorJob.job_id == job.job_id)).first()
                 if job_row is not None:
                     job_row.payload_json = _safe_json_dumps(payload)
+                    if total_chunks is not None:
+                        job_row.total_chunks = total_chunks
                     job_row.updated_at = datetime.now()
                     session.add(job_row)
                     session.commit()

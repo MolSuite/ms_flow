@@ -12,7 +12,7 @@ from ms_flow.query import db_input_for
 from ms_flow.core.data import DbOutputSpec
 from ms_flow.core.database.executor_models import ExecutorJob, ExecutorJobChunk
 from ms_flow.main import MolSuite
-from ms_flow.tasking import job, task
+from ms_flow.tasking import JobSpec, job, task
 
 
 def _patch_fake_home(monkeypatch, fake_home: Path):
@@ -256,6 +256,30 @@ def _gated_lazy_submit_job(params: dict, _config: dict):
     count = int(params["count"])
     for idx in range(count):
         yield {"value": base + idx}
+
+
+class _CountedDeferredJob(JobSpec):
+    name = "counted_deferred_job"
+    task_name = "counted_deferred_task"
+    params_model = _BatchJobParams
+    executor = "thread"
+    supported_executors = ("thread",)
+
+    @staticmethod
+    def count_chunks(params: dict, _config: dict) -> int:
+        return int(params["count"])
+
+    @staticmethod
+    def build_chunks(params: dict, _config: dict):
+        for idx in range(int(params["count"])):
+            yield {"value": int(params["base"]) + idx, "sleep": 0.2}
+
+    @staticmethod
+    def run_chunk(payload: dict):
+        return _blocking_worker(payload)
+
+
+_counted_deferred_job = _CountedDeferredJob.to_job_definition()
 
 
 def test_task_and_job_support_with_options():
@@ -645,6 +669,50 @@ def test_molsuite_submit_job_with_dependency_defers_chunk_build_until_upstream_c
         assert final["chunks_done"] == 2
     finally:
         _LAZY_SUBMIT_GATE = None
+        ms.shutdown()
+
+
+def test_deferred_job_declares_full_scope_before_its_first_feed_window(tmp_path, monkeypatch):
+    _patch_fake_home(monkeypatch, tmp_path)
+    ms = MolSuite(app_id="testtasking")
+    try:
+        ms.create_or_open_project(
+            name="tasking_counted_deferred_chunks",
+            folder=tmp_path / "tasking_counted_deferred_chunks",
+            scope="testing",
+            activate=True,
+        )
+        assert ms.executor_manager is not None
+        blocker = ms.executor_manager.submit_job(
+            executor_name="thread",
+            chunks=[{"value": 1, "sleep": 0.2}],
+            run_chunk=_blocking_worker,
+            max_inflight_tasks=1,
+        )
+        job_id = ms.submit_job(
+            _counted_deferred_job,
+            params={"base": 1, "count": 9},
+            depends_on=[blocker],
+            max_inflight_tasks=1,
+        )
+
+        waiting = ms.executor_manager.get_job(job_id)
+        assert waiting is not None
+        assert waiting["chunks_total"] == 0
+
+        deadline = time.time() + 3.0
+        observed = None
+        while time.time() < deadline:
+            row = ms.executor_manager.get_job(job_id)
+            if row is not None and row["chunks_total"] == 9 and row["chunks_emitted"] < 9:
+                observed = row
+                break
+            time.sleep(0.02)
+        assert observed is not None
+        assert observed["chunks_total"] == 9
+        assert observed["chunks_emitted"] < observed["chunks_total"]
+        assert ms.wait_for_job(job_id, poll_s=0.05)["status"] == "completed"
+    finally:
         ms.shutdown()
 
 

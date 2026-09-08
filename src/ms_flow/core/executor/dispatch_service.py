@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from datetime import datetime
 from typing import Any, List, Tuple
 
@@ -175,6 +176,8 @@ class DispatchService:
         def _progress_cb(value: float):
             with manager._lock:
                 manager.event_recorder.record_chunk_progress(job_id_for_progress, chunk_id, value)
+            if manager.is_cancel_requested(job_id_for_progress):
+                raise CancelledError("Task canceled by user")
 
         if manager.is_cancel_requested(job.job_id):
             return False

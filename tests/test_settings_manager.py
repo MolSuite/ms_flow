@@ -55,6 +55,59 @@ def test_update_setting_with_save_global_too_updates_global(tmp_path, monkeypatc
     assert sm.settings.general.log_level == "WARNING"
 
 
+def test_set_global_value_preserves_active_project_override(tmp_path, monkeypatch):
+    sm, fake_home = _build_manager(tmp_path, monkeypatch)
+    sm.update_setting("general.poll_interval", 9)
+    project_dir = fake_home / "project-global-edit"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    sm.set_project(project_dir)
+    sm.update_setting("general.poll_interval", 2)
+
+    sm.set_global_value("general.poll_interval", 7)
+
+    assert sm.settings.general.poll_interval == 2
+    assert sm.get_global_value("general.poll_interval") == 7
+    sm.clear_project()
+    assert sm.settings.general.poll_interval == 7
+
+
+def test_missing_project_value_inherits_global_and_reset_removes_override(tmp_path, monkeypatch):
+    sm, fake_home = _build_manager(tmp_path, monkeypatch)
+    sm.update_setting("general.poll_interval", 9)
+    project_dir = fake_home / "project-layering"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    sm.set_project(project_dir)
+
+    assert toml.load(project_dir / "config.toml") == {}
+    assert sm.settings.general.poll_interval == 9
+    assert sm.get_source("general.poll_interval") == "global"
+
+    sm.update_setting("general.poll_interval", 2)
+    sm.set_global_value("general.poll_interval", 7)
+    assert sm.settings.general.poll_interval == 2
+    assert sm.get_source("general.poll_interval") == "project"
+
+    sm.reset_value("general.poll_interval", "global")
+    assert sm.settings.general.poll_interval == 7
+    assert sm.get_source("general.poll_interval") == "global"
+    assert "general" not in toml.load(project_dir / "config.toml")
+
+
+def test_legacy_project_snapshot_is_migrated_to_sparse_overrides(tmp_path, monkeypatch):
+    sm, fake_home = _build_manager(tmp_path, monkeypatch)
+    project_dir = fake_home / "legacy-project"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    with (project_dir / "config.toml").open("w", encoding="utf-8") as handle:
+        toml.dump(sm.settings.model_dump(mode="json"), handle)
+
+    sm.set_project(project_dir)
+    assert toml.load(project_dir / "config.toml") == {}
+
+    sm.set_global_value("general.poll_interval", 7)
+    assert sm.settings.general.poll_interval == 7
+    assert sm.get_source("general.poll_interval") == "global"
+
+
 def test_executor_db_defaults_next_to_projects_db(tmp_path, monkeypatch):
     sm, _ = _build_manager(tmp_path, monkeypatch)
     assert sm.settings.executor_db == sm.settings.projects_db.parent / "executor.db"

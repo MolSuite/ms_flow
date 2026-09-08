@@ -507,7 +507,7 @@ class SubmissionService:
         payload: dict[str, Any],
         lifecycle_meta: dict[str, Any],
         cursor_position: int,
-    ) -> tuple[Iterator[dict], list[Any]]:
+    ) -> tuple[Iterator[dict], list[Any], int | None]:
         chunker_ref = payload.get("_chunker_ref")
         chunker_params = payload.get("_chunker_params")
         if not chunker_ref:
@@ -523,7 +523,16 @@ class SubmissionService:
         produced = call_with_optional_context(chunker_fn, chunker_params or {}, config)
         if isinstance(produced, dict):
             produced = [produced]
-        return iter(produced or ()), resources
+        declared_total = payload.get("_total_chunks")
+        total_chunks = None if declared_total is None else max(0, int(declared_total))
+        chunk_counter_ref = str(payload.get("_chunk_counter_ref") or "").strip()
+        if total_chunks is None and chunk_counter_ref:
+            counter_fn = resolve_runner(str_to_ref(chunk_counter_ref))
+            total_chunks = max(
+                0,
+                int(call_with_optional_context(counter_fn, chunker_params or {}, config)),
+            )
+        return iter(produced or ()), resources, total_chunks
 
     def build_output_handler(
         self,

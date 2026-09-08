@@ -5,7 +5,7 @@ import queue
 import threading
 import traceback
 import uuid
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -42,8 +42,11 @@ def pooled_process_worker_entry(
     progress_queue=None,
     handle_id: str = "",
     chunk_id: str = "",
+    cancel_flags=None,
 ) -> Any:
     def _pooled_progress_cb(value: float) -> None:
+        if cancel_flags is not None and bool(cancel_flags.get(str(handle_id), False)):
+            raise CancelledError("Task canceled by user")
         if progress_queue is None or not handle_id:
             return
         try:
@@ -58,7 +61,10 @@ def pooled_process_worker_entry(
             return None
 
     fn = resolve_runner(fn_ref)
-    return make_runner_call(fn, payload, _pooled_progress_cb)
+    result = make_runner_call(fn, payload, _pooled_progress_cb)
+    if cancel_flags is not None and bool(cancel_flags.get(str(handle_id), False)):
+        raise CancelledError("Task canceled by user")
+    return result
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,7 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
         self._kill_workers_on_shutdown = bool(kill_workers_on_shutdown)
         self._manager = None
         self._progress_queue = None
+        self._cancel_flags = None
         self._pool = None
         self._futures: Dict[str, Future] = {}
         self._handle_job_ids: Dict[str, str] = {}
@@ -269,6 +276,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
             self._manager = mp.Manager()
         if self._progress_queue is None:
             self._progress_queue = self._manager.Queue()
+        if self._cancel_flags is None:
+            self._cancel_flags = self._manager.dict()
         if self._pool is None:
             self._pool = self._build_pool()
 
@@ -293,6 +302,7 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
         manager = self._manager
         self._manager = None
         self._progress_queue = None
+        self._cancel_flags = None
         if manager is None:
             return
         try:
@@ -330,6 +340,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
         self._futures.clear()
         self._handle_job_ids.clear()
         self._latest_progress.clear()
+        if self._cancel_flags is not None:
+            self._cancel_flags.clear()
         self._shutdown_pool(old_pool)
         self._ensure_runtime_objects_locked()
 
@@ -345,9 +357,11 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
                 self._progress_queue,
                 handle_id,
                 str(chunk_id or ""),
+                self._cancel_flags,
             )
             self._futures[handle_id] = future
             self._handle_job_ids[handle_id] = str(job_id or "")
+            self._cancel_flags[handle_id] = False
         return handle_id
 
     def drain_progress(self, handle_id: str) -> Optional[float]:
@@ -368,6 +382,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
                 self._futures.pop(handle_id, None)
                 self._handle_job_ids.pop(handle_id, None)
                 self._latest_progress.pop(handle_id, None)
+                if self._cancel_flags is not None:
+                    self._cancel_flags.pop(handle_id, None)
             return "FAILED", None, "Task canceled before execution"
         try:
             result = future.result()
@@ -375,6 +391,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
                 self._futures.pop(handle_id, None)
                 self._handle_job_ids.pop(handle_id, None)
                 self._latest_progress.pop(handle_id, None)
+                if self._cancel_flags is not None:
+                    self._cancel_flags.pop(handle_id, None)
             return "DONE", {"result": result}, None
         except Exception as exc:
             detail = _failure_detail(exc)
@@ -382,6 +400,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
                 self._futures.pop(handle_id, None)
                 self._handle_job_ids.pop(handle_id, None)
                 self._latest_progress.pop(handle_id, None)
+                if self._cancel_flags is not None:
+                    self._cancel_flags.pop(handle_id, None)
             return "FAILED", None, detail
 
     def cancel(self, handle_id: str) -> bool:
@@ -390,18 +410,22 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
             job_id = self._handle_job_ids.get(handle_id, "")
         if future is None:
             return False
+        with self._lock:
+            if self._cancel_flags is not None:
+                self._cancel_flags[handle_id] = True
         if future.cancel():
             with self._lock:
                 self._futures.pop(handle_id, None)
                 self._handle_job_ids.pop(handle_id, None)
                 self._latest_progress.pop(handle_id, None)
+                if self._cancel_flags is not None:
+                    self._cancel_flags.pop(handle_id, None)
             return True
         with self._lock:
             if future.done():
                 return False
-            if not self._all_inflight_handles_belong_to(job_id):
-                return False
-            self._reset_pool_locked()
+            if self._all_inflight_handles_belong_to(job_id):
+                self._reset_pool_locked()
         return True
 
     def shutdown(self):
@@ -411,6 +435,8 @@ class LokyProcessExecutorAdapter(ExecutorAdapterBase):
             self._futures.clear()
             self._handle_job_ids.clear()
             self._latest_progress.clear()
+            if self._cancel_flags is not None:
+                self._cancel_flags.clear()
         self._shutdown_pool(old_pool)
         self._shutdown_manager()
 

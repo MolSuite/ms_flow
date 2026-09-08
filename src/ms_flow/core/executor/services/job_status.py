@@ -398,7 +398,7 @@ class JobStatusService:
                 message=final_flush_error,
             )
             self.event_recorder.flush()
-        self._cleanup_job_runtime(job_id, flush_handler=False)
+        self._cleanup_job_runtime(job_id, flush_handler=False, terminal_status=status)
 
     def _add_event(
         self,

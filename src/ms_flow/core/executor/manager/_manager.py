@@ -563,7 +563,7 @@ class ExecutorManager:
             session.add(row)
             session.commit()
 
-    def _cleanup_job_runtime(self, job_id: str, *, flush_handler: bool):
+    def _cleanup_job_runtime(self, job_id: str, *, flush_handler: bool, terminal_status: str = ""):
         cleanup_state = self.runtime_state.pop_job_runtime(job_id)
         for future in self._staging.cancel_job(job_id):
             if future is not None:
@@ -574,8 +574,12 @@ class ExecutorManager:
                 cleanup_state.handler.flush()
             except Exception as exc:
                 self.logger.exception("Final ResultHandler flush error: %s", exc)
-        if cleanup_state.handler is not None and hasattr(cleanup_state.handler, "close"):
-            cleanup_state.handler.close()
+        if cleanup_state.handler is not None:
+            terminal_hook = getattr(cleanup_state.handler, "on_job_terminal", None)
+            if callable(terminal_hook):
+                terminal_hook(str(terminal_status or ""))
+            if hasattr(cleanup_state.handler, "close"):
+                cleanup_state.handler.close()
 
         if cleanup_state.feed is not None:
             self._lifecycle_controller.close_job_resources(cleanup_state.feed.attached_resources)
@@ -648,7 +652,7 @@ class ExecutorManager:
             progress=100.0,
             updated_at=now,
         )
-        self._cleanup_job_runtime(job_id, flush_handler=True)
+        self._cleanup_job_runtime(job_id, flush_handler=True, terminal_status="canceled")
         if flush_events:
             self.event_recorder.flush()
 
@@ -688,7 +692,7 @@ class ExecutorManager:
                 progress=100.0,
                 updated_at=now,
             )
-        self._cleanup_job_runtime(job_id, flush_handler=True)
+        self._cleanup_job_runtime(job_id, flush_handler=True, terminal_status="failed")
         if failed_written:
             self._add_event(job_id, level="ERROR", event_type="job_failed", message=reason)
         if flush_events:

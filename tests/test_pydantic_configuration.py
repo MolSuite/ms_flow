@@ -62,3 +62,18 @@ def test_configuration_rejects_invalid_value_without_persisting(tmp_path):
 
     assert provider.get_value("previews.limit") == 50
     assert not provider.global_path.exists()
+
+
+def test_configuration_can_update_global_without_touching_project_override(tmp_path):
+    provider = _provider(tmp_path)
+    provider.set_value("previews.limit", 60)
+    provider.set_project_root(tmp_path / "project")
+    provider.set_value("previews.limit", 70)
+
+    provider.set_global_value("previews.limit", 65)
+
+    assert provider.get_global_value("previews.limit") == 65
+    assert provider.get_value("previews.limit") == 70
+    assert provider.get_source("previews.limit") == "project"
+    provider.reset_value("previews.limit", "global")
+    assert provider.get_value("previews.limit") == 65
