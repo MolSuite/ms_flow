@@ -1,0 +1,58 @@
+name: Documentation
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: documentation
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/configure-pages@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+      - run: pip install zensical "mkdocstrings[python]" "mike @ git+https://github.com/squidfunk/mike.git"
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Deploy development documentation
+        if: github.ref == 'refs/heads/main'
+        run: |
+          mike deploy --push dev
+          if ! mike list latest >/dev/null 2>&1; then
+            mike set-default --push dev
+          fi
+      - name: Deploy release documentation
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mike deploy --push --update-aliases --alias-type redirect "$GITHUB_REF_NAME" latest
+          mike set-default --push latest
+      - name: Export versioned site
+        run: |
+          mkdir -p site
+          git archive gh-pages | tar -x -C site
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - uses: actions/deploy-pages@v5
+        id: deployment

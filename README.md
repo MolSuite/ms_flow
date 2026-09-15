@@ -25,8 +25,7 @@ print(ms.wait_for_job(job_id).status)
 
 ```bash
 pip install ms_flow            # core: control plane + SQLite + loky
-pip install "ms_flow[ray]"     # executor Ray
-pip install "ms_flow[ui]"      # PySide6 components
+pip install "ms_flow[ray]"     # Ray executor
 ```
 
 ## Where to look

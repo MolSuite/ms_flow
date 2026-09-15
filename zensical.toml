@@ -1,0 +1,79 @@
+[project]
+site_name = "ms_flow"
+site_description = "In-process job, executor and data-flow orchestrator for scientific applications."
+site_author = "MolSuite authors"
+site_url = "https://molsuite.github.io/ms_flow/"
+repo_url = "https://github.com/MolSuite/ms_flow"
+repo_name = "MolSuite/ms_flow"
+copyright = "Copyright &copy; 2026 MolSuite authors"
+
+# nav only sets the menu: zensical renders every .md under docs/ (no exclude
+# option), so internal notes must live outside docs/ to stay off the site.
+nav = [
+  { "Home" = "index.md" },
+  { "API guide" = "api_guide.md" },
+  { "Examples" = "examples.md" },
+  { "API reference" = "api_reference.md" },
+]
+
+[project.theme]
+language = "en"
+features = [
+  "content.code.copy",
+  "navigation.footer",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "search.highlight",
+  "search.suggest",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to light mode"
+
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.pymdownx.details]
+[project.markdown_extensions.pymdownx.highlight]
+[project.markdown_extensions.pymdownx.superfences]
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.plugins.search]
+
+[project.plugins.mkdocstrings.handlers.python]
+paths = ["src"]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"
+filters = "public"
+members_order = "source"
+merge_init_into_class = true
+separate_signature = true
+show_root_heading = true
+show_root_full_path = false
+show_signature_annotations = true
+show_source = true
+show_symbol_type_heading = true
+show_symbol_type_toc = true
+signature_crossrefs = true
+summary = true
+
+[project.plugins.mike]
+canonical_version = "latest"
+
+[project.extra.version]
+provider = "mike"

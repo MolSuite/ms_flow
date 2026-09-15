@@ -42,10 +42,6 @@ dependencies = [
 [project.optional-dependencies]
 # Ray executor (native and external modes) for distributed compute.
 ray = ["ray>=2.6"]
-# Optional PostgreSQL operational/project stores.
-postgresql = ["psycopg2-binary>=2.9"]
-# Desktop UI components (project browser, monitor, table views).
-ui = ["PySide6>=6.5"]
 # Test + development tooling.
 dev = ["pytest>=7.0"]
 

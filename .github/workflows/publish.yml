@@ -1,0 +1,31 @@
+# Publish to PyPI on a GitHub release.
+#
+# No secrets: the job authenticates to PyPI over OIDC (Trusted Publishing).
+# It has to be enabled on the PyPI side *before* the first upload -- for a
+# project that does not exist yet, that is a "pending publisher" under
+# Your projects > Publishing, and it must name this repo, `publish.yml`
+# and the `pypi` environment below.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # A permissions block sets every scope it does not name to none, so
+      # checkout needs contents spelled out or it cannot read a private repo.
+      contents: read
+      id-token: write  # mint the OIDC token PyPI checks; no secret involved
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # setuptools-scm reads the version off the tag
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pipx run build
+      - uses: pypa/gh-action-pypi-publish@release/v1
