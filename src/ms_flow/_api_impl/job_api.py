@@ -7,6 +7,7 @@ from uuid import UUID
 
 from ms_flow.core.data import TableOutputSpec
 from ms_flow.core.executor.dispatch_model import DispatchPolicy
+from ms_flow.core.executor.submission_service import executor_is_supported
 from ms_flow.core.executor.job_snapshot import JobSnapshot
 from ms_flow.job_templates import batch_job, streaming_job
 
@@ -256,7 +257,9 @@ class MolSuiteJobApiMixin:
             effective_project_id = str(self.active_context.id)
 
         selected_executor = str(executor_name or job.executor).strip() or job.executor
-        if selected_executor not in job.supported_executors:
+        if not executor_is_supported(
+            self.executor_manager, selected_executor, job.supported_executors
+        ):
             raise ValueError(
                 f"Executor '{selected_executor}' is not supported by job '{job.name}'. "
                 f"Compatible: {job.supported_executors}."
@@ -349,6 +352,15 @@ class MolSuiteJobApiMixin:
                 "_operational_profile": operational_policy,
                 "_supported_executors": list(job.supported_executors),
                 "_chunker_ref": job.chunker_ref,
+                # The handler instance dies with the process; its factory and the arguments
+                # that survive a round-trip through JSON are what lets a reattached job
+                # rebuild it. Live objects (the project store) are re-injected on restore.
+                "_result_handler_ref": "" if result_handler is not None else job.result_handler_ref,
+                "_result_handler_kwargs": {
+                    key: value
+                    for key, value in (result_handler_kwargs or {}).items()
+                    if isinstance(value, (str, int, float, bool, list, dict, type(None)))
+                },
                 "_chunk_counter_ref": job.chunk_counter_ref,
                 "_chunker_params": params,
                 "_dispatch_policy": DispatchPolicy(

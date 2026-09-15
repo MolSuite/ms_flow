@@ -6,6 +6,7 @@ import functools
 import threading
 import time
 from concurrent.futures import Future
+from itertools import islice
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -1386,20 +1387,163 @@ class ExecutorManager:
         self._terminalize_active_jobs(
             reason="runtime_interrupted",
             message="Job failed because a previous MolSuite runtime ended before completion.",
+            skip_job_ids=self._reattach_external_jobs(),
         )
+
+    def _reattach_external_jobs(self) -> set[str]:
+        """Adopt jobs still running off this machine. Returns the job ids kept alive.
+
+        A scheduler job outlives the desktop app: it is still running, still writing into its
+        control dir, and failing it here would throw away hours of cluster time that nobody
+        asked to cancel. Everything needed to resume watching it is durable — the payload
+        carries the chunker, the handler factory and the data context, the feed cursor says
+        how many chunks were already emitted, and the adapter finds its scheduler id on disk.
+        """
+        if self.executor_db is None:
+            return set()
+        with self.executor_db.get_session() as session:
+            jobs = session.exec(
+                select(ExecutorJob).where(ExecutorJob.status.in_(JOB_RECOVERABLE_STATUSES))
+            ).all()
+            job_ids = [job.job_id for job in jobs]
+            if not job_ids:
+                return set()
+            chunks = session.exec(
+                select(ExecutorJobChunk).where(
+                    ExecutorJobChunk.job_id.in_(job_ids),
+                    ExecutorJobChunk.status == "running",
+                )
+            ).all()
+            feed_states = session.exec(
+                select(ExecutorJobFeedState).where(ExecutorJobFeedState.job_id.in_(job_ids))
+            ).all()
+
+        cursors = {state.job_id: int(state.cursor_position or 0) for state in feed_states}
+        running_by_job: dict[str, list[ExecutorJobChunk]] = {}
+        for chunk in chunks:
+            running_by_job.setdefault(chunk.job_id, []).append(chunk)
+
+        reattached: set[str] = set()
+        for job in jobs:
+            adapter = self._executors.get(job.executor_name)
+            # An adapter that can reattach is one whose work survives us; every local pool died
+            # with the process.
+            if adapter is None or getattr(adapter, "reattach", None) is None:
+                continue
+            try:
+                self._reattach_job(
+                    job,
+                    adapter,
+                    running_by_job.get(job.job_id, []),
+                    cursors.get(job.job_id, 0),
+                )
+            except Exception as exc:  # noqa: BLE001 - what we cannot adopt falls back to the failure sweep
+                self.logger.warning("Could not reattach job=%s: %s", job.job_id, exc)
+                self.runtime_state.pop_job_runtime(job.job_id)
+                continue
+            reattached.add(job.job_id)
+            self._add_event(
+                job.job_id,
+                level="INFO",
+                event_type="job_reattached",
+                message=f"Reattached to '{job.executor_name}' after a runtime restart.",
+                payload={"running_chunks": len(running_by_job.get(job.job_id, []))},
+            )
+        return reattached
+
+    def _reattach_job(
+        self,
+        job: ExecutorJob,
+        adapter,
+        running_chunks: list[ExecutorJobChunk],
+        cursor_position: int,
+    ) -> None:
+        payload = _safe_json_loads(job.payload_json)
+        lifecycle_meta = dict(payload.get("_lifecycle") or {})
+        item_source, resources, total_chunks = self.submission_service.restore_chunk_source(
+            job=job,
+            payload=payload,
+            lifecycle_meta=lifecycle_meta,
+            cursor_position=cursor_position,
+        )
+        # The chunker replays its stream from the start; the cursor says how much of it the
+        # feed already emitted, so drop exactly that prefix.
+        feed = JobFeed(
+            job_id=job.job_id,
+            executor_name=job.executor_name,
+            item_source=islice(item_source, cursor_position, None),
+            dispatch_policy=DispatchPolicy.from_mapping(payload.get("_dispatch_policy")),
+            default_cpu_required=max(1, int(payload.get("_default_cpu_required", 1) or 1)),
+            default_gpu_required=max(0, int(payload.get("_default_gpu_required", 0) or 0)),
+            total_emitted=cursor_position,
+            total_chunks=total_chunks if total_chunks is not None else job.total_chunks,
+            attached_resources=list(resources),
+        )
+        handler = self.submission_service.restore_result_handler(
+            job_id=job.job_id,
+            payload=payload,
+            project_db=next((item for item in resources if hasattr(item, "get_session")), None),
+        )
+        # Setup already ran in the previous process; finalize has not.
+        lifecycle = JobLifecycle(
+            setup_ref=str(lifecycle_meta.get("setup_ref", "") or ""),
+            stage_ref=str(lifecycle_meta.get("stage_ref", "") or ""),
+            finalize_ref=str(lifecycle_meta.get("finalize_ref", "") or ""),
+            stage_fail_policy=str(lifecycle_meta.get("stage_fail_policy", "fail_fast") or "fail_fast"),
+            max_stage_failures=max(0, int(lifecycle_meta.get("max_stage_failures", 0) or 0)),
+            setup_done=True,
+            setup_data=dict(lifecycle_meta.get("setup_data") or {}),
+        )
+        # Adopt every running chunk before registering the job: a job whose chunks we cannot
+        # find again must fail whole, not half — the caller drops it back into the sweep.
+        adopted: list[RunningChunk] = []
+        # Same mapping dispatch built when it submitted: the control dir is derived from it,
+        # and `hpc_wdir` is only defaulted there, not in the stored data context.
+        submit_context = self._build_data_context_mapping(job)
+        for chunk in running_chunks:
+            handle_id = adapter.reattach(job.job_id, chunk.chunk_id, submit_context)
+            if handle_id is None:
+                raise RuntimeError(f"No remote handle on disk for chunk '{chunk.chunk_id}'.")
+            adopted.append(
+                RunningChunk(
+                    job_id=job.job_id,
+                    chunk_id=chunk.chunk_id,
+                    executor_name=job.executor_name,
+                    handle_id=handle_id,
+                    cpu_required=int(chunk.cpu_required or 1),
+                    gpu_required=int(chunk.gpu_required or 0),
+                )
+            )
+        self.register_job_runtime(
+            job_id=job.job_id,
+            runner_ref=payload.get("_runner_ref"),
+            feed=feed,
+            lifecycle=lifecycle,
+            store_results=bool(payload.get("_store_results", True)),
+            handler=handler,
+        )
+        for item in adopted:
+            self.runtime_state.register_running_chunk(item)
 
     def _terminalize_active_jobs_on_shutdown(self) -> None:
         self._assert_engine_thread()
+        # Work that outlives us is left alone: closing the app is not a reason to kill a
+        # queued cluster job, and the next start adopts it from its control dir.
+        external_jobs: set[str] = set()
         for item in self.running_chunks_snapshot():
             adapter = self._executors.get(item.executor_name)
-            if adapter is not None:
-                try:
-                    adapter.cancel(item.handle_id)
-                except Exception:
-                    self.logger.debug(
-                        "Best-effort cancel failed during shutdown for chunk=%s",
-                        item.chunk_id,
-                    )
+            if adapter is None:
+                continue
+            if getattr(adapter, "reattach", None) is not None:
+                external_jobs.add(item.job_id)
+                continue
+            try:
+                adapter.cancel(item.handle_id)
+            except Exception:
+                self.logger.debug(
+                    "Best-effort cancel failed during shutdown for chunk=%s",
+                    item.chunk_id,
+                )
         for job_id in tuple(self.runtime_state.job_feeds):
             self._dispatch_pool.cancel_job(job_id)
             for future in self._staging.cancel_job(job_id):
@@ -1408,11 +1552,15 @@ class ExecutorManager:
         self._terminalize_active_jobs(
             reason="runtime_interrupted",
             message="Job failed because the MolSuite runtime was stopped before completion.",
+            skip_job_ids=external_jobs,
         )
 
-    def _terminalize_active_jobs(self, *, reason: str, message: str) -> None:
+    def _terminalize_active_jobs(
+        self, *, reason: str, message: str, skip_job_ids: set[str] | None = None
+    ) -> None:
         if self.executor_db is None:
             return
+        untouched = skip_job_ids or set()
         now = datetime.now()
         project_updates: list[tuple[str, UUID | None]] = []
         payload_refs: list[str] = []
@@ -1420,6 +1568,7 @@ class ExecutorManager:
             jobs = session.exec(
                 select(ExecutorJob).where(ExecutorJob.status.in_(JOB_RECOVERABLE_STATUSES))
             ).all()
+            jobs = [job for job in jobs if job.job_id not in untouched]
             job_ids = [job.job_id for job in jobs]
             if not job_ids:
                 return

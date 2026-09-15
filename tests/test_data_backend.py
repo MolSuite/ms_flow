@@ -14,6 +14,7 @@ from ms_flow.core.data import (
     FileInputSpec,
     FileOutputSpec,
     InlineInputSpec,
+    ProjectOutputDirSpec,
     from_wire_value,
     to_wire_value,
 )
@@ -327,6 +328,26 @@ def test_data_bridge_hpc_staged_copy_returns_remote_path(tmp_path):
     staged_path = Path(materialized["ligands"])
     assert staged_path.exists()
     assert staged_path.read_text(encoding="utf-8") == "CCO ligand_1\n"
+
+
+def test_data_bridge_hpc_output_dir_stays_in_the_working_directory(tmp_path):
+    """Results a cluster job produces are left on the cluster: copying a whole screening run
+    back is the cost the cluster was chosen to avoid. Only selected hits travel, inline."""
+    hpc_wdir = tmp_path / "hpc_wdir"
+    bridge = DataBridge()
+    payload = to_wire_value({"output_dir": ProjectOutputDirSpec("results/docking/screening")})
+    profile = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=False)
+    ctx = DataContext(project_dir=tmp_path, extras={"hpc_wdir": str(hpc_wdir)})
+
+    target = Path(bridge.materialize_payload(payload, ctx, executor_profile=profile)["output_dir"])
+    assert target == hpc_wdir / "outputs" / "results/docking/screening"
+    assert target.is_dir()
+    assert not (tmp_path / "results").exists()
+
+    # A shared filesystem has nothing to avoid: the project tree is already reachable.
+    shared = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=True)
+    local = bridge.materialize_payload(payload, ctx, executor_profile=shared)["output_dir"]
+    assert Path(local) == tmp_path / "results/docking/screening"
 
 
 def test_data_bridge_transport_planner_allows_bytes_without_shared_fs():

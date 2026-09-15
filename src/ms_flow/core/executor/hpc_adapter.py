@@ -293,6 +293,13 @@ class HPCCommandExecutorAdapter:
             )
 
         scheduler_job_id = self._parse_scheduler_id(proc.stdout)
+        # The scheduler id is the one thing a restart cannot re-derive: the control dir is a
+        # function of (job_id, chunk_id), but this comes back from `sbatch`. Without it on
+        # disk the remote job keeps running and nobody can poll or cancel it again.
+        _write_json(
+            control_dir / "handle.json",
+            {"scheduler_job_id": scheduler_job_id, "submitted_at": _utc_now()},
+        )
         handle_id = uuid.uuid4().hex
         with self._lock:
             self._handles[handle_id] = HPCHandleState(
@@ -304,6 +311,39 @@ class HPCCommandExecutorAdapter:
                 result_path=result_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+            )
+        return handle_id
+
+    def reattach(self, job_id: str, chunk_id: str, submit_context: Optional[dict] = None) -> Optional[str]:
+        """Adopt a chunk submitted by an earlier run of this process. None if there is nothing to adopt.
+
+        A scheduler job outlives the desktop app, so after a restart the work is still out
+        there writing into the same control dir. Everything needed to resume watching it is
+        on disk: the paths follow from (job_id, chunk_id) and the scheduler id was written
+        beside them at submit.
+        """
+        context = dict(self._command_context)
+        context.update(dict(submit_context or {}))
+        context["job_id"] = job_id
+        context["chunk_id"] = chunk_id
+        control_dir = self._build_control_dir(context)
+        handle_path = control_dir / "handle.json"
+        if not handle_path.exists():
+            return None
+        scheduler_job_id = str(_safe_json_loads(handle_path).get("scheduler_job_id") or "").strip()
+        if not scheduler_job_id:
+            return None
+        handle_id = uuid.uuid4().hex
+        with self._lock:
+            self._handles[handle_id] = HPCHandleState(
+                scheduler_job_id=scheduler_job_id,
+                control_dir=control_dir,
+                manifest_path=control_dir / "manifest.json",
+                submit_script_path=control_dir / "submit.sh",
+                status_path=control_dir / "status.json",
+                result_path=control_dir / "result.json",
+                stdout_path=control_dir / "stdout.log",
+                stderr_path=control_dir / "stderr.log",
             )
         return handle_id
 

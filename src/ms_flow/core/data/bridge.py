@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -66,20 +69,48 @@ class DataBridge:
 
     @staticmethod
     def _hpc_stage_destination(*, source: Path, context: DataContext) -> Path:
+        """Where one input file lands in the cluster's working directory.
+
+        Content-addressed and shared by every chunk of every job: an input is immutable by
+        definition, so copying the receptor once per chunk is the same file transferred a
+        thousand times. Per-chunk scratch stays per-chunk — this is only the inbound side.
+
+        ponytail: the key is (path, mtime, size), not a content hash, so staging never reads
+        a file it is not about to copy. Same key the Ray node cache uses.
+        """
         raw_wdir = context.extras.get("hpc_wdir")
         if not raw_wdir:
             raise DataContractError("HPC transport requires 'hpc_wdir' in DataContext.")
         wdir = Path(str(raw_wdir)).expanduser().resolve()
-        job_id = str(context.extras.get("job_id") or "job")
-        chunk_id = str(context.extras.get("chunk_id") or "chunk")
-        base = wdir / "molsuite_staging" / job_id / chunk_id
+        stat = source.stat()
+        key = hashlib.sha256(
+            f"{source}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")
+        ).hexdigest()[:16]
+        base = wdir / "molsuite_inputs" / key
         base.mkdir(parents=True, exist_ok=True)
         return (base / source.name).resolve()
+
+    @staticmethod
+    def _hpc_output_destination(*, relative: str, context: DataContext) -> Path:
+        """Where a project output directory lives while the job runs on the cluster.
+
+        The project tree is mirrored under the working directory instead of written into, so
+        a run leaves everything it produced in one place the user can archive or delete.
+        """
+        raw_wdir = context.extras.get("hpc_wdir")
+        if not raw_wdir:
+            raise DataContractError("HPC transport requires 'hpc_wdir' in DataContext.")
+        return (Path(str(raw_wdir)).expanduser().resolve() / "outputs" / relative).resolve()
 
     def _stage_file_to_hpc(self, spec: FileInputSpec, context: DataContext) -> str:
         source = self._resolve_file_path(spec, context)
         target = self._hpc_stage_destination(source=source, context=context)
-        shutil.copy2(source, target)
+        if not target.exists():
+            # Staging runs on a thread pool, so two chunks can race for the same input. The
+            # copy goes to a private name and lands atomically; the loser's file is discarded.
+            temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+            shutil.copy2(source, temporary)
+            os.replace(temporary, target)
         return str(target)
 
     def _ray_file_input(self, spec: FileInputSpec, context: DataContext) -> dict[str, Any]:
@@ -160,6 +191,8 @@ class DataBridge:
                 relative = target.relative_to(context.project_dir.expanduser().resolve()).as_posix()
                 if handle.strategy == "ray_output_transfer":
                     return {RAY_OUTPUT_DIR_KEY: {"destination": relative}}
+                if handle.strategy == "hpc_output_dir":
+                    target = self._hpc_output_destination(relative=relative, context=context)
                 target.mkdir(parents=True, exist_ok=True)
                 return str(target)
             return self.resolve_input(value, context)

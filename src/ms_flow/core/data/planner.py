@@ -44,11 +44,12 @@ class DataTransportPlanner:
                 return ResolvedHandle(strategy=strategy, spec_kind=spec.kind, details={"path": spec.path})
             if profile.backend == "hpc":
                 return ResolvedHandle(strategy="hpc_staged_copy", spec_kind=spec.kind, details={"path": spec.path})
-            if profile.backend == "ray" and spec.cache:
-                return ResolvedHandle(strategy="ray_object_transfer", spec_kind=spec.kind, details={"path": spec.path})
+            # A shared filesystem beats the cache: the worker can already open the file, so
+            # transferring its bytes to warm a node-local copy is pure cost. `cache` only
+            # decides how a *transfer* is done, never whether one happens.
             if profile.shared_fs and spec.delivery == "path":
                 return ResolvedHandle(strategy="shared_path", spec_kind=spec.kind, details={"path": spec.path})
-            if profile.backend == "ray" and not profile.shared_fs:
+            if profile.backend == "ray" and (spec.cache or not profile.shared_fs):
                 return ResolvedHandle(strategy="ray_object_transfer", spec_kind=spec.kind, details={"path": spec.path})
             return ResolvedHandle(strategy="driver_materialized_file", spec_kind=spec.kind)
 
@@ -57,6 +58,11 @@ class DataTransportPlanner:
                 return ResolvedHandle(strategy="project_output_path", spec_kind=spec.kind)
             if profile.backend == "ray":
                 return ResolvedHandle(strategy="ray_output_transfer", spec_kind=spec.kind)
+            if profile.backend == "hpc":
+                # Output stays where it was produced. Copying a screening run's fragments back
+                # is the network cost the cluster was chosen to avoid; only what the parent
+                # selects travels, and it travels inline in the chunk result.
+                return ResolvedHandle(strategy="hpc_output_dir", spec_kind=spec.kind)
             raise DataContractError("Remote project output directories require a shared filesystem or Ray transfer.")
 
         if isinstance(spec, DbInputSpec):

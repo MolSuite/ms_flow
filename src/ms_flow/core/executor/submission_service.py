@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import uuid
 from dataclasses import dataclass
@@ -63,6 +64,19 @@ class PreparedSubmit:
     store_results: bool
     handler_instance: ResultHandler | None
     guardrail_warnings: tuple[GuardrailWarning, ...]
+
+
+def executor_is_supported(manager: Any, name: str, supported: tuple[str, ...]) -> bool:
+    """A job declares the *kind* of place it can run, not the label a user gave it.
+
+    An HPC executor is registered under the worker's own name ("hpc_ucm"), so matching names
+    alone would reject every real cluster. The adapter's backend is the fallback.
+    """
+    if name in supported:
+        return True
+    adapter = manager.registered_executors().get(name)
+    backend = str(getattr(getattr(adapter, "metadata", None), "backend", "") or "")
+    return bool(backend) and backend in supported
 
 
 class SubmissionService:
@@ -413,7 +427,9 @@ class SubmissionService:
             for item in (payload.get("_supported_executors") or ())
             if str(item).strip()
         )
-        if supported_executors and selected_executor not in supported_executors:
+        if supported_executors and not executor_is_supported(
+            self.manager, selected_executor, supported_executors
+        ):
             raise ValueError(
                 f"Executor '{selected_executor}' no soportado al reenviar job '{source_job_id}'. "
                 f"Compatibles: {supported_executors}."
@@ -533,6 +549,32 @@ class SubmissionService:
                 int(call_with_optional_context(counter_fn, chunker_params or {}, config)),
             )
         return iter(produced or ()), resources, total_chunks
+
+    def restore_result_handler(
+        self, *, job_id: str, payload: dict[str, Any], project_db: Any = None
+    ) -> ResultHandler | None:
+        """Rebuild the handler a job was submitted with, for a job adopted after a restart.
+
+        The instance was never persisted, only the factory ref and its JSON arguments — which
+        is enough, because a factory takes its live objects (the project store) as keywords
+        instead of baking them in.
+        """
+        handler_ref = str(payload.get("_result_handler_ref") or "").strip()
+        if handler_ref:
+            factory = resolve_runner(str_to_ref(handler_ref))
+            kwargs = dict(payload.get("_result_handler_kwargs") or {})
+            if project_db is not None and "project_db" in inspect.signature(factory).parameters:
+                kwargs["project_db"] = project_db
+            return factory(**kwargs)
+        output_spec = _normalize_output_spec(payload.get("_output_spec"))
+        if output_spec is None:
+            return None
+        return self.build_output_handler(
+            job_id=job_id,
+            output_spec=output_spec,
+            data_context_mapping=payload.get("_data_context") or {},
+            flush_every=max(1, int(payload.get("_output_flush_every", 500) or 500)),
+        )
 
     def build_output_handler(
         self,
