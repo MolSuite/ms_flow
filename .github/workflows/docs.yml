@@ -11,22 +11,20 @@ concurrency:
   group: documentation
   cancel-in-progress: false
 
+# mike commits every version to the gh-pages branch and GitHub Pages serves that
+# branch (Settings > Pages > Deploy from a branch: gh-pages, / (root)).
+# An Actions Pages deployment is keyed by commit SHA, so a release tag on a
+# commit already deployed from main would be silently ignored.
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/configure-pages@v6
       - uses: actions/setup-python@v6
         with:
           python-version: 3.x
@@ -47,12 +45,3 @@ jobs:
         run: |
           mike deploy --push --update-aliases --alias-type redirect "$GITHUB_REF_NAME" latest
           mike set-default --push latest
-      - name: Export versioned site
-        run: |
-          mkdir -p site
-          git archive gh-pages | tar -x -C site
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: site
-      - uses: actions/deploy-pages@v5
-        id: deployment
