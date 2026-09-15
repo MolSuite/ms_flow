@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://molsuite.github.io/ms_flow/latest/</loc>
+      </url>
+      <url>
+        <loc>https://molsuite.github.io/ms_flow/latest/api_guide/</loc>
+      </url>
+      <url>
+        <loc>https://molsuite.github.io/ms_flow/latest/examples/</loc>
+      </url>
+      <url>
+        <loc>https://molsuite.github.io/ms_flow/latest/api_reference/</loc>
+      </url>
+</urlset>
