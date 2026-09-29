@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID, uuid4
 
+from sqlalchemy import DateTime
 from sqlmodel import Field, SQLModel
 
 
@@ -31,10 +32,10 @@ class ExecutorJob(SQLModel, table=True):
     total_emitted: int = Field(default=0, index=True)
     loop_latency_ms: float = 0.0
     throughput_eps: float = 0.0
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
+    started_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+    finished_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
 
 
 class ExecutorJobFeedState(SQLModel, table=True):
@@ -48,8 +49,8 @@ class ExecutorJobFeedState(SQLModel, table=True):
     items_acked: int = 0
     exhausted: bool = False
     last_error: str = ""
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ExecutorJobChunk(SQLModel, table=True):
@@ -72,13 +73,13 @@ class ExecutorJobChunk(SQLModel, table=True):
     progress: float = 0.0
     checkpoint_ref: str = ""
     error: str = ""
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
-    started_at: Optional[datetime] = None
-    output_produced_at: Optional[datetime] = None
-    output_persisted_at: Optional[datetime] = None
-    output_confirmed_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
+    started_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+    output_produced_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+    output_persisted_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+    output_confirmed_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+    finished_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
 
 
 class ExecutorJobEvent(SQLModel, table=True):
@@ -93,7 +94,7 @@ class ExecutorJobEvent(SQLModel, table=True):
     event_type: str = Field(default="log", index=True)
     message: str = ""
     payload_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ExecutorHeartbeat(SQLModel, table=True):
@@ -109,4 +110,4 @@ class ExecutorHeartbeat(SQLModel, table=True):
     running_jobs: int = 0
     running_chunks: int = 0
     loop_latency_ms: float = 0.0
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)

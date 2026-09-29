@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
+from sqlalchemy import DateTime
 from sqlmodel import Field, SQLModel
 
 
@@ -19,8 +20,8 @@ class Project(SQLModel, table=True):
     scope: str = "full"
     tags: str = ""
     favorite: bool = False
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
 
 
 class ProjectJobIndex(SQLModel, table=True):
@@ -36,5 +37,5 @@ class ProjectJobIndex(SQLModel, table=True):
     status: str = Field(default="pending", index=True)
     progress: float = 0.0
     scheduler_reason: str = ""
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)

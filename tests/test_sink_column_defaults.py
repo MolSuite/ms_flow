@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import DateTime
 from sqlmodel import Field, SQLModel
 
 from ms_flow.core.database import ProjectStore
@@ -21,7 +22,7 @@ class _DefaultsRow(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
-    created_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
     tag: str = "auto"
 
 

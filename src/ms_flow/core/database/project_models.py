@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import DateTime
 from sqlmodel import Field, SQLModel
 
 
@@ -23,8 +24,8 @@ class ProjectArtifact(SQLModel, table=True):
     status: str = Field(default="available", index=True)
     producer_job_id: str = Field(default="", index=True)
     metadata_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ProjectArtifactCapability(SQLModel, table=True):
@@ -39,7 +40,7 @@ class ProjectArtifactCapability(SQLModel, table=True):
     method: str = Field(default="", index=True)
     params_json: str = "{}"
     metadata_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ProjectOperationRun(SQLModel, table=True):
@@ -55,5 +56,5 @@ class ProjectOperationRun(SQLModel, table=True):
     input_ref_json: str = "{}"
     output_ref_json: str = "{}"
     params_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now)
-    finished_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+    finished_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
