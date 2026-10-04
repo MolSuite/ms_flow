@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,8 @@ from typing import Any, Literal, Union, get_args, get_origin
 import toml
 from pydantic import BaseModel
 
+
+logger = logging.getLogger(__name__)
 
 _MISSING = object()
 _NO_DEFAULT = object()
@@ -95,6 +98,58 @@ def _is_model_type(annotation: Any) -> bool:
         return isinstance(annotation, type) and issubclass(annotation, BaseModel)
     except TypeError:
         return False
+
+
+def _stale_paths(data: dict[str, Any], model_type: type[BaseModel], legacy_keys: dict, prefix: str = "") -> list[str]:
+    """Dotted paths in ``data`` that ``model_type`` does not declare."""
+    open_model = model_type.model_config.get("extra") == "allow"
+    paths: list[str] = []
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+        field = model_type.model_fields.get(key)
+        if field is not None:
+            if isinstance(value, dict) and _is_model_type(field.annotation):
+                paths.extend(_stale_paths(value, _unwrap_optional(field.annotation)[0], legacy_keys, f"{path}."))
+        elif open_model:
+            continue
+        elif isinstance(value, dict) and value and path not in legacy_keys:
+            # An undeclared table: its leaves are looked up one by one.
+            paths.extend(_stale_paths(value, BaseModel, legacy_keys, f"{path}."))
+        else:
+            paths.append(path)
+    return paths
+
+
+def reconcile_overrides(
+    data: dict[str, Any],
+    model_type: type[BaseModel],
+    legacy_keys: dict[str, Any] | None = None,
+    *,
+    source: str = "",
+) -> dict[str, Any]:
+    """Bring an override layer written against an older layout up to date, and say so.
+
+    Every key the model does not declare is looked up in ``legacy_keys`` (old dotted
+    path -> new path, ``(new path, convert)``, or ``None`` for a setting that is gone).
+    Renamed keys are moved, the rest removed; each change is logged. Runs on the raw
+    layer, before defaults are merged, so the user's value wins over the new default.
+    """
+    legacy_keys = legacy_keys or {}
+    data = deepcopy(data)
+    for path in _stale_paths(data, model_type, legacy_keys):
+        value = get_path_value(data, path, _MISSING)
+        delete_path_value(data, path)
+        target = legacy_keys.get(path, _MISSING)
+        if target is _MISSING:
+            logger.warning("%s: unknown setting '%s' removed", source, path)
+        elif target is None:
+            logger.warning("%s: setting '%s' no longer exists, removed", source, path)
+        else:
+            new, convert = target if isinstance(target, tuple) else (target, None)
+            if get_path_value(data, new, _MISSING) is _MISSING:  # an explicit new-layout value wins
+                set_path_value(data, new, convert(value) if convert else value)
+            logger.warning("%s: setting '%s' is now '%s', migrated", source, path, new)
+    return data
 
 
 def _field_constraints(field) -> tuple[int | float | None, int | float | None]:
@@ -193,18 +248,22 @@ class PydanticConfiguration:
         config_id: str,
         display_name: str,
         model_type: type[BaseModel],
-        default_path: str | Path,
         global_path: str | Path,
+        default_path: str | Path | None = None,
         project_relative_path: str | Path | None = None,
         description: str = "",
         icon_name: str | None = None,
+        legacy_keys: dict[str, Any] | None = None,
     ) -> None:
+        # Registry of renamed/removed settings, see ``reconcile_overrides``.
+        self._legacy_keys = legacy_keys
         self.config_id = str(config_id).strip()
         self.display_name = str(display_name).strip() or self.config_id
         if not self.config_id:
             raise ValueError("Configuration id must not be empty.")
         self.model_type = model_type
-        self.default_path = Path(default_path).expanduser().resolve()
+        # None: the model's own field defaults are the packaged default.
+        self.default_path = Path(default_path).expanduser().resolve() if default_path is not None else None
         self.global_path = Path(global_path).expanduser().resolve()
         self.project_relative_path = (
             Path(project_relative_path) if project_relative_path is not None else Path(".molsuite/config") / f"{self.config_id}.toml"
@@ -216,7 +275,7 @@ class PydanticConfiguration:
         self.project_root: Path | None = None
         self.project_path: Path | None = None
         self._default = self._load_default()
-        self._global_overrides = self._load_overrides(self.global_path)
+        self._global_overrides = self._load_layer(self.global_path)
         self._project_overrides: dict[str, Any] = {}
         self._global = self._validate_layers(self._global_overrides)
         self._effective = self._global.model_copy(deep=True)
@@ -231,7 +290,16 @@ class PydanticConfiguration:
             raise ValueError(f"Configuration file must contain a TOML table: {path}")
         return data
 
+    def _load_layer(self, path: Path) -> dict[str, Any]:
+        loaded = self._load_overrides(path)
+        data = reconcile_overrides(loaded, self.model_type, self._legacy_keys, source=str(path))
+        if data != loaded:
+            self._save_overrides(path, data)  # rewritten, so the notice is given once
+        return data
+
     def _load_default(self) -> BaseModel:
+        if self.default_path is None:
+            return self.model_type()
         if not self.default_path.exists():
             raise FileNotFoundError(f"Packaged default configuration not found: {self.default_path}")
         return self.model_type.model_validate(toml.load(self.default_path))
@@ -271,7 +339,7 @@ class PydanticConfiguration:
         else:
             self.project_root = Path(project_root).expanduser().resolve()
             self.project_path = (self.project_root / self.project_relative_path).resolve()
-            self._project_overrides = self._load_overrides(self.project_path)
+            self._project_overrides = self._load_layer(self.project_path)
         self._refresh()
 
     def entries(self) -> tuple[ConfigurationEntry, ...]:

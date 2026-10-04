@@ -68,6 +68,10 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
 
         self.master_db = MasterDB(self._master_db_path)
         self.project_manager = ProjectManager(self.master_db, app_id_filter=self.app_id)
+        if self.settings_manager.settings.general.prune_missing_projects:
+            pruned = self.project_manager.repository.delete_missing_projects()
+            if pruned:
+                self.app_logger.info("Pruned %d registry entries with missing project folders.", pruned)
         self._project_resource_contract = ProjectResourceContract(
             app_id=self.app_id,
             specs=coerce_project_resource_specs(project_resources),

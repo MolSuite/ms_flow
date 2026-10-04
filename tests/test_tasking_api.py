@@ -862,13 +862,13 @@ def test_molsuite_applies_operational_limits_from_settings(tmp_path, monkeypatch
     try:
         ms.settings_manager.update_setting("general.poll_interval", 0.05)
         ms.settings_manager.update_setting("operational_limits.staging_max_workers", 3)
-        ms.settings_manager.update_setting("operational_limits.max_inline_chunk_payload_bytes", 2048)
-        ms.settings_manager.update_setting("operational_limits.max_spool_payload_bytes", 8192)
+        ms.settings_manager.update_setting("operational_limits.max_inline_chunk_payload_mb", 2048 / 1048576)
+        ms.settings_manager.update_setting("operational_limits.max_spool_payload_mb", 8192 / 1048576)
         ms.settings_manager.update_setting("operational_limits.default_max_inflight_tasks", 4)
         ms.settings_manager.update_setting("operational_limits.default_max_inflight_items", 12)
-        ms.settings_manager.update_setting("operational_limits.output_sink_max_payload_bytes", 4096)
+        ms.settings_manager.update_setting("operational_limits.output_sink_max_payload_mb", 4096 / 1048576)
         ms.settings_manager.update_setting("operational_limits.output_sink_max_pending_chunks", 17)
-        ms.settings_manager.update_setting("operational_limits.output_sink_max_pending_bytes", 16384)
+        ms.settings_manager.update_setting("operational_limits.output_sink_max_pending_mb", 16384 / 1048576)
 
         ms.create_or_open_project(
             name="limits_project",

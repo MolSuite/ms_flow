@@ -143,6 +143,8 @@ class RayWorkerConfig(WorkerConfig):
     conda_env: str = ""
     python_version: str = ""
     setup_commands: List[str] = Field(default_factory=list)
+    # Absolute path on the remote where apps install the external tools they manage.
+    tools_home: str = ""
 
 
 
@@ -171,6 +173,8 @@ class HPCWorkerConfig(WorkerConfig):
     conda_env: str = ""
     python_version: str = ""
     setup_commands: List[str] = Field(default_factory=list)
+    # Absolute path on the remote where apps install the external tools they manage.
+    tools_home: str = ""
 
 
 class ResourcesConfig(BaseModel):
@@ -214,9 +218,17 @@ class DatabaseConfig(BaseModel):
     connection_timeout: int = 30
 
 
+def mb_to_bytes(value: float) -> int:
+    return max(1024, int(float(value) * 1024 * 1024))
+
+
 class GeneralConfig(BaseModel):
     poll_interval: float = 0.1
     log_level: LogLevel = "INFO"
+    prune_missing_projects: bool = Field(
+        default=True,
+        description="On startup, drop registry entries whose project folder no longer exists (e.g. tmp test projects).",
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -226,9 +238,11 @@ class GeneralConfig(BaseModel):
 
 
 class OperationalLimitsConfig(BaseModel):
+    # Sizes are configured in MB (humans read 16, not 16777216); the runtime
+    # converts them to bytes with `mb_to_bytes`.
     operational_profile: Literal["strict", "balanced", "throughput"] = "balanced"
-    max_inline_chunk_payload_bytes: int = Field(default=512 * 1024, ge=1024)
-    max_spool_payload_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    max_inline_chunk_payload_mb: float = Field(default=0.5, ge=0.001)
+    max_spool_payload_mb: float = Field(default=64.0, ge=0.001)
     staging_max_workers: int = Field(default=8, ge=1)
     default_max_inflight_tasks: int = Field(default=16, ge=1)
     default_max_inflight_items: int = Field(default=256, ge=1)
@@ -236,10 +250,10 @@ class OperationalLimitsConfig(BaseModel):
     output_sink_flush_retries: int = Field(default=3, ge=0)
     output_sink_retry_backoff_s: float = Field(default=0.05, ge=0.0)
     output_sink_max_buffer_factor: int = Field(default=10, ge=1)
-    output_sink_max_buffer_bytes: int = Field(default=16 * 1024 * 1024, ge=1024)
-    output_sink_max_payload_bytes: int = Field(default=4 * 1024 * 1024, ge=1024)
+    output_sink_max_buffer_mb: float = Field(default=16.0, ge=0.001)
+    output_sink_max_payload_mb: float = Field(default=4.0, ge=0.001)
     output_sink_max_pending_chunks: int = Field(default=1024, ge=1)
-    output_sink_max_pending_bytes: int = Field(default=256 * 1024 * 1024, ge=1024)
+    output_sink_max_pending_mb: float = Field(default=256.0, ge=0.001)
 
     @field_validator("operational_profile", mode="before")
     @classmethod
@@ -273,9 +287,12 @@ class Settings(BaseModel):
     Can be loaded from TOML or constructed programmatically.
     """
 
-    data_dir: str = "data"
-    projects_db: Path = Field(default_factory=lambda: Path.home().joinpath(".molsuite", "projects.db"))
-    executor_db: Optional[Path] = None
+    # The MolSuite home: moving it orphans every registered project, so it is not a UI
+    # setting. Each project carries its own executor.db.
+    projects_db: Path = Field(
+        default_factory=lambda: Path.home().joinpath(".molsuite", "projects.db"),
+        json_schema_extra={"settings_hidden": True},
+    )
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     operational_limits: OperationalLimitsConfig = Field(default_factory=OperationalLimitsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -306,12 +323,6 @@ class Settings(BaseModel):
 
         return cls()
 
-    @model_validator(mode="after")
-    def ensure_executor_db(self) -> "Settings":
-        if self.executor_db is None:
-            self.executor_db = self.projects_db.parent / "executor.db"
-        return self
-
     @classmethod
     def _find_config(cls) -> Path:
         search_paths = [
@@ -325,13 +336,7 @@ class Settings(BaseModel):
 
         return Path.home() / ".config" / "molsuite" / "config.toml"
 
-    @property
-    def data_path(self) -> Path:
-        return Path(self.data_dir).resolve()
-
-
     def ensure_dirs(self) -> None:
-        self.data_path.mkdir(parents=True, exist_ok=True)
         if self._config_path:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
 
