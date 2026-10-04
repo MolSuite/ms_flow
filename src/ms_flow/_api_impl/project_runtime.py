@@ -14,6 +14,7 @@ from ms_flow.core.project import ActiveProjectRuntime, ProjectDataContext, Proje
 from ms_flow.core.project.context import ProjectContext
 from ms_flow.core.project.resources import ProjectResource
 from ms_flow.core.project.manager import SettingsProfile
+from ms_flow.core.settings.models import mb_to_bytes
 
 ACTIVE_PROJECT_JOB_STATUSES = ("pending", "pending_feed", "queued", "running", "staging", "cancel_requested")
 
@@ -238,18 +239,18 @@ class MolSuiteProjectRuntimeMixin:
             poll_interval=float(general.poll_interval),
             progress_flush_interval=float(limits.progress_flush_interval_s),
             staging_max_workers=int(limits.staging_max_workers),
-            max_inline_chunk_payload_bytes=int(limits.max_inline_chunk_payload_bytes),
-            max_spool_payload_bytes=int(limits.max_spool_payload_bytes),
+            max_inline_chunk_payload_bytes=mb_to_bytes(limits.max_inline_chunk_payload_mb),
+            max_spool_payload_bytes=mb_to_bytes(limits.max_spool_payload_mb),
             logger=self.executor_logger,
         )
         executor_manager.configure_output_sink_limits(
             flush_retries=int(limits.output_sink_flush_retries),
             retry_backoff_s=float(limits.output_sink_retry_backoff_s),
             max_buffer_factor=int(limits.output_sink_max_buffer_factor),
-            max_buffer_bytes=int(limits.output_sink_max_buffer_bytes),
-            max_payload_bytes=int(limits.output_sink_max_payload_bytes),
+            max_buffer_bytes=mb_to_bytes(limits.output_sink_max_buffer_mb),
+            max_payload_bytes=mb_to_bytes(limits.output_sink_max_payload_mb),
             max_pending_chunks=int(limits.output_sink_max_pending_chunks),
-            max_pending_bytes=int(limits.output_sink_max_pending_bytes),
+            max_pending_bytes=mb_to_bytes(limits.output_sink_max_pending_mb),
         )
         self._register_configured_executors(executor_manager, resources)
         executor_manager.start()
