@@ -143,6 +143,8 @@ class RayWorkerConfig(WorkerConfig):
     conda_env: str = ""
     python_version: str = ""
     setup_commands: List[str] = Field(default_factory=list)
+    # Absolute path on the remote where apps install the external tools they manage.
+    tools_home: str = ""
 
 
 
@@ -171,6 +173,8 @@ class HPCWorkerConfig(WorkerConfig):
     conda_env: str = ""
     python_version: str = ""
     setup_commands: List[str] = Field(default_factory=list)
+    # Absolute path on the remote where apps install the external tools they manage.
+    tools_home: str = ""
 
 
 class ResourcesConfig(BaseModel):
