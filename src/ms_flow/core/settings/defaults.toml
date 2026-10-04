@@ -1,6 +1,7 @@
 [general]
 poll_interval = 0.1
 log_level = "INFO"
+prune_missing_projects = true
 
 [operational_limits]
 operational_profile = "balanced"

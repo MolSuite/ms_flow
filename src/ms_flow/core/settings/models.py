@@ -225,6 +225,10 @@ def mb_to_bytes(value: float) -> int:
 class GeneralConfig(BaseModel):
     poll_interval: float = 0.1
     log_level: LogLevel = "INFO"
+    prune_missing_projects: bool = Field(
+        default=True,
+        description="On startup, drop registry entries whose project folder no longer exists (e.g. tmp test projects).",
+    )
 
     @field_validator("log_level", mode="before")
     @classmethod
