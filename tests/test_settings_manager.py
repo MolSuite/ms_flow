@@ -108,9 +108,10 @@ def test_legacy_project_snapshot_is_migrated_to_sparse_overrides(tmp_path, monke
     assert sm.get_source("general.poll_interval") == "global"
 
 
-def test_executor_db_defaults_next_to_projects_db(tmp_path, monkeypatch):
+def test_storage_paths_are_not_ui_settings(tmp_path, monkeypatch):
     sm, _ = _build_manager(tmp_path, monkeypatch)
-    assert sm.settings.executor_db == sm.settings.projects_db.parent / "executor.db"
+    paths = {entry.path for entry in sm.entries()}
+    assert not paths & {"projects_db", "executor_db", "data_dir"}
 
 
 def test_logging_settings_defaults_exist(tmp_path, monkeypatch):
@@ -141,7 +142,7 @@ def test_settings_manager_exposes_packaged_configuration_provider(tmp_path, monk
     assert not any(entry.path.startswith("applications") for entry in sm.entries())
 
 
-def test_executor_db_is_derived_from_custom_projects_db_when_missing_in_config(tmp_path, monkeypatch):
+def test_custom_projects_db_is_read_from_config(tmp_path, monkeypatch):
     fake_home = tmp_path
     monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: fake_home)
     monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: fake_home)
@@ -154,7 +155,6 @@ def test_executor_db_is_derived_from_custom_projects_db_when_missing_in_config(t
 
     sm = SettingsManager()
     assert sm.settings.projects_db == custom_projects_db
-    assert sm.settings.executor_db == custom_projects_db.parent / "executor.db"
     assert sm.settings.logging.executor_level == "DEBUG"
 
 
@@ -215,3 +215,31 @@ def test_empty_legacy_contract_removes_historical_values(tmp_path, monkeypatch):
     assert sm.register_app_settings("testdock", ()) == ()
     assert "testdock" not in sm.settings.applications
     assert "testdock" not in toml.load(config_path).get("applications", {})
+
+
+def test_legacy_keys_are_migrated_and_rewritten(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
+    config_path = tmp_path / ".molsuite" / "config.toml"
+    config_path.parent.mkdir(parents=True)
+    with config_path.open("w") as f:
+        toml.dump(
+            {
+                "data_dir": "data",
+                "executor_db": "/old/executor.db",
+                "operational_limits": {"max_spool_payload_bytes": 128 * 1024 * 1024, "typo": 1},
+            },
+            f,
+        )
+
+    sm = SettingsManager()
+    assert sm.settings.operational_limits.max_spool_payload_mb == 128.0
+    assert toml.load(config_path) == {"operational_limits": {"max_spool_payload_mb": 128.0}}
+
+    notices = "\n".join(caplog.messages)
+    assert "'operational_limits.max_spool_payload_bytes' is now 'operational_limits.max_spool_payload_mb'" in notices
+    assert "'executor_db' no longer exists" in notices
+    assert "unknown setting 'operational_limits.typo'" in notices
+    caplog.clear()
+    SettingsManager()
+    assert not caplog.messages  # the file was rewritten: said once

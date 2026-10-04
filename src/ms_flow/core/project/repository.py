@@ -251,6 +251,16 @@ class ProjectRepository:
                     session.add(project)
             session.commit()
 
+    def delete_missing_projects(self) -> int:
+        """Drop rows whose folder is gone, across every app (the registry is shared)."""
+        with self.master_db.get_session() as session:
+            missing = [project for project in session.exec(select(Project)).all()
+                       if not Path(project.path).expanduser().exists()]
+            for project in missing:
+                session.delete(project)
+            session.commit()
+        return len(missing)
+
     def delete_projects(self, project_ids):
         with self.master_db.get_session() as session:
             for project_id in project_ids:

@@ -1,13 +1,12 @@
-data_dir = "data"
-
 [general]
 poll_interval = 0.1
 log_level = "INFO"
+prune_missing_projects = true
 
 [operational_limits]
 operational_profile = "balanced"
-max_inline_chunk_payload_bytes = 524288
-max_spool_payload_bytes = 67108864
+max_inline_chunk_payload_mb = 0.5
+max_spool_payload_mb = 64.0
 staging_max_workers = 8
 default_max_inflight_tasks = 16
 default_max_inflight_items = 256
@@ -15,10 +14,10 @@ progress_flush_interval_s = 2.0
 output_sink_flush_retries = 3
 output_sink_retry_backoff_s = 0.05
 output_sink_max_buffer_factor = 10
-output_sink_max_buffer_bytes = 16777216
-output_sink_max_payload_bytes = 4194304
+output_sink_max_buffer_mb = 16.0
+output_sink_max_payload_mb = 4.0
 output_sink_max_pending_chunks = 1024
-output_sink_max_pending_bytes = 268435456
+output_sink_max_pending_mb = 256.0
 
 [logging]
 max_file_size_mb = 10

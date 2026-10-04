@@ -10,12 +10,31 @@ from ms_flow.core.configuration import (
     configuration_entries,
     delete_path_value,
     get_path_value,
+    reconcile_overrides,
     set_path_value,
 )
 from ms_flow.core.events import setting_changed
 from ms_flow.core.settings.models import Settings
 
 _MISSING = object()
+
+
+_MB = 1024 * 1024
+# Renamed/removed settings, see ``reconcile_overrides``. Add an entry whenever one changes.
+_LEGACY_KEYS: dict[str, Any] = {
+    "data_dir": None,
+    "executor_db": None,
+    **{
+        f"operational_limits.{name}_bytes": (f"operational_limits.{name}_mb", lambda value: value / _MB)
+        for name in (
+            "max_inline_chunk_payload",
+            "max_spool_payload",
+            "output_sink_max_buffer",
+            "output_sink_max_payload",
+            "output_sink_max_pending",
+        )
+    },
+}
 
 
 class SettingsManager:
@@ -81,16 +100,15 @@ class SettingsManager:
         data = toml.load(path) or {}
         if not isinstance(data, dict):
             raise ValueError(f"Configuration file must contain a TOML table: {path}")
-        return data
+        migrated = reconcile_overrides(data, Settings, _LEGACY_KEYS, source=str(path))
+        if migrated != data:
+            SettingsManager._save_overrides(path, migrated)  # rewritten, so the notice is given once
+        return migrated
 
     def _compose(self, *layers: dict[str, Any]) -> Settings:
         data = self._default.model_dump(mode="python")
         for layer in layers:
             data = self._deep_merge_dicts(data, layer)
-            # executor_db is derived from projects_db unless that same layer explicitly
-            # chooses it. This preserves the existing Settings validator contract.
-            if "projects_db" in layer and "executor_db" not in layer:
-                data["executor_db"] = None
         return Settings.model_validate(data)
 
     def _build_effective_settings(self) -> Settings:

@@ -11,6 +11,7 @@ from sqlmodel import select
 from ms_flow.core.data import payload_has_input_specs, to_wire_value
 from ms_flow.core.database.executor_models import ExecutorJob, ExecutorJobChunk, ExecutorJobFeedState
 from ms_flow.core.executor.utils import _safe_json_dumps, _safe_json_loads
+from ms_flow.core.executor.tools import dependency_state
 
 if TYPE_CHECKING:
     from ms_flow.core.executor.manager import ExecutorManager, JobFeed
@@ -115,6 +116,13 @@ class FeedingService:
                     unfinished = []
                     failed_or_canceled: list[str] = []
                     for dep_id in deps:
+                        tool_state = dependency_state(str(dep_id))
+                        if tool_state is not None:  # an external-tool install, not a job
+                            if tool_state == "failed":
+                                failed_or_canceled.append(dep_id)
+                            elif tool_state != "completed":
+                                unfinished.append(dep_id)
+                            continue
                         dep_job = session.exec(select(ExecutorJob).where(ExecutorJob.job_id == dep_id)).first()
                         if dep_job is None:
                             unfinished.append(dep_id)
