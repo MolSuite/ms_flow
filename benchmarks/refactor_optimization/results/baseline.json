@@ -1,0 +1,87 @@
+{
+  "label": "baseline",
+  "recorded_at": "2026-10-08T01:10:33+00:00",
+  "commit": "1be4a2d",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        389.9592,
+        368.668,
+        383.8101,
+        365.0071,
+        383.679
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        544.0182,
+        512.0761,
+        511.9217
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        4.1766,
+        4.2185,
+        4.2781
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        5.6157,
+        5.5069,
+        5.7516
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        2.0794
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        5.0642
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        2.4354
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        1.4378
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        91.4922
+      ],
+      "unit": "MB"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": false,
+    "worker_death_pool_recovers": false,
+    "kill9_no_orphans": false,
+    "second_engine_safe": false
+  }
+}
