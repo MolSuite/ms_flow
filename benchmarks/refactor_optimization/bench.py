@@ -78,13 +78,13 @@ class Engine:
         self.eng.register("process", engine.ProcessExecutor(procs))
 
     def run(self, executor: str, payloads, fn=workers.noop, inflight: int | None = None,
-            marks_every: int = 0, timeout: float = 1800.0, key: str | None = None):
+            marks_every: int = 0, timeout: float = 1800.0, key: str | None = None, options: dict | None = None):
         """Run one job to its end. Returns (seconds, marks, job_snapshot)."""
         payloads = list(payloads)
         counter = _Counter(marks_every)
         counter.t0 = time.perf_counter()
         job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight, journal="project", key=key,
-                                 on_result=counter.handle, on_terminal=counter.on_job_terminal)
+                                 on_result=counter.handle, on_terminal=counter.on_job_terminal, **(options or {}))
         counter.done.wait(timeout)
         seconds = time.perf_counter() - counter.t0
         return seconds, counter.marks, self.eng.status(job_id)
@@ -165,6 +165,23 @@ def check_worker_death() -> dict[str, bool]:
         _, _, second = eng.run("process", _items(20), timeout=60)
         return {"worker_death_isolated": first.chunks_done >= 39 and first.chunks_failed <= 1,
                 "worker_death_pool_recovers": second.chunks_done == 20}
+    finally:
+        eng.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def check_retry_and_limit() -> dict[str, bool]:
+    """A chunk that fails twice ends done on its third try; one that hangs is cut at its limit."""
+    d = _workdir("retry")
+    eng = Engine(d, procs=4)
+    try:
+        flaky = [{"idx": 0, "path": str(d / "tries"), "fails": 2}]
+        _, _, third = eng.run("process", flaky, fn=workers.flaky, timeout=60,
+                               options={"retries": 2, "retry_wait": 0.05})
+        naps = [{"idx": i, "s": 120 if i == 5 else 0.2} for i in range(12)]
+        seconds, _, hung = eng.run("process", naps, fn=workers.nap, timeout=60, options={"timeout": 1.0})
+        return {"retry_then_done": (third.status, third.chunks_done, third.chunks_retried) == ("completed", 1, 2),
+                "hung_chunk_cut": (hung.chunks_done, hung.chunks_failed) == (11, 1) and seconds < 15}
     finally:
         eng.close()
         shutil.rmtree(d, ignore_errors=True)
@@ -271,7 +288,7 @@ def main() -> None:
     put("peak_rss_mb", [resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024], "MB")
 
     checks: dict[str, bool] = {}
-    for check in (check_worker_death, check_kill9, check_second_engine):
+    for check in (check_worker_death, check_kill9, check_second_engine, check_retry_and_limit):
         try:
             checks.update(check())
         except Exception as exc:  # a check that cannot even run is a failed check

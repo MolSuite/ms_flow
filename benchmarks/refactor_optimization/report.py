@@ -42,6 +42,10 @@ STEPS = {
     "batching": (None, "Chunks measured to take well under 10 ms share a pool task with the ones behind them, up "
                        "to 64 to a task. Each still succeeds, fails, is retried alone after a worker death and is "
                        "journaled on its own. Chunks worth a task of their own are left alone.", True),
+    "retries": (None, "A chunk that raises, outlives its time limit or kills its worker is tried again, up to "
+                      "the job's retries and waiting longer each time. A chunk past its limit is stopped, and so "
+                      "is whatever a canceled job was running; chunks that fall with them start again at no "
+                      "cost to their own retries.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
@@ -84,6 +88,10 @@ CHECKS = [
      "that were not on record.", "F2-7"),
     ("second_engine_safe", "Second engine on the same file is safe",
      "A second engine on the same executor.db is refused, or both jobs finish complete.", "F1-3"),
+    ("retry_then_done", "A chunk that fails is tried again",
+     "A chunk fails twice and works the third time: it counts as done, with two retries on record.", "F1-1"),
+    ("hung_chunk_cut", "A chunk that hangs is cut",
+     "One of 12 chunks sleeps for two minutes under a limit of 1 s: it alone fails and the job ends.", "F1-2"),
 ]
 
 NOISE_FLOOR_PTS = 3.0
