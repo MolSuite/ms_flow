@@ -24,6 +24,8 @@ STEPS = {
     "engine core": (None, "New engine next to the old one (ms_flow.engine): state in memory, CPU/GPU/memory tokens, "
                           "event loop, pools that recover. No journal yet, so nothing is written to disk. First job: "
                           "the workers import the whole ms_flow package (pool start alone is 75 ms).", True),
+    "lazy import": (None, "The ms_flow package loads its top-level names on first use, so a worker that only runs chunks "
+                          "imports the engine (16 ms) and not the whole API (358 ms).", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
