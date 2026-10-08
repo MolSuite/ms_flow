@@ -39,9 +39,10 @@ CANCELED = "canceled"
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
 # Chunks shorter than this share a task, as many as it takes to fill it and at most _PACK_MAX.
+# A task costs about 1 ms to hand out with every core busy, so 100 ms keeps that near 1 %.
 # ponytail: one figure for every executor; let the executor name its own when a remote one,
 # whose tasks cost far more than a local process's, starts packing.
-_TASK_SECONDS, _PACK_MAX = 0.01, 64
+_TASK_SECONDS, _PACK_MAX = 0.1, 64
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 
 
@@ -559,8 +560,10 @@ class Engine:
         job.open += 1
         if cost is None or self.tokens.ever_fits(cost):
             if job.pack > 1:  # short chunks: the ones behind it with the same needs share its task
-                pack = [chunk]
-                while len(pack) < job.pack and job.open < job.window and ready and ready[0].cost == cost:
+                pack, size = [chunk], job.pack
+                if job.fed_all:  # the tail is shared out, or the last tasks take it all and workers idle
+                    size = min(size, -(-(len(ready) + 1) // slot.impl.capacity))
+                while len(pack) < size and job.open < job.window and ready and ready[0].cost == cost:
                     pack.append(ready.popleft())
                     job.seq += 1
                     job.open += 1

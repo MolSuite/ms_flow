@@ -53,9 +53,9 @@ Una herramienta que solo sabe trabajar por lotes lo declara (`@task(batched=True
 1. `batch=` en el envío.
 2. La configuración del ejecutor para esa task (lo normal en HPC).
 3. `@task(batch=N)`: lo que el autor sabe de su trabajo.
-4. Automático: el motor mide lo que tarda un elemento y agrupa los que caben en el objetivo del ejecutor. Un elemento de segundos va solo.
+4. Automático: el motor mide lo que tarda un elemento y agrupa los que caben en el objetivo del ejecutor (100 ms en local). Un elemento de segundos va solo.
 
-El objetivo hoy es 10 ms y es poco. Medido con 14 workers y elementos que ocupan CPU (tiempo real / tiempo ideal):
+El objetivo era 10 ms y era poco. Medido con 14 workers y elementos que ocupan CPU (tiempo real / tiempo ideal):
 
 | Elemento × cantidad | Objetivo 10 ms | 100 ms | 500 ms |
 |---|---|---|---|
@@ -66,7 +66,7 @@ El objetivo hoy es 10 ms y es poco. Medido con 14 workers y elementos que ocupan
 | 100 ms × 28 | 1,02 | 1,05 | 2,52 |
 | 20 ms × 140 | 1,11 | 1,33 | 2,42 |
 
-Con 10 ms se pierde hasta un 22 %: despachar una tarea cuesta cerca de 1 ms cuando todos los núcleos están ocupados. Con 100 ms la pérdida baja al 2-3 %. Con 500 ms no se gana nada más y los jobs pequeños tardan 2,5 veces más, porque los últimos elementos se agrupan en pocos workers y el resto queda parado. Propuesta: objetivo de 100 ms en local, propio de cada ejecutor, y no agrupar más de lo que deja a todos los workers con trabajo (elementos leídos / workers). La segunda regla va contra la pérdida de los jobs pequeños (20 ms × 140, 100 ms × 28); está sin medir.
+Con 10 ms se pierde hasta un 22 %: despachar una tarea cuesta cerca de 1 ms cuando todos los núcleos están ocupados. Con 100 ms la pérdida baja al 2-3 %. Con 500 ms no se gana nada más y los jobs pequeños tardan 2,5 veces más, porque los últimos elementos se agrupan en pocos workers y el resto queda parado. Decidido el 2026-10-08 y hecho en la rama `refactor/engine-pack-target`: objetivo de 100 ms, y cuando la fuente se agota lo que queda se reparte entre los workers. Con las dos cosas, 20 ms × 140 queda en 1,09 y 100 ms × 28 en 1,04. Falta que cada ejecutor ponga su propio objetivo.
 
 **Progreso.** Del job: (elementos hechos + fracción de los que corren) / total. La fracción llega por casillas en un fichero mapeado en memoria, no por colas. Lote de un elemento: `report()` de la task, que el motor pide solo cuando el job tiene pocos elementos (hasta 2 × workers; se fuerza con `progress=`). Lote de varios: el worker cuenta los hechos solo. En HPC, únicamente elementos hechos por lote, leídos al sondear.
 

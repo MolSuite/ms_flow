@@ -1,0 +1,90 @@
+{
+  "label": "pack target",
+  "recorded_at": "2026-10-08T21:08:23+00:00",
+  "commit": "edbd1e9+dirty",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        359.4636,
+        368.9022,
+        369.8999,
+        384.3617,
+        372.4207
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        98.5826,
+        92.9751,
+        88.0048
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        0.0187,
+        0.0274,
+        0.0292
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        0.0156,
+        0.0112,
+        0.0119
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        0.0226
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        0.0391
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        1.7306
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        0.001
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        38.125
+      ],
+      "unit": "MB"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": true,
+    "worker_death_pool_recovers": true,
+    "kill9_no_orphans": true,
+    "resume_skips_done": true,
+    "second_engine_safe": true,
+    "retry_then_done": true,
+    "hung_chunk_cut": true
+  }
+}

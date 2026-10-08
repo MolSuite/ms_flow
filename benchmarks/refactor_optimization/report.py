@@ -49,6 +49,12 @@ STEPS = {
     "memory": (None, "A job that continues looks each chunk's key up in the journal file instead of loading "
                      "every done key (232 MB down to 35 MB continuing a job with 1.8 million chunks done). The "
                      "engine lets go of a job when it ends and keeps the last snapshot of the latest 1000.", True),
+    "pack target": (None, "Chunks share a task until it lasts 100 ms instead of 10 ms: handing a task out costs "
+                          "about 1 ms with every core busy, so CPU-bound chunks of 1 to 5 ms ran 15 to 22 % over "
+                          "the ideal and now run 2 to 3 % over. Once the source has ended, what is left is shared "
+                          "out among the workers, so a small job does not end on a few long tasks with workers "
+                          "idle. The bench chunks are empty and already went 64 to a task: same cost per chunk "
+                          "against the previous step run side by side (0.0074 to 0.0086 ms both).", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.

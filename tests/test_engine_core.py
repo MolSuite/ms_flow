@@ -221,6 +221,7 @@ class _CountingPool(ProcessExecutor):
 
     def submit(self, *args):
         self.tasks += 1
+        self.sizes.append(len(args[1]) if len(args) > 3 else 1)  # a fourth argument: a shared task
         return super().submit(*args)
 
 
@@ -229,6 +230,7 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
     results, errors = {}, {}
     with Engine(cpus=4, mem_mb=0) as engine:
         pool = _CountingPool(4)
+        pool.sizes = []
         engine.register("process", pool)
         payloads = [{"idx": i} for i in range(5000)]
         payloads[7]["fail"] = True
@@ -240,8 +242,12 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         assert pool.tasks < 1000 and engine.tokens.free[0] == 4
 
         pool.tasks = 0  # a chunk worth a task of its own gets one
-        long = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.02} for i in range(40)]), 120)
+        long = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.2} for i in range(40)]), 120)
         assert (long.status, long.chunks_done, pool.tasks) == ("completed", 40, 40)
+
+        pool.sizes = []  # the last chunks of a job are shared out among the workers, not packed into one
+        tail = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.02} for i in range(80)]), 120)
+        assert tail.chunks_done == 80 and max(pool.sizes) > 1 and pool.sizes[-3:] == [1, 1, 1]
 
         # a dead worker costs the chunk that killed it, not the ones that shared its task
         pool.tasks = 0
