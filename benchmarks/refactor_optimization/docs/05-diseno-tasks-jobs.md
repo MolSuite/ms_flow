@@ -1,5 +1,7 @@
 # 05 — Diseño de tasks y jobs
 
+Estado: acordado con Mario el 2026-10-08. Nada de esto está construido salvo lo que lista la última sección.
+
 Borrador del 2026-10-08 para revisar. Nada construido. Sale de la auditoría (`04-auditoria-tasks-jobs.md`) y de sus cuatro rondas de discusión.
 
 ## Piezas
@@ -86,7 +88,7 @@ Medido en una pose (1iep, Vina): detectar interacciones 0,04 s; lo que encarece 
 
 **Entradas con ficheros.** Un `FileInputSpec` en un elemento lo resuelve el ejecutor (en local, la ruta tal cual; en remoto, copiar el fichero, una vez si varios elementos lo comparten). El motor llama a esa función desde el hilo del job, nunca desde el hilo de eventos: `submit` de un ejecutor no puede bloquear.
 
-**Pasos previos (`setup`).** Hoy un job ejecuta una sola task; `setup`, `stage_chunk` y `finalize` son funciones sueltas que corren en el proceso que lanza, en un pool aparte, sin recursos declarados ni reintentos. El motor nuevo también lleva una función por job. Propuesta: un job sigue siendo una task aplicada a muchos elementos, y además puede listar pasos que corren una vez, en orden, antes del primer elemento:
+**Pasos previos (`setup`).** Hoy un job ejecuta una sola task; `setup`, `stage_chunk` y `finalize` son funciones sueltas que corren en el proceso que lanza, en un pool aparte, sin recursos declarados ni reintentos. El motor nuevo también lleva una función por job. Acordado con Mario el 2026-10-08: un job sigue siendo una task aplicada a muchos elementos, y además puede listar pasos que corren una vez, en orden, antes del primer elemento:
 
 ```python
 @task(local=True, timeout=600)
@@ -107,6 +109,22 @@ def docking_job(params, project, setup): ...
 - En el motor es lo que ya hace `after=`: la fuente no se lee hasta que terminan y el job falla si uno falla. Se construye con el primer ejecutor remoto; en local nadie lo usa.
 - Preparar el entorno queda fuera (se hace al configurar el ejecutor, en `ms_env`); comprobarlo sí puede ser un paso.
 - Los ficheros de cada elemento no necesitan paso: los cubre la regla anterior.
+- `finalize` se trata igual: es un paso del job, al final, y se ve como tal.
+
+En el monitor los pasos son parte del job, no jobs aparte (vista acordada, sin construir):
+
+```
+Job                 Status          Executor  Progress  Chunks
+amdock_docking_job  preparing 1/2   cluster   —         0/12000
+
+    step   upload_inputs   running   62 %   00:41
+    step   check_env       pending
+```
+
+- `Status` lleva la fase: `preparing 1/2`, `running`, `finalizing`.
+- Los pasos son filas del panel de detalle, con nombre, estado, tiempo y progreso si llaman a `report()`; los previos van antes de los lotes y `finalize` después.
+- Un paso que falla sale en Errors con su traceback, como un lote.
+- La barra cuenta solo elementos; durante la preparación queda vacía.
 
 **Registro de lo hecho.** El journal sigue registrando cada elemento hecho cuando el job se envía con `journal=` y `key=`. Quien invoca decide qué pide (por ejemplo, excluir lo ya calculado); `ms_flow` sabe por sí mismo qué tiene activo y qué tiene registrado. El total al reanudar usa lo registrado.
 
@@ -120,9 +138,8 @@ def docking_job(params, project, setup): ...
 
 ## Abierto
 
-1. Confirmar los pasos previos como lista de tasks (`setup=[...]`).
-2. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
-3. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
+1. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
+2. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
 
 ## Para más adelante: task compuesta
 
