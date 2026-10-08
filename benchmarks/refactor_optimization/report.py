@@ -30,6 +30,10 @@ STEPS = {
                       "its own job. Every chunk gets a content key (16-byte blake2b) and may carry its own CPU, GPU and "
                       "memory cost. Costs about 0.005 ms per chunk: the key and one more thread sharing the interpreter.",
                 True),
+    "journal": (None, "Jobs are recorded in executor.db again: raw sqlite3, one writer thread, one transaction every "
+                      "50 ms, a 5-column row per finished chunk and no payload. A finished job keeps one row plus its "
+                      "failures (the large job peaks at 37 bytes per chunk while it runs). One process owns each "
+                      "journal through an operating system lock, so the second engine is refused.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.

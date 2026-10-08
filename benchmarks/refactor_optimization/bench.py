@@ -67,8 +67,13 @@ class Engine:
     def __init__(self, workdir: Path, procs: int = CPUS):
         from ms_flow import engine
 
-        self.workdir = Path(workdir)  # no journal yet: nothing is written here
+        self.workdir = Path(workdir)
         self.eng = engine.Engine(cpus=CPUS)
+        try:
+            self.eng.attach("project", self.workdir / "executor.db")
+        except Exception:
+            self.eng.close()
+            raise
         self.eng.register("thread", engine.ThreadExecutor(2 * CPUS))
         self.eng.register("process", engine.ProcessExecutor(procs))
 
@@ -78,7 +83,7 @@ class Engine:
         payloads = list(payloads)
         counter = _Counter(marks_every)
         counter.t0 = time.perf_counter()
-        job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight,
+        job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight, journal="project",
                                  on_result=counter.handle, on_terminal=counter.on_job_terminal)
         counter.done.wait(timeout)
         seconds = time.perf_counter() - counter.t0
