@@ -17,6 +17,12 @@ def _boom_on_3(payload):
     return payload * 2
 
 
+def _echo(payload):
+    if "fail" in payload:
+        raise ValueError("asked to")
+    return payload
+
+
 class _Gauge:
     """A chunk function that records how many of itself ran at once."""
 
@@ -199,3 +205,39 @@ def test_worker_death_costs_one_chunk():
         second = engine.wait(engine.submit("process", workers.noop, [{"idx": i} for i in range(20)]), 60)
         assert (second.status, second.chunks_done, second.peak_mem_mb > 0) == ("completed", 20, True)
         assert engine.tokens.free[0] == 4
+
+
+class _CountingPool(ProcessExecutor):
+    tasks = 0
+
+    def submit(self, *args):
+        self.tasks += 1
+        return super().submit(*args)
+
+
+@pytest.mark.slow
+def test_short_chunks_share_a_task_and_long_ones_do_not():
+    results, errors = {}, {}
+    with Engine(cpus=4, mem_mb=0) as engine:
+        pool = _CountingPool(4)
+        engine.register("process", pool)
+        payloads = [{"idx": i} for i in range(5000)]
+        payloads[7]["fail"] = True
+        short = engine.wait(engine.submit("process", _echo, payloads, on_result=results.__setitem__,
+                                          on_error=errors.__setitem__), 120)
+        assert (short.status, short.chunks_done, short.chunks_failed) == ("completed_with_errors", 4999, 1)
+        assert list(errors) == [content_key(payloads[7])] and "ValueError" in short.error
+        assert len(results) == 4999 and results[content_key(payloads[8])] == {"idx": 8}
+        assert pool.tasks < 1000 and engine.tokens.free[0] == 4
+
+        pool.tasks = 0  # a chunk worth a task of its own gets one
+        long = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.02} for i in range(40)]), 120)
+        assert (long.status, long.chunks_done, pool.tasks) == ("completed", 40, 40)
+
+        # a dead worker costs the chunk that killed it, not the ones that shared its task
+        pool.tasks = 0
+        payloads = [{"idx": i} for i in range(8, 3008)]
+        payloads[2000] = {"idx": 7}
+        died = engine.wait(engine.submit("process", workers.die_on_7, payloads), 120)
+        assert (died.status, died.chunks_done, died.chunks_failed) == ("completed_with_errors", 2999, 1)
+        assert "worker process died" in died.error and pool.tasks < 1500 and engine.tokens.free[0] == 4

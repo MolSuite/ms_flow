@@ -37,6 +37,10 @@ FAILED = "failed"
 CANCELED = "canceled"
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
+# Chunks shorter than this share a task, as many as it takes to fill it and at most _PACK_MAX.
+# ponytail: one figure for every executor; let the executor name its own when a remote one,
+# whose tasks cost far more than a local process's, starts packing.
+_TASK_SECONDS, _PACK_MAX = 0.01, 64
 
 
 def content_key(payload) -> bytes:
@@ -73,7 +77,7 @@ class _Job:
                  "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
-                 "skip", "after", "chunks")
+                 "skip", "after", "chunks", "pace", "pack", "elastic")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
@@ -83,20 +87,21 @@ class _Job:
 class _Chunk:
     """A chunk between dispatch and its result being delivered. Finished ones are only counted."""
 
-    __slots__ = ("job", "key", "payload", "cost", "handle", "alone")
+    __slots__ = ("job", "key", "payload", "cost", "handle", "alone", "pack", "started")
 
     def __init__(self, job: _Job, key, payload, cost):
         self.job, self.key, self.payload, self.cost = job, key, payload, cost
-        self.handle, self.alone = None, False
+        self.handle, self.alone, self.pack = None, False, None  # `pack`: the chunks sharing its task
 
 
 class _Slot:
     """A registered executor and what the loop tracks about it."""
 
-    __slots__ = ("impl", "inflight", "suspects", "isolating")
+    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
+        self.packs = hasattr(impl, "submit_many")
 
 
 class Engine:
@@ -167,6 +172,9 @@ class Engine:
         `max_cpu` caps the job as a whole; a chunk above the cap runs alone in its job.
         `chunks` is read on its own thread. `window` is how many chunks may be between dispatch
         and delivered result, and how many more may be read ahead.
+        Chunks that take well under a task's worth of time travel several to a task where the
+        executor allows it; each still succeeds, fails and is recorded on its own. Left to
+        itself the window grows with them, since such chunks are small by construction.
         A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
@@ -198,6 +206,7 @@ class Engine:
                              f"the engine has {self.tokens.total}")
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.window = window or 2 * slot.impl.capacity
+        job.pace, job.pack, job.elastic = 0.0, 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
@@ -346,13 +355,33 @@ class Engine:
             return
         if peak_mb > job.peak_mem_mb:
             job.peak_mem_mb = peak_mb
+        pack, chunk.pack = chunk.pack, None
+        if slot.packs and status == DONE:
+            # Seconds per chunk as seen from here, so with the trip to the worker and back: a
+            # payload that is expensive to send is never mistaken for a short chunk.
+            took = max(time.perf_counter() - chunk.started, 1e-6) / (len(pack) if pack else 1)
+            job.pace = took if took > job.pace else (job.pace + took) / 2  # slow down at once, speed up warily
+            job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
+            if job.elastic:
+                job.window = 2 * slot.impl.capacity * job.pack
+        if pack is None:
+            self._chunk_ended(chunk, status, result, error)
+        elif status == DONE:  # the task ran: every chunk has its own outcome
+            for member, (value, failure) in zip(pack, result):
+                self._chunk_ended(member, ERROR if failure else DONE, value, failure)
+        else:  # lost ones go on to run alone, like any other
+            for member in pack:
+                self._chunk_ended(member, status, None, error)
+
+    def _chunk_ended(self, chunk: _Chunk, status: str, result, error) -> None:
+        job = chunk.job
         if status == DONE:
             if job.on_result is None:
                 self._settle(job, chunk.key, None)
             else:
                 self._deliveries.put((job.on_result, (chunk.key, result), (job, chunk.key)))
         elif status == LOST and not chunk.alone:
-            slot.suspects.append(chunk)  # collateral or culprit: running it alone will tell
+            job.slot.suspects.append(chunk)  # collateral or culprit: running it alone will tell
         elif status == LOST:
             self._settle(job, chunk.key, "the worker process died while running this chunk\n" + error)
         else:
@@ -422,15 +451,23 @@ class Engine:
                 or (job.max_cpu is not None and job.cpu_used and job.cpu_used + cost[0] > job.max_cpu)):
             return False
         ready.popleft()
-        if 2 * len(ready) <= job.window and not job.room.is_set():
-            job.room.set()  # half empty: one wake-up refills it, instead of one per chunk
         job.seq += 1
         job.open += 1
         if cost is None or self.tokens.ever_fits(cost):
+            if job.pack > 1:  # short chunks: the ones behind it with the same needs share its task
+                pack = [chunk]
+                while len(pack) < job.pack and job.open < job.window and ready and ready[0].cost == cost:
+                    pack.append(ready.popleft())
+                    job.seq += 1
+                    job.open += 1
+                if len(pack) > 1:
+                    chunk.pack = pack
             self._launch(chunk, alone=False)
         else:
             self._settle(job, chunk.key, f"a chunk needing (cpu, gpu, mem_mb)={cost} can never run: "
                                          f"the engine has {self.tokens.total}")
+        if 2 * len(ready) <= job.window and not job.room.is_set():
+            job.room.set()  # half empty: one wake-up refills it, instead of one per chunk
         return True
 
     def _on_fed(self) -> None:
@@ -470,8 +507,12 @@ class Engine:
         slot.inflight += 1
         slot.isolating = chunk.alone = alone
         job.flying.add(chunk)
+        chunk.started = time.perf_counter()
         try:
-            chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk)
+            if chunk.pack is None:
+                chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk)
+            else:  # one task, so one worker and one chunk's tokens: they run one after another
+                chunk.handle = slot.impl.submit_many(job.fn, [c.payload for c in chunk.pack], chunk)
         except Exception:
             self._on_done(chunk, ERROR, None, "the executor refused the chunk\n" + traceback.format_exc(), 0)
 
@@ -480,11 +521,11 @@ class Engine:
     def _feed(self, job: _Job, chunks) -> None:
         fatal, matched, skip = None, 0, job.skip
         try:
-            ready, room, window = job.ready, job.room, job.window
+            ready, room = job.ready, job.room
             for payload in chunks:
-                while len(ready) >= window:  # at most `window` chunks read ahead
+                while len(ready) >= job.window:  # at most `window` chunks read ahead
                     room.clear()
-                    if len(ready) >= window:
+                    if len(ready) >= job.window:
                         room.wait()
                 if job.status != RUNNING:
                     return
