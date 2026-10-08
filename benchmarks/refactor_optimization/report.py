@@ -46,6 +46,9 @@ STEPS = {
                       "the job's retries and waiting longer each time. A chunk past its limit is stopped, and so "
                       "is whatever a canceled job was running; chunks that fall with them start again at no "
                       "cost to their own retries.", True),
+    "memory": (None, "A job that continues looks each chunk's key up in the journal file instead of loading "
+                     "every done key (232 MB down to 35 MB continuing a job with 1.8 million chunks done). The "
+                     "engine lets go of a job when it ends and keeps the last snapshot of the latest 1000.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
