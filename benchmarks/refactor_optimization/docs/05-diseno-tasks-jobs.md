@@ -80,21 +80,45 @@ Con 10 ms se pierde hasta un 22 %: despachar una tarea cuesta cerca de 1 ms cuan
 
 **Entradas con ficheros.** Un `FileInputSpec` en un elemento lo resuelve el ejecutor (en local, la ruta tal cual; en remoto, copiar el fichero, una vez si varios elementos lo comparten). El motor llama a esa función desde el hilo del job, nunca desde el hilo de eventos: `submit` de un ejecutor no puede bloquear.
 
-**Preparación en remoto.** Para lo que era `setup`: lo que es de cada elemento va por la regla anterior; lo que es una vez por job es el código de la fuente antes de su primer `yield` (corre una vez, en el proceso que lanza, antes de cualquier elemento) o un job previo con `after=`. Si con ejecutores remotos no basta, se añade entonces un `setup=` al job.
+**Pasos previos (`setup`).** Hoy un job ejecuta una sola task; `setup`, `stage_chunk` y `finalize` son funciones sueltas que corren en el proceso que lanza, en un pool aparte, sin recursos declarados ni reintentos. El motor nuevo también lleva una función por job. Propuesta: un job sigue siendo una task aplicada a muchos elementos, y además puede listar pasos que corren una vez, en orden, antes del primer elemento:
+
+```python
+@task(local=True, timeout=600)
+def upload_inputs(params): ...      # runs where the job is submitted
+
+@task(timeout=60)
+def check_env(params): ...          # runs on the job's executor
+
+
+@job(task=dock, setup=[upload_inputs, check_env], ...)
+def docking_job(params, project, setup): ...
+```
+
+- Cada paso es una task normal: declara recursos, tiempo máximo y reintentos, y tiene log y progreso. `local=True` lo fija al proceso que lanza; sin él corre en el ejecutor del job.
+- Si un paso falla, el job falla sin leer la fuente. El job muestra la fase en que está (preparando, ejecutando, finalizando).
+- Lo que devuelven los pasos lo recibe la fuente.
+- Al reanudar se repiten, así que deben poder repetirse sin daño (subir solo lo que falta).
+- En el motor es lo que ya hace `after=`: la fuente no se lee hasta que terminan y el job falla si uno falla. Se construye con el primer ejecutor remoto; en local nadie lo usa.
+- Preparar el entorno queda fuera (se hace al configurar el ejecutor, en `ms_env`); comprobarlo sí puede ser un paso.
+- Los ficheros de cada elemento no necesitan paso: los cubre la regla anterior.
 
 **Registro de lo hecho.** El journal sigue registrando cada elemento hecho cuando el job se envía con `journal=` y `key=`. Quien invoca decide qué pide (por ejemplo, excluir lo ya calculado); `ms_flow` sabe por sí mismo qué tiene activo y qué tiene registrado. El total al reanudar usa lo registrado.
 
 ## Qué desaparece
 
 - La clase `JobSpec`, las plantillas `streaming_job`, `batch_job` y `build_streaming_job_definition`, y `molsuite.task` / `molsuite.job`.
-- De la declaración: `required`, `produces`, `setup`, `stage_chunk`, `stage_fail_policy`, `max_stage_failures`, `store_results`, `result_handler_factory`, `cpu_required` (pasa a `cpu`, `gpu`, `mem_mb`) y los pares función / `*_ref` (la referencia se deriva).
+- De la declaración: `required`, `produces`, `setup` como función suelta, `stage_chunk`, `stage_fail_policy`, `max_stage_failures`, `store_results`, `result_handler_factory`, `cpu_required` (pasa a `cpu`, `gpu`, `mem_mb`) y los pares función / `*_ref` (la referencia se deriva).
 - `InputSource.iter_chunks` y `batch_size`; queda `iter_items`.
 - El saco `config` con objetos vivos: la fuente recibe el proyecto; la task, solo parámetros y rutas.
 - En AMDockVS, más adelante: las reglas por nombre de `runtime.py` y los `progress_cb`.
 
 ## Abierto
 
-1. Objetivo del lote automático: 100 ms (medido) frente a los 500 ms que propuso Mario.
-2. Al reanudar, el motor avisa si la fuente no trae ninguno de los elementos hechos. Con una fuente que excluye lo hecho ese aviso es falso: quitarlo o dejar que el job lo apague.
-3. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
-4. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
+1. Confirmar los pasos previos como lista de tasks (`setup=[...]`).
+2. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
+3. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
+
+## Hecho en el motor a raíz de este documento
+
+- `refactor/engine-pack-target`: objetivo del lote automático de 100 ms y reparto del final del job.
+- `refactor/engine-resume-count`: sin aviso al reanudar; lo hecho cuenta aunque la fuente no lo traiga.

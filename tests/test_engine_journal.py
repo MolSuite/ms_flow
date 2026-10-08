@@ -145,3 +145,19 @@ def test_a_canceled_job_continues_or_is_discarded(tmp_path):
         assert _rows(db, "SELECT count(*) FROM chunks") == [(0,)]
         job = engine.submit("thread", workers.nap, payloads[:20], journal="project", key="dock-2")  # free again
         assert engine.wait(job, 30).chunks_done == 20
+
+
+def test_a_continued_job_counts_what_it_had_done_when_the_source_leaves_it_out(tmp_path):
+    payloads, done = [{"s": 0.005, "i": i} for i in range(200)], set()
+    with _engine(tmp_path) as engine:
+        job = engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1",
+                            on_result=lambda key, result: done.add(key))
+        while engine.status(job).chunks_done < 30:
+            time.sleep(0.01)
+        engine.cancel(job)
+        before = engine.wait(job, 30)
+
+        left = [p for p in payloads if content_key(p) not in done]  # the caller leaves out what is done
+        after = engine.wait(engine.submit("thread", workers.nap, left, journal="project", key="dock-1"), 60)
+        assert before.chunks_done == len(done) and len(left) == 200 - len(done)
+        assert (after.status, after.chunks_done, after.chunks_total) == ("completed", 200, 200)

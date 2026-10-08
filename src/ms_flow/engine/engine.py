@@ -580,15 +580,12 @@ class Engine:
     def _on_fed(self) -> None:
         """Nothing to record: the dispatch pass that follows every event picks the chunk up."""
 
-    def _on_source_end(self, job: _Job, fatal: str | None, matched: int) -> None:
+    def _on_source_end(self, job: _Job, fatal: str | None) -> None:
         if job.status == RUNNING:
-            if job.skip:
-                if not matched:
-                    log.warning("job %s (%s): the source brought back none of its %d done chunks, so all of it "
-                                "runs again; payloads must be the same in every run", job.id, job.name, job.skip)
-                job.done -= job.skip - matched  # done chunks the source no longer brings do not count
-                job.skip = None
-            job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready) + matched
+            # What a continued job had done counts whether or not the source brings it back: whoever
+            # submits may well leave out what is already done.
+            job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready) + (job.skip or 0)
+            job.skip = None
             self._finish_if_over(job)
 
     def _retry_suspect(self, slot: _Slot) -> None:
@@ -627,7 +624,7 @@ class Engine:
     # --- Feeder threads, one per job --------------------------------------------------
 
     def _feed(self, job: _Job, chunks) -> None:
-        fatal, matched = None, 0
+        fatal = None
         seen, close = job.journal.done_before(job.n) if job.skip else (None, None)
         try:
             ready, room = job.ready, job.room
@@ -648,7 +645,6 @@ class Engine:
                 if key is None:
                     key = content_key(payload)
                 if seen is not None and seen(key):  # done before the job was interrupted
-                    matched += 1
                     continue
                 ready.append(_Chunk(job, key, payload, cost))
                 if job.hungry:
@@ -659,7 +655,7 @@ class Engine:
         finally:
             if close is not None:
                 close()
-        self._events.put((self._on_source_end, job, fatal, matched))
+        self._events.put((self._on_source_end, job, fatal))
 
     # --- Delivery thread --------------------------------------------------------------
 

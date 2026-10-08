@@ -298,7 +298,7 @@ La regla es: ante la duda se repite; nunca se salta algo que no esté probado co
 
 Dos condiciones y un límite:
 
-- El payload debe ser reproducible: sin rutas temporales, horas ni identificadores aleatorios. Si al reanudar no coincide ninguna clave habiendo chunks hechos, el motor lo avisa con un evento del job.
+- El payload debe ser reproducible: sin rutas temporales, horas ni identificadores aleatorios. Si al reanudar la fuente no trae los chunks hechos, el motor no avisa (decidido el 2026-10-08): quien envía puede haberlos excluido a propósito. Lo que el job tenía hecho cuenta igual, y el total es hechos + pendientes.
 - La garantía sigue siendo «al menos una vez». Un chunk escrito cuyo registro se perdió con el último lote se repite; con un sink que no sea idempotente, se duplica.
 - Un job que ya filtra lo hecho en su fuente de datos (`skip_existing` en docking) no necesita las claves: su flujo ya solo trae lo que falta. Las dos cosas conviven.
 
