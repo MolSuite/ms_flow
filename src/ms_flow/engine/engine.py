@@ -42,6 +42,7 @@ _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a 
 # ponytail: one figure for every executor; let the executor name its own when a remote one,
 # whose tasks cost far more than a local process's, starts packing.
 _TASK_SECONDS, _PACK_MAX = 0.01, 64
+_REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 
 
 def content_key(payload) -> bytes:
@@ -124,7 +125,8 @@ class Engine:
                              memory_budget_mb() if mem_mb is None else mem_mb)
         self._executors: dict[str, _Slot] = {}
         self._journals: dict[str, Journal] = {}
-        self._jobs: dict[int, _Job] = {}
+        self._jobs: dict[int, _Job] = {}  # the ones that have not ended
+        self._ended: dict[int, JobSnapshot] = {}  # the last _REMEMBERED that have, oldest first
         self._active: list[_Job] = []  # running jobs, by priority and then arrival
         self._waiting: list[_Job] = []
         self._ids = itertools.count(1)
@@ -211,7 +213,7 @@ class Engine:
         job = _Job()
         job.journal = job.n = job.uid = job.spec = job.skip = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
-        job.after = [self._jobs[job_id] for job_id in after]
+        job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
         if journal is not None:
             job.journal = self._journals.get(journal)
             if job.journal is None or job.journal.failed:
@@ -235,8 +237,8 @@ class Engine:
         if key is not None and job.journal is not None:
             resumed = job.journal.claim(key)
             if resumed is not None:
-                job.n, job.skip = resumed
-                job.done = len(job.skip)
+                job.n, job.skip = resumed  # `skip`: how many chunks it had done
+                job.done = job.skip
         job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
         job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
         job.started_at, job.finished_at, job.finished = time.time(), None, threading.Event()
@@ -249,19 +251,29 @@ class Engine:
         return self._journals[journal].jobs()
 
     def status(self, job_id: int) -> JobSnapshot:
-        return self._jobs[job_id].snapshot()
+        """Where the job is. An ended job is forgotten once `_REMEMBERED` others ended after it;
+        what a journal recorded of it stays in `recorded()`."""
+        job = self._jobs.get(job_id)
+        return self._ended[job_id] if job is None else job.snapshot()
 
     def jobs(self) -> list[JobSnapshot]:
-        return [job.snapshot() for job in tuple(self._jobs.values())]
+        ended = list(self._ended.values())  # first: a job ending right now shows twice, never zero times
+        return ended + [job.snapshot() for job in tuple(self._jobs.values())]
 
     def wait(self, job_id: int, timeout: float | None = None) -> JobSnapshot:
         """Block until the job is terminal and its callbacks have run, or `timeout` passes."""
-        job = self._jobs[job_id]
+        job = self._jobs.get(job_id)
+        if job is None:
+            return self._ended[job_id]
         job.finished.wait(timeout)
         return job.snapshot()
 
     def cancel(self, job_id: int) -> None:
-        self._events.put((self._on_stop_job, self._jobs[job_id], CANCELED))
+        job = self._jobs.get(job_id)
+        if job is not None:
+            self._events.put((self._on_stop_job, job, CANCELED))
+        elif job_id not in self._ended:
+            raise KeyError(job_id)
 
     def close(self) -> None:
         """Interrupt what is running, let pending callbacks finish and stop the executors."""
@@ -562,8 +574,8 @@ class Engine:
             if job.skip:
                 if not matched:
                     log.warning("job %s (%s): the source brought back none of its %d done chunks, so all of it "
-                                "runs again; payloads must be the same in every run", job.id, job.name, len(job.skip))
-                job.done -= len(job.skip) - matched  # done chunks the source no longer brings do not count
+                                "runs again; payloads must be the same in every run", job.id, job.name, job.skip)
+                job.done -= job.skip - matched  # done chunks the source no longer brings do not count
                 job.skip = None
             job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready) + matched
             self._finish_if_over(job)
@@ -604,7 +616,8 @@ class Engine:
     # --- Feeder threads, one per job --------------------------------------------------
 
     def _feed(self, job: _Job, chunks) -> None:
-        fatal, matched, skip = None, 0, job.skip
+        fatal, matched = None, 0
+        seen, close = job.journal.done_before(job.n) if job.skip else (None, None)
         try:
             ready, room = job.ready, job.room
             for payload in chunks:
@@ -623,7 +636,7 @@ class Engine:
                         cost = tuple(c if o is None else o for c, o in zip(cost, own))
                 if key is None:
                     key = content_key(payload)
-                if skip and key in skip:  # done before the job was interrupted
+                if seen is not None and seen(key):  # done before the job was interrupted
                     matched += 1
                     continue
                 ready.append(_Chunk(job, key, payload, cost))
@@ -632,6 +645,9 @@ class Engine:
                     self._events.put((self._on_fed,))
         except Exception:
             fatal = "the source of chunks failed\n" + traceback.format_exc()
+        finally:
+            if close is not None:
+                close()
         self._events.put((self._on_source_end, job, fatal, matched))
 
     # --- Delivery thread --------------------------------------------------------------
@@ -659,4 +675,9 @@ class Engine:
             if job.on_terminal is not None:
                 job.on_terminal(job.snapshot())
         finally:
+            # The engine lets go of the job, and with it of its function and callbacks.
+            self._ended[job.id] = job.snapshot()  # before leaving `_jobs`: never in neither
+            self._jobs.pop(job.id, None)
+            if len(self._ended) > _REMEMBERED:
+                del self._ended[next(iter(self._ended))]
             job.finished.set()

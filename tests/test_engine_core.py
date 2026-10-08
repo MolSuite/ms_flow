@@ -41,7 +41,7 @@ class _Gauge:
             self.now -= 1
 
 
-def test_results_errors_and_terminal_state():
+def test_results_errors_and_terminal_state(monkeypatch):
     results, errors, terminal = {}, {}, []
     with Engine(cpus=4, mem_mb=0) as engine:
         engine.register("thread", ThreadExecutor(4))
@@ -55,6 +55,13 @@ def test_results_errors_and_terminal_state():
         assert list(errors) == [content_key(3)] and terminal == [snap]
         assert engine.wait(engine.submit("thread", _boom_on_3, [])).status == "completed"
         assert engine.wait(engine.submit("thread", _boom_on_3, [3])).status == "failed"
+        # an ended job is let go of; its last snapshot answers for it, and for the jobs that come after it
+        assert not engine._jobs and engine.status(job) == snap and len(engine.jobs()) == 3
+        assert engine.wait(engine.submit("thread", _boom_on_3, [1], after=[job]), 30).status == "completed"
+        monkeypatch.setattr("ms_flow.engine.engine._REMEMBERED", 2)
+        engine.wait(engine.submit("thread", _boom_on_3, [1]), 30)
+        with pytest.raises(KeyError):
+            engine.status(job)
 
 
 def test_failing_source_and_failing_callback():

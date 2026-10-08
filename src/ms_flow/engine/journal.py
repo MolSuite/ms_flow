@@ -145,7 +145,7 @@ class Journal:
     def claim(self, job_id: str):
         """Reserve `job_id` for a job about to start.
 
-        Returns `(n, done keys)` when it continues an interrupted job and `None` when it is new.
+        Returns `(n, chunks done)` when it continues an interrupted job and `None` when it is new.
         """
         with self._guard:
             if job_id in self._claimed:
@@ -159,13 +159,20 @@ class Journal:
                     return None
                 if row[1] != INTERRUPTED:
                     raise ValueError(f"job {job_id!r} already ended as {row[1]}; only an interrupted job continues")
-                # ponytail: every done key in memory until the source has been read again, about
-                # 90 MB per million. Look them up in the file if a job of that size ever resumes.
-                done = db.execute("SELECT key FROM chunks WHERE job = ? AND status = ?", (row[0], CHUNK_DONE))
-                return row[0], {key for key, in done}
+                done = db.execute("SELECT count(*) FROM chunks WHERE job = ? AND status = ?", (row[0], CHUNK_DONE))
+                return row[0], done.fetchone()[0]
         except BaseException:
             self._claimed.discard(job_id)
             raise
+
+    def done_before(self, n: int):
+        """`(seen, close)` for the calling thread: `seen(key)` says whether that chunk of job `n` is
+        on record as done. Each key is looked up in the file, so a job of millions continues
+        without its keys in memory. A payload equal to one done earlier in the same run is seen too.
+        """
+        db = sqlite3.connect(self.path)
+        find = "SELECT 1 FROM chunks WHERE job = ? AND key = ? AND status = ?"
+        return (lambda key: db.execute(find, (n, key, CHUNK_DONE)).fetchone() is not None), db.close
 
     def jobs(self) -> list[dict]:
         """Every job on record, oldest first."""
