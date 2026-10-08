@@ -78,12 +78,12 @@ class Engine:
         self.eng.register("process", engine.ProcessExecutor(procs))
 
     def run(self, executor: str, payloads, fn=workers.noop, inflight: int | None = None,
-            marks_every: int = 0, timeout: float = 1800.0):
+            marks_every: int = 0, timeout: float = 1800.0, key: str | None = None):
         """Run one job to its end. Returns (seconds, marks, job_snapshot)."""
         payloads = list(payloads)
         counter = _Counter(marks_every)
         counter.t0 = time.perf_counter()
-        job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight, journal="project",
+        job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight, journal="project", key=key,
                                  on_result=counter.handle, on_terminal=counter.on_job_terminal)
         counter.done.wait(timeout)
         seconds = time.perf_counter() - counter.t0
@@ -170,8 +170,12 @@ def check_worker_death() -> dict[str, bool]:
         shutil.rmtree(d, ignore_errors=True)
 
 
+_VICTIM_JOB = [{"idx": i, "s": 0.2} for i in range(200)]
+
+
 def check_kill9() -> dict[str, bool]:
-    """kill -9 the process that owns the engine: no worker may outlive it by 5 s."""
+    """kill -9 the process that owns the engine: no worker may outlive it by 5 s, and
+    the same job submitted again must run only the chunks that were not done."""
     d = _workdir("kill9")
     victim = subprocess.Popen([sys.executable, "-m", "benchmarks.refactor_optimization.bench", "--victim", str(d)],
                               cwd=_REPO, stdout=subprocess.PIPE, text=True)
@@ -187,14 +191,24 @@ def check_kill9() -> dict[str, bool]:
             os.kill(int(k), 9)
         except OSError:
             pass
+    resumed = False
+    try:
+        eng = Engine(d, procs=4)
+        try:
+            _, marks, job = eng.run("process", _VICTIM_JOB, fn=workers.nap, marks_every=1, key="victim", timeout=120)
+            resumed = job.status == "completed" and job.chunks_done == len(_VICTIM_JOB) and 0 < len(marks) < len(_VICTIM_JOB)
+        finally:
+            eng.close()
+    except Exception as exc:
+        print(f"  resume after kill -9: {exc!r}", flush=True)
     shutil.rmtree(d, ignore_errors=True)
-    return {"kill9_no_orphans": bool(kids) and not alive}
+    return {"kill9_no_orphans": bool(kids) and not alive, "resume_skips_done": resumed}
 
 
 def _victim(workdir: str) -> None:
     eng = Engine(Path(workdir), procs=4)
     print("started", flush=True)
-    eng.run("process", [{"idx": i, "s": 0.2} for i in range(200)], fn=workers.nap)
+    eng.run("process", _VICTIM_JOB, fn=workers.nap, key="victim")
 
 
 def check_second_engine() -> dict[str, bool]:

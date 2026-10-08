@@ -33,7 +33,12 @@ STEPS = {
     "journal": (None, "Jobs are recorded in executor.db again: raw sqlite3, one writer thread, one transaction every "
                       "50 ms, a 5-column row per finished chunk and no payload. A finished job keeps one row plus its "
                       "failures (the large job peaks at 37 bytes per chunk while it runs). One process owns each "
-                      "journal through an operating system lock, so the second engine is refused.", True),
+                      "journal through an operating system lock, so the second engine is refused. The growth figure is "
+                      "the first tenth running before the first write, 50 ms in: over a million chunks every tenth "
+                      "costs 0.030 to 0.045 ms.", True),
+    "resume": (None, "A job has a key in its journal. Submitted again after an interruption or a kill, it skips the "
+                     "chunks on record as done, recognised by their content key. Jobs can wait for other jobs "
+                     "(after=), and their source is not read until those end.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
@@ -71,6 +76,9 @@ CHECKS = [
      "The next job on the same executor finishes 20 of 20.", "F0-1"),
     ("kill9_no_orphans", "No orphans after kill -9",
      "The main process is killed mid-job; no worker is alive 5 s later.", "F1-4"),
+    ("resume_skips_done", "A killed job continues where it stopped",
+     "The job killed above is submitted again under its key: it ends complete and runs only the chunks "
+     "that were not on record.", "F2-7"),
     ("second_engine_safe", "Second engine on the same file is safe",
      "A second engine on the same executor.db is refused, or both jobs finish complete.", "F1-3"),
 ]
