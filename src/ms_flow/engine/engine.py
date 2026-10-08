@@ -24,17 +24,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .executors import DONE, ERROR, LOST
-from .journal import Journal, own
+from .journal import INTERRUPTED, Journal, own
 from .tokens import Tokens, memory_budget_mb
 
 log = logging.getLogger(__name__)
 
+WAITING = "waiting"  # for the jobs it was submitted after
 RUNNING = "running"
 COMPLETED = "completed"
 COMPLETED_WITH_ERRORS = "completed_with_errors"
 FAILED = "failed"
 CANCELED = "canceled"
-INTERRUPTED = "interrupted"
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
 
@@ -65,17 +65,19 @@ class JobSnapshot:
     peak_mem_mb: int
     started_at: float
     finished_at: float | None
+    key: str | None  # what the job is called in its journal; submitting it again continues it
 
 
 class _Job:
     __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority",
                  "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
-                 "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec")
+                 "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
+                 "skip", "after", "chunks")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
-                           self.error, self.peak_mem_mb, self.started_at, self.finished_at)
+                           self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid)
 
 
 class _Chunk:
@@ -111,6 +113,7 @@ class Engine:
         self._journals: dict[str, Journal] = {}
         self._jobs: dict[int, _Job] = {}
         self._active: list[_Job] = []  # running jobs, by priority and then arrival
+        self._waiting: list[_Job] = []
         self._ids = itertools.count(1)
         self._events: queue.SimpleQueue = queue.SimpleQueue()  # into the loop
         self._deliveries: queue.SimpleQueue = queue.SimpleQueue()  # user callbacks, out of the loop
@@ -155,8 +158,8 @@ class Engine:
 
     def submit(self, executor: str, fn, chunks, *, cpu: float = 1, gpu: float = 0, mem_mb: float = 0,
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
-               total: int | None = None, name: str = "", journal: str | None = None, on_result=None,
-               on_error=None, on_terminal=None) -> int:
+               total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
+               after=(), on_result=None, on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
         `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
@@ -168,6 +171,10 @@ class Engine:
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
+        `key` is what the job is called there. Submitting an interrupted job again under its key
+        continues it: the chunks it had done are recognised by their own keys and not run again.
+        `after` is the ids of the jobs that must end first; `chunks` is not read until they do,
+        and the job fails if one of them fails, is canceled or is interrupted.
         """
         if self._closed:
             raise RuntimeError("engine is closed")
@@ -175,12 +182,13 @@ class Engine:
         if slot is None:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         job = _Job()
-        job.journal = job.n = job.uid = job.spec = None
+        job.journal = job.n = job.uid = job.spec = job.skip = None
+        job.after = [self._jobs[job_id] for job_id in after]
         if journal is not None:
             job.journal = self._journals.get(journal)
             if job.journal is None or job.journal.failed:
                 raise ValueError(f"no usable journal {journal!r}; attached: {sorted(self._journals)}")
-            job.uid = uuid.uuid4().hex
+            job.uid = key or uuid.uuid4().hex
             job.spec = json.dumps({
                 "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority})
@@ -191,16 +199,24 @@ class Engine:
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.window = window or 2 * slot.impl.capacity
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
-        job.status = RUNNING
+        job.status, job.chunks = WAITING if job.after else RUNNING, chunks
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
         job.done = job.failed = job.open = job.seq = job.peak_mem_mb = 0
+        if key is not None and job.journal is not None:
+            resumed = job.journal.claim(key)
+            if resumed is not None:
+                job.n, job.skip = resumed
+                job.done = len(job.skip)
         job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
         job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
         job.started_at, job.finished_at, job.finished = time.time(), None, threading.Event()
         self._jobs[job.id] = job
         self._events.put((self._on_submit, job))
-        threading.Thread(target=self._feed, args=(job, chunks), name=f"msflow-feed-{job.id}", daemon=True).start()
         return job.id
+
+    def recorded(self, journal: str) -> list[dict]:
+        """The jobs on record in an attached journal, oldest first, as rows of its `jobs` table."""
+        return self._journals[journal].jobs()
 
     def status(self, job_id: int) -> JobSnapshot:
         return self._jobs[job_id].snapshot()
@@ -262,24 +278,44 @@ class Engine:
                 log.exception("engine loop: dispatch failed")
 
     def _on_submit(self, job: _Job) -> None:
-        self._active.append(job)
-        self._active.sort(key=lambda j: (-j.priority, j.id))
         if job.journal is not None:
             job.journal.job_created(job)
             if job.journal not in self._journals.values():  # detached between submit() and here
-                self._on_stop_jobs_of(job.journal, FAILED, "the journal of this job was detached")
+                job.fatal = "the journal of this job was detached"
+                return self._finish(job, FAILED)
+        if job.after:
+            self._waiting.append(job)
+            self._on_dependency_end(job)
+        else:
+            self._start(job)
+
+    def _on_dependency_end(self, job: _Job) -> None:
+        """Start a waiting job once every job before it ended well; fail it if one did not."""
+        ended = {dep.status: dep for dep in job.after}
+        for status in ended.keys() - {WAITING, RUNNING, COMPLETED, COMPLETED_WITH_ERRORS}:
+            job.fatal = f"job {ended[status].id}, which this one comes after, ended as {status}"
+            return self._finish(job, FAILED)
+        if WAITING not in ended and RUNNING not in ended:
+            self._waiting.remove(job)
+            self._start(job)
+
+    def _start(self, job: _Job) -> None:
+        job.status, job.after, chunks, job.chunks = RUNNING, (), job.chunks, None
+        self._active.append(job)
+        self._active.sort(key=lambda j: (-j.priority, j.id))
+        threading.Thread(target=self._feed, args=(job, chunks), name=f"msflow-feed-{job.id}", daemon=True).start()
 
     def _on_stop_job(self, job: _Job, status: str) -> None:
         # ponytail: chunks already running are not killed; their tokens come back when they
         # end and the result is dropped. Killing one arrives with the per-chunk time limit.
-        if job.status != RUNNING:
+        if job.status not in (RUNNING, WAITING):
             return
         for chunk in tuple(job.flying):
             job.slot.impl.cancel(chunk.handle)
         self._finish(job, status)
 
     def _on_stop_jobs_of(self, journal: Journal, status: str, fatal: str | None = None) -> None:
-        for job in tuple(self._active):
+        for job in (*self._waiting, *self._active):  # waiting ones first: they are stopped, not failed
             if job.journal is journal:
                 job.fatal = fatal or job.fatal
                 self._on_stop_job(job, status)
@@ -289,7 +325,7 @@ class Engine:
         self._deliveries.put((told.set, (), None))  # behind the callbacks of the jobs just stopped
 
     def _on_close(self) -> None:
-        for job in tuple(self._active):
+        for job in (*self._waiting, *self._active):  # waiting ones first: they are stopped, not failed
             self._on_stop_job(job, INTERRUPTED)
 
     def _chunk_done(self, chunk, status, result, error, peak_mb=0) -> None:
@@ -344,13 +380,17 @@ class Engine:
             self._finish(job, FAILED if nothing_worked else COMPLETED_WITH_ERRORS if job.failed else COMPLETED)
 
     def _finish(self, job: _Job, status: str) -> None:
-        job.status, job.finished_at = status, time.time()
+        job.status, job.finished_at, job.chunks, job.skip = status, time.time(), None, None
         job.error = job.fatal or job.error
         job.ready.clear()
         job.room.set()  # a feeder waiting for room wakes up, sees the status and leaves
+        for jobs in (self._active, self._waiting):
+            if job in jobs:
+                jobs.remove(job)
+        for other in [j for j in self._waiting if job in j.after]:
+            self._on_dependency_end(other)
         if job.journal is not None:
             job.journal.job_ended(job, forget_done=status != INTERRUPTED)  # an interrupted job resumes
-        self._active.remove(job)
         self._deliveries.put((self._announce, (job,), None))
 
     def _dispatch(self) -> None:
@@ -396,9 +436,15 @@ class Engine:
     def _on_fed(self) -> None:
         """Nothing to record: the dispatch pass that follows every event picks the chunk up."""
 
-    def _on_source_end(self, job: _Job, fatal: str | None) -> None:
+    def _on_source_end(self, job: _Job, fatal: str | None, matched: int) -> None:
         if job.status == RUNNING:
-            job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready)
+            if job.skip:
+                if not matched:
+                    log.warning("job %s (%s): the source brought back none of its %d done chunks, so all of it "
+                                "runs again; payloads must be the same in every run", job.id, job.name, len(job.skip))
+                job.done -= len(job.skip) - matched  # done chunks the source no longer brings do not count
+                job.skip = None
+            job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready) + matched
             self._finish_if_over(job)
 
     def _retry_suspect(self, slot: _Slot) -> None:
@@ -432,7 +478,7 @@ class Engine:
     # --- Feeder threads, one per job --------------------------------------------------
 
     def _feed(self, job: _Job, chunks) -> None:
-        fatal = None
+        fatal, matched, skip = None, 0, job.skip
         try:
             ready, room, window = job.ready, job.room, job.window
             for payload in chunks:
@@ -449,13 +495,18 @@ class Engine:
                     own = [payload.pop(name, None) for name in _PER_CHUNK]
                     if cost is not None:
                         cost = tuple(c if o is None else o for c, o in zip(cost, own))
-                ready.append(_Chunk(job, content_key(payload) if key is None else key, payload, cost))
+                if key is None:
+                    key = content_key(payload)
+                if skip and key in skip:  # done before the job was interrupted
+                    matched += 1
+                    continue
+                ready.append(_Chunk(job, key, payload, cost))
                 if job.hungry:
                     job.hungry = False
                     self._events.put((self._on_fed,))
         except Exception:
             fatal = "the source of chunks failed\n" + traceback.format_exc()
-        self._events.put((self._on_source_end, job, fatal))
+        self._events.put((self._on_source_end, job, fatal, matched))
 
     # --- Delivery thread --------------------------------------------------------------
 

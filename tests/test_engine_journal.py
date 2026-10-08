@@ -81,3 +81,35 @@ def test_a_journal_that_cannot_be_written_fails_its_jobs(tmp_path):
         assert engine.wait(other, 30).status == "completed"
         with pytest.raises(ValueError):
             engine.submit("thread", _boom_on_3, [1], journal="project")
+
+
+def test_an_interrupted_job_continues_where_it_stopped(tmp_path):
+    db, payloads = tmp_path / "executor.db", [{"s": 0.005, "i": i} for i in range(400)]
+    with _engine(tmp_path) as engine:
+        job = engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1")
+        with pytest.raises(ValueError, match="already running"):
+            engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1")
+        while engine.status(job).chunks_done < 30:
+            time.sleep(0.01)
+    before = engine.status(job)  # closing the engine interrupted it
+    assert before.status == "interrupted" and before.key == "dock-1" and 30 <= before.chunks_done < 400
+
+    ran = []
+    with _engine(tmp_path) as engine:
+        (row,) = engine.recorded("project")
+        assert (row["job_id"], row["status"], row["done"]) == ("dock-1", "interrupted", before.chunks_done)
+        more = payloads + [{"s": 0.005, "i": i} for i in range(400, 450)]  # the source grew meanwhile
+        job = engine.submit("thread", workers.nap, more, journal="project", key="dock-1",
+                            on_result=lambda key, result: ran.append(key))
+        after = engine.wait(job, 60)
+        assert (after.status, after.chunks_done, after.chunks_total) == ("completed", 450, 450)
+        assert len(ran) == 450 - before.chunks_done  # only what was missing
+        assert _rows(db, "SELECT n, status, done FROM jobs") == [(1, "completed", 450)]
+        with pytest.raises(ValueError, match="already ended as completed"):
+            engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1")
+
+    with closing(sqlite3.connect(db)) as raw:  # what a killed process leaves behind
+        raw.execute("UPDATE jobs SET status = 'running', finished_at = NULL")
+        raw.commit()
+    with _engine(tmp_path) as engine:
+        assert engine.recorded("project")[0]["status"] == "interrupted"

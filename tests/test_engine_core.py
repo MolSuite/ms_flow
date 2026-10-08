@@ -160,6 +160,35 @@ def test_cancel_and_close_release_everything():
         engine.submit("thread", _boom_on_3, [1])
 
 
+def test_a_job_waits_for_the_jobs_it_comes_after():
+    produced, gate = [], threading.Event()
+
+    def first(payload):
+        gate.wait(10)
+        return payload
+
+    def from_first():  # read only once the first job is over
+        yield from list(produced)
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        a = engine.submit("thread", first, range(20), on_result=lambda key, result: produced.append(result))
+        b = engine.submit("thread", _boom_on_3, from_first(), after=[a])
+        c = engine.submit("thread", _boom_on_3, [1], after=[b])
+        bad = engine.submit("thread", _boom_on_3, [3])
+        d = engine.submit("thread", _boom_on_3, [1], after=[a, bad])
+        e = engine.submit("thread", _boom_on_3, [1], after=[d])
+        assert engine.wait(e, 30).status == "failed" and f"job {d}" in engine.status(e).error
+        assert "ended as failed" in engine.status(d).error and engine.status(b).status == "waiting"
+        engine.cancel(c)
+        assert engine.wait(c, 30).status == "canceled"
+        gate.set()
+        done = engine.wait(b, 30)
+        assert (done.status, done.chunks_done, done.chunks_failed) == ("completed_with_errors", 19, 1)
+        with pytest.raises(KeyError):
+            engine.submit("thread", _boom_on_3, [1], after=[999])
+
+
 @pytest.mark.slow
 def test_worker_death_costs_one_chunk():
     with Engine(cpus=4, mem_mb=0) as engine:

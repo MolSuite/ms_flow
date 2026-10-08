@@ -14,12 +14,14 @@ import threading
 import time
 import traceback
 from collections import deque
+from contextlib import closing
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 VERSION = 1
 CHUNK_DONE, CHUNK_FAILED = 1, 2
+INTERRUPTED = "interrupted"  # the one job status the journal acts on: it is the one that continues
 
 _SCHEMA = """
 CREATE TABLE jobs (
@@ -91,12 +93,18 @@ class Journal:
                 db.executescript(f"PRAGMA auto_vacuum = INCREMENTAL; {_SCHEMA} PRAGMA user_version = {VERSION};")
             elif version != VERSION:
                 raise RuntimeError(f"{self.path} is not a version {VERSION} journal")
+            # Whatever never ended belonged to a process that is gone: the lock says so.
+            db.execute("UPDATE jobs SET status = ?, finished_at = ? WHERE finished_at IS NULL",
+                       (INTERRUPTED, time.time()))
+            db.commit()
             self._next = db.execute("SELECT coalesce(max(n), 0) FROM jobs").fetchone()[0] + 1
             db.close()
         except BaseException:
             self._lock.close()
             raise
         self._records = deque()
+        self._claimed: set[str] = set()  # ids of the jobs this engine has not ended yet
+        self._guard = threading.Lock()
         self._wake = threading.Event()
         self._writer = threading.Thread(target=self._write, name="msflow-journal", daemon=True)
         self._writer.start()
@@ -104,8 +112,9 @@ class Journal:
     # --- Engine loop: nothing here touches the disk -----------------------------------
 
     def job_created(self, job) -> None:
-        job.n = self._next
-        self._next += 1
+        if job.n is None:  # a job that continues keeps its number
+            job.n = self._next
+            self._next += 1
         self._records.append((job,))
 
     def chunk_finished(self, job, key, error: str | None) -> None:
@@ -115,6 +124,7 @@ class Journal:
     def job_ended(self, job, forget_done: bool) -> None:
         """`forget_done` drops the rows of the chunks that went well: the job will not resume."""
         self._records.append((job, forget_done))
+        self._claimed.discard(job.uid)
 
     def wait_if_behind(self) -> None:
         # ponytail: this holds the engine loop, so every job waits for this disk. Brake only
@@ -132,6 +142,38 @@ class Journal:
         self._wake.set()
         while self._writer.is_alive() and not written.wait(1.0):
             pass  # forgetting the done chunks of a job of millions takes seconds
+
+    def claim(self, job_id: str):
+        """Reserve `job_id` for a job about to start.
+
+        Returns `(n, done keys)` when it continues an interrupted job and `None` when it is new.
+        """
+        with self._guard:
+            if job_id in self._claimed:
+                raise ValueError(f"job {job_id!r} is already running")
+            self._claimed.add(job_id)
+        try:
+            self.flush()
+            with closing(sqlite3.connect(self.path)) as db:
+                row = db.execute("SELECT n, status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                if row is None:
+                    return None
+                if row[1] != INTERRUPTED:
+                    raise ValueError(f"job {job_id!r} already ended as {row[1]}; only an interrupted job continues")
+                # ponytail: every done key in memory until the source has been read again, about
+                # 90 MB per million. Look them up in the file if a job of that size ever resumes.
+                done = db.execute("SELECT key FROM chunks WHERE job = ? AND status = ?", (row[0], CHUNK_DONE))
+                return row[0], {key for key, in done}
+        except BaseException:
+            self._claimed.discard(job_id)
+            raise
+
+    def jobs(self) -> list[dict]:
+        """Every job on record, oldest first."""
+        self.flush()
+        with closing(sqlite3.connect(self.path)) as db:
+            db.row_factory = sqlite3.Row
+            return [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY n")]
 
     def close(self) -> None:
         self._records.append(None)
@@ -160,15 +202,17 @@ class Journal:
                         waiting.append(record)  # a flush()
                     elif len(record) == 5:
                         chunks.append(record)
-                    else:  # a job: created `(job,)` or ended `(job, forget_done)`
+                    else:  # a job: started `(job,)` or ended `(job, forget_done)`
                         db.executemany("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?)", chunks)
                         chunks.clear()
                         job = record[0]
                         if len(record) == 1:
                             live[job.n] = job
-                            db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                        (job.n, job.uid, job.name, job.status, job.spec, job.total, job.done,
                                         job.failed, job.error, job.started_at, job.finished_at))
+                            # one that continues runs its failures again
+                            db.execute("DELETE FROM chunks WHERE job = ? AND status = ?", (job.n, CHUNK_FAILED))
                         else:
                             live.pop(job.n, None)
                             db.execute(_JOB_COUNTERS, _counters(job))
