@@ -21,7 +21,14 @@ REPO = "https://github.com/MolSuite/ms_flow"
 # One line per step, added in the PR that records it: label -> (PR number, what changed, still open).
 STEPS = {
     "baseline": (None, "main before the refactor", False),
+    "engine core": (None, "New engine next to the old one (ms_flow.engine): state in memory, CPU/GPU/memory tokens, "
+                          "event loop, pools that recover. No journal yet, so nothing is written to disk. First job: "
+                          "the workers import the whole ms_flow package (pool start alone is 75 ms).", True),
 }
+
+# What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
+TARGETS = {"thread_ms_per_chunk": 0.2, "process_ms_per_chunk": 0.2, "scale_last_ms": 0.2, "scale_first_ms": 0.2,
+           "scale_growth": 1.1, "state_kb_per_chunk": 0.3}
 
 # key, short name, chart title, how it is measured. The first CHARTED get a chart panel.
 METRICS = [
@@ -128,6 +135,7 @@ def main() -> None:
         "steps": summarize(records),
         "metrics": [dict(zip(("key", "short", "title", "what"), m)) for m in METRICS],
         "charted": CHARTED,
+        "targets": TARGETS,
         "checks": [dict(zip(("key", "title", "what", "task"), c)) for c in CHECKS],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -238,7 +246,7 @@ td.b, th.b { border-left: 1px solid var(--border); }
 
 <div class="card">
   <h2>Table</h2>
-  <p class="sub">Median of the repeats; the range is in the tooltip of each cell.</p>
+  <p class="sub">Median of the repeats; the range is in the tooltip of each cell. Green: the value meets the design target of the last row.</p>
   <div class="scroll" id="table"></div>
 </div>
 
@@ -346,8 +354,11 @@ function table(host) {
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
     + D.steps.map(s => `<tr><td>${esc(s.label)}</td><td>${prHtml(s)}</td><td class="l">${esc(s.commit)}</td><td class="l">${s.date}</td>`
       + D.metrics.map((m, i) => { const c = s.m[m.key];
-        return `<td${i ? '' : ' class="b"'}${c ? ` title="${num(c.lo)} to ${num(c.hi)} ${c.unit}"` : ''}>${c ? val(c) : ''}</td>`; }).join('')
-      + `<td class="b">${passed(s)}/${Object.keys(s.checks).length}</td></tr>`).join('') + '</table>';
+        return `<td class="${i ? '' : 'b'}${c && c.med <= D.targets[m.key] ? ' good' : ''}"${c ? ` title="${num(c.lo)} to ${num(c.hi)} ${c.unit}"` : ''}>${c ? val(c) : ''}</td>`; }).join('')
+      + `<td class="b">${passed(s)}/${Object.keys(s.checks).length}</td></tr>`).join('')
+    + '<tr><td class="muted">target</td><td></td><td></td><td></td>'
+    + D.metrics.map((m, i) => `<td class="muted${i ? '' : ' b'}">${D.targets[m.key] ? '≤ ' + D.targets[m.key] : ''}</td>`).join('')
+    + `<td class="muted b">${D.checks.length}/${D.checks.length}</td></tr></table>`;
 }
 
 document.getElementById('sub').innerHTML = `Report of ${D.date} · ${D.steps.length} column${D.steps.length > 1 ? 's' : ''}, baseline ${esc(D.steps[0].commit)} `
