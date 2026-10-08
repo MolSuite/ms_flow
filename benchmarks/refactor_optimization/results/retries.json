@@ -9,7 +9,8 @@
   },
   "sizes": {
     "chunks_per_job": 2000,
-    "chunks_scale_job": 20000
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
   },
   "quick": false,
   "metrics": {
@@ -76,6 +77,34 @@
         38.3633
       ],
       "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.03497834611509461,
+        0.035093306729977486,
+        0.03427906859986251,
+        0.03505106764496304,
+        0.03353631619494991
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.012902266989985946,
+        0.012942596609937027,
+        0.012983575670077699,
+        0.013236598980001872,
+        0.012838536710041808
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.02500450980005553,
+        0.03502067925001029,
+        0.03329927169979783
+      ],
+      "unit": "ms"
     }
   },
   "checks": {
@@ -86,5 +115,9 @@
     "second_engine_safe": true,
     "retry_then_done": true,
     "hung_chunk_cut": true
+  },
+  "long_jobs": {
+    "measured_at": "2026-10-08",
+    "commit": "71f839b"
   }
 }

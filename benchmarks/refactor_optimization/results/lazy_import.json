@@ -9,7 +9,8 @@
   },
   "sizes": {
     "chunks_per_job": 2000,
-    "chunks_scale_job": 20000
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
   },
   "quick": false,
   "metrics": {
@@ -76,6 +77,34 @@
         26.4688
       ],
       "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.02041755782003747,
+        0.020782221730041784,
+        0.020974309245066252,
+        0.021268569280073278,
+        0.020639848549908493
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.19807112555994535,
+        0.19841871172990067,
+        0.19434119719007867,
+        0.196682024634938,
+        0.1954313792249013
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.023014570550003555,
+        0.022402000649890397,
+        0.02189328859967645
+      ],
+      "unit": "ms"
     }
   },
   "checks": {
@@ -83,5 +112,9 @@
     "worker_death_pool_recovers": true,
     "kill9_no_orphans": true,
     "second_engine_safe": true
+  },
+  "long_jobs": {
+    "measured_at": "2026-10-08",
+    "commit": "37afb81"
   }
 }

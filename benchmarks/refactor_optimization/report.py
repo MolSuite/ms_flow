@@ -35,7 +35,8 @@ STEPS = {
                       "failures (the large job peaks at 37 bytes per chunk while it runs). One process owns each "
                       "journal through an operating system lock, so the second engine is refused. The growth figure is "
                       "the first tenth running before the first write, 50 ms in: over a million chunks every tenth "
-                      "costs 0.030 to 0.045 ms.", True),
+                      "costs 0.030 to 0.045 ms. Recording a chunk adds about 0.009 ms to it, which only the "
+                      "long thread job shows (0.025 to 0.034 ms).", True),
     "resume": (None, "A job has a key in its journal. Submitted again after an interruption or a kill, it skips the "
                      "chunks on record as done, recognised by their content key. Jobs can wait for other jobs "
                      "(after=), and their source is not read until those end.", True),
@@ -54,11 +55,16 @@ STEPS = {
                           "the ideal and now run 2 to 3 % over. Once the source has ended, what is left is shared "
                           "out among the workers, so a small job does not end on a few long tasks with workers "
                           "idle. The bench chunks are empty and already went 64 to a task: same cost per chunk "
-                          "against the previous step run side by side (0.0074 to 0.0086 ms both).", True),
+                          "against the previous step run side by side (0.0074 to 0.0086 ms both).", False),
+    "resume count": (None, "A job that continues counts what it had done whether or not its source brings it back, "
+                           "and no longer warns about it: total = done + pending. Nothing on the path of a chunk "
+                           "changes. From this step on the long-job measures are recorded with the rest; for the "
+                           "steps before, they were taken on 2026-10-08 from each step's own commit.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
 TARGETS = {"thread_ms_per_chunk": 0.2, "process_ms_per_chunk": 0.2, "scale_last_ms": 0.2, "scale_first_ms": 0.2,
+           "thread_long_ms": 0.2, "process_long_ms": 0.2, "scale_long_last_ms": 0.2,
            "scale_growth": 1.1, "state_kb_per_chunk": 0.3}
 
 # key, short name, chart title, how it is measured. The first CHARTED get a chart panel.
@@ -71,6 +77,13 @@ METRICS = [
      "One large thread job with 64 chunks in flight; cost per chunk over its last tenth."),
     ("state_kb_per_chunk", "state", "State on disk per chunk (KB)",
      "Size of executor.db after the large job ÷ its chunks."),
+    ("thread_long_ms", "thread, long", "Thread executor, long job, cost per chunk (ms)",
+     "The thread job with 200,000 chunks instead of 2,000: it lasts seconds, so one run differs from the next by "
+     "about 10 % where the short one differs by half. Median of 5. This is the one to compare engine steps by."),
+    ("process_long_ms", "process, long", "Process executor, long job, cost per chunk (ms)",
+     "The process job with 200,000 chunks. Median of 5."),
+    ("scale_long_last_ms", "large job, long", "Late in a 200,000-chunk job, cost per chunk (ms)",
+     "The large thread job with 64 chunks in flight, ten times longer; cost per chunk over its last tenth. Median of 3."),
     ("first_job_ms", "first job", "First job on a fresh engine (ms)",
      "New engine, one-chunk job on the process executor, pool start-up included. Median of 3."),
     ("import_ms", "import", "Import time (ms)",
@@ -82,7 +95,7 @@ METRICS = [
     ("peak_rss_mb", "peak RSS", "Peak memory of the benchmark process (MB)",
      "ru_maxrss of the main process at the end of the run; workers not included."),
 ]
-CHARTED = 6
+CHARTED = 9
 
 # key, name, what it does, task that is meant to make it pass.
 CHECKS = [
@@ -169,7 +182,7 @@ def main() -> None:
 
     data = {
         "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "repo": REPO,
-        "machine": records[0]["machine"], "sizes": records[0]["sizes"],
+        "machine": records[0]["machine"], "sizes": {**records[0]["sizes"], **records[-1]["sizes"]},
         "steps": summarize(records),
         "metrics": [dict(zip(("key", "short", "title", "what"), m)) for m in METRICS],
         "charted": CHARTED,
@@ -401,7 +414,8 @@ function table(host) {
 
 document.getElementById('sub').innerHTML = `Report of ${D.date} · ${D.steps.length} column${D.steps.length > 1 ? 's' : ''}, baseline ${esc(D.steps[0].commit)} `
   + `of ${D.steps[0].date} · ${D.machine.cpus} logical CPUs, engine on ${D.machine.engine_cpus} · Python ${D.machine.python} · `
-  + `${D.sizes.chunks_per_job.toLocaleString('en')} empty chunks per job, large job ${D.sizes.chunks_scale_job.toLocaleString('en')} · `
+  + `${D.sizes.chunks_per_job.toLocaleString('en')} empty chunks per job, large job ${D.sizes.chunks_scale_job.toLocaleString('en')}`
+  + (D.sizes.chunks_long_job ? `, long jobs ${D.sizes.chunks_long_job.toLocaleString('en')}` : '') + ' · '
   + `data: <code>benchmarks/refactor_optimization/results</code>`;
 document.getElementById('tiles').innerHTML = D.metrics.slice(0, 4).filter(m => last.m[m.key]).map(m => { const c = last.m[m.key];
   return `<div class="tile"><div class="v">${val(c)}</div><div class="l">${m.title.replace(/ \(.*/, '')} · `

@@ -9,7 +9,8 @@
   },
   "sizes": {
     "chunks_per_job": 2000,
-    "chunks_scale_job": 20000
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
   },
   "quick": false,
   "metrics": {
@@ -76,6 +77,34 @@
         37.75
       ],
       "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.0322477107749728,
+        0.03434651964998921,
+        0.03502804671006743,
+        0.032873795979976424,
+        0.03379907211507088
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.013097880324930884,
+        0.013098688414902426,
+        0.012814017979981145,
+        0.012783382445049937,
+        0.013012776739924448
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.033683101150381846,
+        0.029492889749235474,
+        0.0293170230492251
+      ],
+      "unit": "ms"
     }
   },
   "checks": {
@@ -84,5 +113,9 @@
     "kill9_no_orphans": true,
     "resume_skips_done": true,
     "second_engine_safe": true
+  },
+  "long_jobs": {
+    "measured_at": "2026-10-08",
+    "commit": "ba63b32"
   }
 }

@@ -228,6 +228,12 @@ def _victim(workdir: str) -> None:
     eng.run("process", _VICTIM_JOB, fn=workers.nap, key="victim")
 
 
+def _long_jobs(n: int) -> None:
+    print(json.dumps({"thread_long_ms": measure_per_chunk("thread", n, repeats=5),
+                      "process_long_ms": measure_per_chunk("process", n, repeats=5),
+                      "scale_long_last_ms": [measure_scale(n)["scale_last_ms"] for _ in range(3)]}), flush=True)
+
+
 def check_second_engine() -> dict[str, bool]:
     """A second engine on the same state file must be refused or must not disturb the first."""
     d = _workdir("two")
@@ -262,13 +268,16 @@ def main() -> None:
     ap.add_argument("--label", help="name of this step, e.g. 'baseline' or 'PR #12'")
     ap.add_argument("--quick", action="store_true", help="small sizes, to try the harness; not comparable")
     ap.add_argument("--victim", help=argparse.SUPPRESS)
+    ap.add_argument("--long", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.victim:
         return _victim(args.victim)
+    if args.long:
+        return _long_jobs(args.long)
     if not args.label:
         ap.error("--label is required")
 
-    n, n_scale = (300, 2000) if args.quick else (2000, 20000)
+    n, n_scale, n_long = (300, 2000, 5000) if args.quick else (2000, 20000, 200000)
     metrics: dict[str, dict] = {}
 
     def put(name: str, values, unit: str) -> None:
@@ -286,6 +295,13 @@ def main() -> None:
     put("scale_growth", [scale["scale_growth"]], "x")
     put("state_kb_per_chunk", [scale["state_kb_per_chunk"]], "KB")
     put("peak_rss_mb", [resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024], "MB")
+    # The jobs above end in tens of ms on the new engine, where one run differs from the next by
+    # half. These last seconds, long enough to tell one step from the one before. They run in an
+    # interpreter of their own: after the measures above, the same job costs a tenth more.
+    long_jobs = subprocess.run([sys.executable, "-m", "benchmarks.refactor_optimization.bench", "--long", str(n_long)],
+                               cwd=_REPO, capture_output=True, text=True, check=True).stdout.splitlines()[-1]
+    for name, values in json.loads(long_jobs).items():
+        put(name, values, "ms")
 
     checks: dict[str, bool] = {}
     for check in (check_worker_death, check_kill9, check_second_engine, check_retry_and_limit):
@@ -302,7 +318,7 @@ def main() -> None:
         "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "commit": _git("rev-parse", "--short", "HEAD") + ("+dirty" if _git("status", "--porcelain", "-uno") else ""),
         "machine": {"cpus": os.cpu_count(), "engine_cpus": CPUS, "python": sys.version.split()[0]},
-        "sizes": {"chunks_per_job": n, "chunks_scale_job": n_scale},
+        "sizes": {"chunks_per_job": n, "chunks_scale_job": n_scale, "chunks_long_job": n_long},
         "quick": args.quick,
         "metrics": metrics,
         "checks": checks,

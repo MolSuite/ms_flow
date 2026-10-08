@@ -33,3 +33,5 @@ Refactor del motor de ms_flow: el banco de pruebas, lo que midió cada paso y lo
 El informe no rechaza nada: enseña el efecto. Un paso que sube un coste aparece en "What needs a look" con su explicación.
 
 Si cambia la API del motor, en `bench.py` solo se toca la sección "Engine adapter". Las medidas no se cambian, para que las columnas sigan siendo comparables; una medida nueva se añade y toma como base el paso en que aparece.
+
+Para comparar un paso del motor nuevo con el anterior valen las tres medidas "long" (trabajos de 200.000 chunks, que duran segundos y varían un 5 % entre repeticiones). Las de 2.000 y 20.000 chunks duran decenas de milisegundos en el motor nuevo y varían hasta un 60 %: sirven contra el motor viejo, no entre pasos. Aun así, dos sesiones distintas difieren hasta un 10 %; una diferencia menor se confirma midiendo los dos commits alternados. Las medidas "long" de los pasos anteriores a "resume count" se tomaron el 2026-10-08 desde el commit de cada paso (`long_jobs` en su JSON).
