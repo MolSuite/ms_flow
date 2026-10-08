@@ -53,7 +53,20 @@ Una herramienta que solo sabe trabajar por lotes lo declara (`@task(batched=True
 1. `batch=` en el envío.
 2. La configuración del ejecutor para esa task (lo normal en HPC).
 3. `@task(batch=N)`: lo que el autor sabe de su trabajo.
-4. Automático: el motor mide lo que tarda un elemento y agrupa los que caben en 10 ms, hasta 64. Un elemento de segundos va solo.
+4. Automático: el motor mide lo que tarda un elemento y agrupa los que caben en el objetivo del ejecutor. Un elemento de segundos va solo.
+
+El objetivo hoy es 10 ms y es poco. Medido con 14 workers y elementos que ocupan CPU (tiempo real / tiempo ideal):
+
+| Elemento × cantidad | Objetivo 10 ms | 100 ms | 500 ms |
+|---|---|---|---|
+| 1 ms × 42 000 | 1,15 | 1,03 | 1,03 |
+| 5 ms × 8 400 | 1,22 | 1,02 | 1,07 |
+| 20 ms × 2 100 | 1,06 | 1,03 | 1,09 |
+| 100 ms × 420 | 1,02 | 1,02 | 1,10 |
+| 100 ms × 28 | 1,02 | 1,05 | 2,52 |
+| 20 ms × 140 | 1,11 | 1,33 | 2,42 |
+
+Con 10 ms se pierde hasta un 22 %: despachar una tarea cuesta cerca de 1 ms cuando todos los núcleos están ocupados. Con 100 ms la pérdida baja al 2-3 %. Con 500 ms no se gana nada más y los jobs pequeños tardan 2,5 veces más, porque los últimos elementos se agrupan en pocos workers y el resto queda parado. Propuesta: objetivo de 100 ms en local, propio de cada ejecutor, y no agrupar más de lo que deja a todos los workers con trabajo (elementos leídos / workers). Con esa segunda regla el caso de 20 ms × 140 deja de perder.
 
 **Progreso.** Del job: (elementos hechos + fracción de los que corren) / total. La fracción llega por casillas en un fichero mapeado en memoria, no por colas. Lote de un elemento: `report()` de la task, que el motor pide solo cuando el job tiene pocos elementos (hasta 2 × workers; se fuerza con `progress=`). Lote de varios: el worker cuenta los hechos solo. En HPC, únicamente elementos hechos por lote, leídos al sondear.
 
@@ -63,7 +76,13 @@ Una herramienta que solo sabe trabajar por lotes lo declara (`@task(batched=True
 
 **Resultados.** Una sola puerta: lo que devuelve la task va a `output`. `finalize` corre una vez al terminar.
 
-**Entradas con ficheros.** Un `FileInputSpec` en un elemento se resuelve en el hilo que lee la fuente, con la función que da el ejecutor (en local, la ruta tal cual; en remoto, subir el fichero). Nunca en el hilo de eventos.
+**Datos y base de datos.** La base de datos solo se toca en el proceso que lanza el job. El hilo del job lee la fuente y arma el elemento con datos planos y rutas; el hilo de entrega escribe en `output` lo que devuelve la task. Un worker nunca recibe una conexión ni la ruta de la base: recibe datos y rutas de ficheros, y devuelve filas.
+
+**Entradas con ficheros.** Un `FileInputSpec` en un elemento lo resuelve el ejecutor (en local, la ruta tal cual; en remoto, copiar el fichero, una vez si varios elementos lo comparten). El motor llama a esa función desde el hilo del job, nunca desde el hilo de eventos: `submit` de un ejecutor no puede bloquear.
+
+**Preparación en remoto.** Para lo que era `setup`: lo que es de cada elemento va por la regla anterior; lo que es una vez por job es el código de la fuente antes de su primer `yield` (corre una vez, en el proceso que lanza, antes de cualquier elemento) o un job previo con `after=`. Si con ejecutores remotos no basta, se añade entonces un `setup=` al job.
+
+**Registro de lo hecho.** El journal sigue registrando cada elemento hecho cuando el job se envía con `journal=` y `key=`. Quien invoca decide qué pide (por ejemplo, excluir lo ya calculado); `ms_flow` sabe por sí mismo qué tiene activo y qué tiene registrado. El total al reanudar usa lo registrado.
 
 ## Qué desaparece
 
@@ -75,8 +94,7 @@ Una herramienta que solo sabe trabajar por lotes lo declara (`@task(batched=True
 
 ## Abierto
 
-1. Confirmar la regla de «entradas con ficheros».
-2. Qué recibe la task además del elemento y los parámetros (¿rutas del proyecto?).
-3. Con una fuente que ya excluye lo hecho, el registro por elemento del journal sobra: decidir si esos jobs lo apagan.
-4. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
-5. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
+1. Objetivo del lote automático: 100 ms (medido) frente a los 500 ms que propuso Mario.
+2. Al reanudar, el motor avisa si la fuente no trae ninguno de los elementos hechos. Con una fuente que excluye lo hecho ese aviso es falso: quitarlo o dejar que el job lo apague.
+3. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
+4. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
