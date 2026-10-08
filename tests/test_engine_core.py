@@ -1,11 +1,14 @@
-"""The new engine core (`ms_flow.engine`): counters, admission by tokens, worker death, cancel."""
+"""The new engine core (`ms_flow.engine`): counters, admission by tokens, feeders, keys, worker death, cancel."""
+import os
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
 from benchmarks.refactor_optimization import workers
-from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor
+from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key
 
 
 def _boom_on_3(payload):
@@ -41,7 +44,7 @@ def test_results_errors_and_terminal_state():
             ("completed_with_errors", 500, 499, 1)
         assert snap.chunks_inflight == 0 and "ValueError: three" in snap.error
         assert len(results) == 499 and sorted(results.values())[:3] == [0, 2, 4]
-        assert list(errors) == [3] and terminal == [snap]
+        assert list(errors) == [content_key(3)] and terminal == [snap]
         assert engine.wait(engine.submit("thread", _boom_on_3, [])).status == "completed"
         assert engine.wait(engine.submit("thread", _boom_on_3, [3])).status == "failed"
 
@@ -75,6 +78,61 @@ def test_admission_by_tokens(cost, expected):
         assert engine.tokens.free == [8, 1, 1000]
 
 
+def test_a_chunk_can_carry_its_own_cost_and_key():
+    gauge, seen, errors = _Gauge(), [], {}
+
+    def fn(payload):
+        seen.append(payload)
+        gauge(payload)
+
+    heavy = [{"n": i, "_cpu_required": 4, "_key": f"heavy-{i}"} for i in range(10)]
+    with Engine(cpus=8, mem_mb=1000) as engine:
+        engine.register("thread", ThreadExecutor(16, uses_tokens=True))
+        snap = engine.wait(engine.submit("thread", fn, heavy + [{"n": 99, "_mem_mb": 5000}],
+                                         on_error=errors.__setitem__), 30)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 10, 1)
+        assert gauge.peak == 2 and seen[0] == {"n": 0} and heavy[0]["_cpu_required"] == 4
+        assert list(errors) == [content_key({"n": 99})] and "can never run" in snap.error
+        assert engine.tokens.free == [8, 0, 1000]
+
+
+def test_content_key_is_the_same_in_another_process():
+    payload = {"ligand": "CCO", "receptor": ["1abc", 7], "box": (1.5, 2.0)}
+    code = f"from ms_flow.engine import content_key; print(content_key({payload!r}).hex())"
+    other = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                           env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
+    assert other.stdout.strip() == content_key(payload).hex() and len(content_key(payload)) == 16
+    assert content_key({"ligand": "CCN"}) != content_key({"ligand": "CCO"})
+    assert content_key(threading.Lock()) != content_key(threading.Lock())  # unknown content: never equal
+
+
+def test_the_source_runs_off_the_loop_and_only_a_window_ahead():
+    read, gate = [], threading.Event()
+
+    def slow():
+        for i in range(3):
+            time.sleep(0.3)
+            yield i
+
+    def counted():
+        for i in range(1000):
+            read.append(i)
+            yield i
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        slow_job = engine.submit("thread", _boom_on_3, slow())
+        quick = engine.wait(engine.submit("thread", _boom_on_3, range(4, 200)), 30)
+        assert quick.finished_at - quick.started_at < 0.25  # a slow source holds only its own job
+        assert engine.wait(slow_job, 30).chunks_done == 3
+
+        held = engine.submit("thread", lambda payload: gate.wait(10), counted(), window=5)
+        time.sleep(0.2)
+        assert len(read) <= 5 + 5 + 1  # in flight, read ahead, and the one waiting for room
+        gate.set()
+        assert engine.wait(held, 30).chunks_done == 1000
+
+
 def test_chunk_that_can_never_run_is_refused():
     with Engine(cpus=2, mem_mb=100) as engine:
         engine.register("thread", ThreadExecutor(2, uses_tokens=True))
@@ -91,6 +149,10 @@ def test_cancel_and_close_release_everything():
         engine.cancel(job)
         assert engine.wait(job, 10).status == "canceled"
         assert engine.wait(engine.submit("thread", _boom_on_3, range(3)), 10).chunks_done == 3
+        for _ in range(100):  # a canceled chunk that was already running keeps its CPU until it ends
+            if engine.tokens.free[0] == 2:
+                break
+            time.sleep(0.01)
         assert engine.tokens.free[0] == 2
         left = engine.submit("thread", workers.nap, [{"s": 0.05}] * 200)
     assert engine.status(left).status == "interrupted"

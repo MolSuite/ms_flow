@@ -3,17 +3,21 @@
 The state lives in memory and belongs to the loop thread alone. Everything else reaches
 it through one queue: callers leave orders, executors leave finished chunks, the delivery
 thread leaves confirmations. The loop only moves state and tokens and decides what is
-dispatched next; results reach user callbacks from the delivery thread.
+dispatched next. User code runs elsewhere: the source of chunks on a feeder thread per
+job, the callbacks on the delivery thread.
 """
 from __future__ import annotations
 
+import hashlib
 import itertools
 import logging
 import os
+import pickle
 import queue
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from dataclasses import dataclass
 
@@ -28,6 +32,21 @@ COMPLETED_WITH_ERRORS = "completed_with_errors"
 FAILED = "failed"
 CANCELED = "canceled"
 INTERRUPTED = "interrupted"
+
+_PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
+
+
+def content_key(payload) -> bytes:
+    """16 bytes that identify a chunk by what it carries, the same in every run.
+
+    Equal keys mean equal payloads. The reverse is not promised: a payload built another
+    way (dict order, a set) gets another key, so on resume it is repeated, never skipped.
+    """
+    try:
+        data = pickle.dumps(payload, protocol=4)
+    except Exception:
+        return uuid.uuid4().bytes  # nothing to recognise it by in another run
+    return hashlib.blake2b(data, digest_size=16).digest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,10 +65,10 @@ class JobSnapshot:
 
 
 class _Job:
-    __slots__ = ("id", "name", "slot", "fn", "source", "cost", "window", "max_running", "priority",
+    __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority",
                  "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
-                 "flying", "seq", "exhausted", "fatal", "error", "peak_mem_mb", "started_at",
-                 "finished_at", "finished")
+                 "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
+                 "peak_mem_mb", "started_at", "finished_at", "finished")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
@@ -59,10 +78,11 @@ class _Job:
 class _Chunk:
     """A chunk between dispatch and its result being delivered. Finished ones are only counted."""
 
-    __slots__ = ("job", "key", "payload", "handle", "alone")
+    __slots__ = ("job", "key", "payload", "cost", "handle", "alone")
 
-    def __init__(self, job: _Job, key, payload):
-        self.job, self.key, self.payload, self.handle, self.alone = job, key, payload, None, False
+    def __init__(self, job: _Job, key, payload, cost):
+        self.job, self.key, self.payload, self.cost = job, key, payload, cost
+        self.handle, self.alone = None, False
 
 
 class _Slot:
@@ -110,8 +130,12 @@ class Engine:
                on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
-        `cpu`, `gpu` and `mem_mb` are what one chunk needs; `max_cpu` caps the job as a whole.
-        `window` is how many chunks may be between dispatch and delivered result.
+        `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
+        for itself with `_cpu_required`, `_gpu_required` and `_mem_mb`, which `fn` never sees.
+        `max_cpu` caps the job as a whole; a chunk above the cap runs alone in its job.
+        `chunks` is read on its own thread. `window` is how many chunks may be between dispatch
+        and delivered result, and how many more may be read ahead.
+        A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
         """
@@ -121,24 +145,22 @@ class Engine:
         if slot is None:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         job = _Job()
-        job.cost = job.max_running = None
-        if slot.impl.uses_tokens:
-            job.cost = (cpu, gpu, mem_mb)
-            if not self.tokens.ever_fits(job.cost) or (max_cpu is not None and max_cpu < cpu):
-                raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: the engine "
-                                 f"has {self.tokens.total} and max_cpu={max_cpu}")
-            if max_cpu is not None and cpu:
-                job.max_running = int(max_cpu // cpu)
-        job.id, job.name, job.slot, job.fn, job.source = next(self._ids), name, slot, fn, iter(chunks)
+        job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
+        if job.cost is not None and not self.tokens.ever_fits(job.cost):
+            raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
+                             f"the engine has {self.tokens.total}")
+        job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.window = window or 2 * slot.impl.capacity
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
         job.status = RUNNING
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
         job.done = job.failed = job.open = job.seq = job.peak_mem_mb = 0
-        job.flying, job.exhausted, job.fatal, job.error = set(), False, None, None
+        job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
+        job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
         job.started_at, job.finished_at, job.finished = time.time(), None, threading.Event()
         self._jobs[job.id] = job
         self._events.put((self._on_submit, job))
+        threading.Thread(target=self._feed, args=(job, chunks), name=f"msflow-feed-{job.id}", daemon=True).start()
         return job.id
 
     def status(self, job_id: int) -> JobSnapshot:
@@ -219,8 +241,9 @@ class Engine:
         if chunk.alone:
             slot.isolating = False
         job.flying.discard(chunk)
-        if job.cost is not None:
-            self.tokens.give(job.cost)
+        if chunk.cost is not None:
+            self.tokens.give(chunk.cost)
+            job.cpu_used -= chunk.cost[0]
         if job.status != RUNNING:
             return
         if peak_mb > job.peak_mem_mb:
@@ -252,13 +275,15 @@ class Engine:
         self._finish_if_over(job)
 
     def _finish_if_over(self, job: _Job) -> None:
-        if job.exhausted and not job.open:
+        if job.fed_all and not job.ready and not job.open:
             nothing_worked = job.fatal or (job.failed and not job.done)
             self._finish(job, FAILED if nothing_worked else COMPLETED_WITH_ERRORS if job.failed else COMPLETED)
 
     def _finish(self, job: _Job, status: str) -> None:
-        job.status, job.finished_at, job.source = status, time.time(), None
+        job.status, job.finished_at = status, time.time()
         job.error = job.fatal or job.error
+        job.ready.clear()
+        job.room.set()  # a feeder waiting for room wakes up, sees the status and leaves
         self._active.remove(job)
         self._deliveries.put((self._announce, (job,), None))
 
@@ -277,31 +302,38 @@ class Engine:
 
     def _start_one(self, job: _Job) -> bool:
         slot = job.slot
-        if (job.exhausted or job.open >= job.window or slot.inflight >= slot.impl.capacity
-                or slot.suspects or slot.isolating):
+        if job.open >= job.window or slot.inflight >= slot.impl.capacity or slot.suspects or slot.isolating:
             return False
-        if job.cost is not None and (not self.tokens.fits(job.cost)
-                                     or (job.max_running is not None and len(job.flying) >= job.max_running)):
+        ready = job.ready
+        if not ready:
+            job.hungry = True  # the feeder wakes the loop after its next chunk...
+            if not ready:  # ...unless that chunk arrived in between
+                return False
+        chunk = ready[0]
+        cost = chunk.cost
+        if cost is not None and self.tokens.ever_fits(cost) and (
+                not self.tokens.fits(cost)
+                or (job.max_cpu is not None and job.cpu_used and job.cpu_used + cost[0] > job.max_cpu)):
             return False
-        try:
-            # ponytail: the source of chunks runs here, so a slow generator stalls every job.
-            # It moves to a feeder thread per job together with the content key.
-            payload = next(job.source)
-        except StopIteration:
-            self._exhausted(job, None)
-            return False
-        except Exception:
-            self._exhausted(job, "the source of chunks failed\n" + traceback.format_exc())
-            return False
-        chunk = _Chunk(job, job.seq, payload)
+        ready.popleft()
+        if 2 * len(ready) <= job.window and not job.room.is_set():
+            job.room.set()  # half empty: one wake-up refills it, instead of one per chunk
         job.seq += 1
         job.open += 1
-        self._launch(chunk, alone=False)
+        if cost is None or self.tokens.ever_fits(cost):
+            self._launch(chunk, alone=False)
+        else:
+            self._settle(job, chunk.key, f"a chunk needing (cpu, gpu, mem_mb)={cost} can never run: "
+                                         f"the engine has {self.tokens.total}")
         return True
 
-    def _exhausted(self, job: _Job, fatal: str | None) -> None:
-        job.exhausted, job.fatal, job.total = True, fatal, job.seq
-        self._finish_if_over(job)
+    def _on_fed(self) -> None:
+        """Nothing to record: the dispatch pass that follows every event picks the chunk up."""
+
+    def _on_source_end(self, job: _Job, fatal: str | None) -> None:
+        if job.status == RUNNING:
+            job.fed_all, job.fatal, job.total = True, fatal, job.seq + len(job.ready)
+            self._finish_if_over(job)
 
     def _retry_suspect(self, slot: _Slot) -> None:
         # ponytail: after a worker death every chunk the pool held is rerun one at a time,
@@ -310,7 +342,7 @@ class Engine:
             chunk = slot.suspects[0]
             job = chunk.job
             if job.status == RUNNING:
-                if job.cost is not None and not self.tokens.fits(job.cost):
+                if chunk.cost is not None and not self.tokens.fits(chunk.cost):
                     return
                 slot.suspects.popleft()
                 self._launch(chunk, alone=True)
@@ -320,8 +352,9 @@ class Engine:
     def _launch(self, chunk: _Chunk, alone: bool) -> None:
         job = chunk.job
         slot = job.slot
-        if job.cost is not None:
-            self.tokens.take(job.cost)
+        if chunk.cost is not None:
+            self.tokens.take(chunk.cost)
+            job.cpu_used += chunk.cost[0]
         slot.inflight += 1
         slot.isolating = chunk.alone = alone
         job.flying.add(chunk)
@@ -329,6 +362,34 @@ class Engine:
             chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk)
         except Exception:
             self._on_done(chunk, ERROR, None, "the executor refused the chunk\n" + traceback.format_exc(), 0)
+
+    # --- Feeder threads, one per job --------------------------------------------------
+
+    def _feed(self, job: _Job, chunks) -> None:
+        fatal = None
+        try:
+            ready, room, window = job.ready, job.room, job.window
+            for payload in chunks:
+                while len(ready) >= window:  # at most `window` chunks read ahead
+                    room.clear()
+                    if len(ready) >= window:
+                        room.wait()
+                if job.status != RUNNING:
+                    return
+                cost, key = job.cost, None
+                if type(payload) is dict and ("_key" in payload or not payload.keys().isdisjoint(_PER_CHUNK)):
+                    payload = dict(payload)
+                    key = payload.pop("_key", None)
+                    own = [payload.pop(name, None) for name in _PER_CHUNK]
+                    if cost is not None:
+                        cost = tuple(c if o is None else o for c, o in zip(cost, own))
+                ready.append(_Chunk(job, content_key(payload) if key is None else key, payload, cost))
+                if job.hungry:
+                    job.hungry = False
+                    self._events.put((self._on_fed,))
+        except Exception:
+            fatal = "the source of chunks failed\n" + traceback.format_exc()
+        self._events.put((self._on_source_end, job, fatal))
 
     # --- Delivery thread --------------------------------------------------------------
 
