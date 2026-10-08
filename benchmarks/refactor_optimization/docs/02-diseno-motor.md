@@ -28,7 +28,7 @@ Un usuario, pocos jobs a la vez, cada uno con cientos a millones de chunks. De a
 - 0,2 ms o menos de orquestación por chunk con diario, 0,05 ms sin él. Hoy: 4,2 ms en hilos y 5,6 ms en procesos.
 - Coste por chunk plano (±10 %) de 1.000 a 1.000.000 de chunks. Hoy crece 2,4 veces dentro de un job de 20.000.
 - Menos de 0,3 KB en disco por chunk. Hoy: 1,44 KB.
-- Tras `kill -9` y reabrir, el job termina con todos sus chunks y ninguno terminado se repite.
+- Tras `kill -9` y reabrir, el job se reanuda, termina con todos sus chunks y solo repite los del último lote sin registrar.
 - La muerte de un worker afecta a un chunk, no al job ni a los siguientes.
 
 ## Componentes
@@ -37,7 +37,7 @@ Un usuario, pocos jobs a la vez, cada uno con cientos a millones de chunks. De a
 flowchart TB
     API["Llamador<br/>submit · cancel · status"]
 
-    subgraph ENGINE["Motor · uno por proceso"]
+    subgraph ENGINE["Motor · dentro del proceso de la aplicación"]
         direction TB
         Q(["Cola de eventos"])
         LOOP["Bucle del motor<br/>1 hilo, sin E/S"]
@@ -70,18 +70,18 @@ El bucle es el único que cambia el estado. Todo lo demás le habla por la cola 
 
 ### 1. Motor (`Engine`)
 
-Un objeto por proceso. Posee los ejecutores registrados, los tokens de CPU y GPU, el estado de los jobs y el hilo del bucle. Se crea al arrancar la aplicación o al primer uso, y no necesita proyecto.
+Un objeto dentro del proceso de la aplicación (la app, un script o un notebook), en lugar de uno por proyecto como hoy. Los procesos worker no levantan motor ni monitoreo: ejecutan la función y devuelven el resultado. Solo un motor por usuario reparte los recursos locales: al crearse toma un bloqueo del sistema operativo sobre `engine.lock`, en la carpeta de estado que le pasa la aplicación. Un segundo proceso recibe un error con el pid del dueño, para que dos aplicaciones no compitan por CPU, GPU y memoria. Un script puede saltarse el bloqueo con `exclusive=False`, declarando sus CPUs, bajo su responsabilidad. Posee los ejecutores registrados, los tokens de CPU y GPU, el estado de los jobs y el hilo del bucle. Se crea al arrancar la aplicación o al primer uso, y no necesita proyecto.
 
 - **Hoy.** `ExecutorManager` se construye con el `executor.db` de un proyecto (`_create_executor_manager` en `project_runtime.py`) y `stop()` al cambiar de proyecto. Sin proyecto no existe, y por eso las instalaciones de herramientas corren fuera del orquestador.
 - **Cambio.** El motor no recibe ninguna base de datos al construirse. Recibe diarios después, con `attach` y `detach`, y cada job dice cuál usa.
-- **Por qué.** Es lo que permite los jobs de aplicación (`ms_env`), los scripts sin proyecto y que abrir otro proyecto no mate nada.
+- **Por qué.** Es lo que permite los jobs de aplicación (`ms_env`), los scripts sin proyecto y que cambiar de proyecto no pare el motor, sus pools ni los jobs de aplicación.
 
 ### 2. Estado en memoria
 
 Dos estructuras, las dos propiedad exclusiva del bucle:
 
-- **Job.** Especificación (ejecutor, función, coste en CPU y GPU, ventana, nivel de durabilidad, reintentos), fase, contadores (`total`, `en vuelo`, `hechos`, `fallidos`, `cancelados`), posición del generador y dependencias.
-- **Chunk en vuelo.** Índice dentro del job, intento, estado, asa del ejecutor y hora límite.
+- **Job.** Especificación (ejecutor, función, coste en CPU, GPU y memoria, ventana, nivel de durabilidad, reintentos), fase, contadores (`total`, `en vuelo`, `hechos`, `fallidos`, `cancelados`), posición del generador y dependencias.
+- **Chunk en vuelo.** Clave, número de orden local, intento, estado, asa del ejecutor y hora límite.
 
 Solo se guardan en memoria los chunks en vuelo. Uno terminado suma a un contador y desaparece. La memoria del motor es proporcional a la ventana, no al tamaño del job.
 
@@ -89,7 +89,7 @@ Solo se guardan en memoria los chunks en vuelo. Uno terminado suma a un contador
 - **Cambio.** Ningún `SELECT` en el bucle. El estado del job es `O(1)`: se lee de los contadores.
 - **Por qué.** Es la causa 1 y 3 del overhead y la causa de que el coste crezca con el tamaño del job.
 
-**Identidad del chunk.** Un chunk se identifica por `(job, índice)`, donde el índice es su posición en la secuencia que produce el generador. Sustituye al UUID y al `chunk_id` de texto. Esto impone un contrato: el generador debe producir la misma secuencia si se le vuelve a llamar. Ver decisiones abiertas.
+**Identidad del chunk.** Un chunk se identifica por `(job, clave)`. La clave es un hash de 16 bytes (`blake2b`) del payload ya convertido a formato de transporte, que el alimentador calcula; un generador que conozca una clave mejor la entrega en `_key`, como hoy `_cpu_required`. Sustituye al `uuid4` actual, que no significa nada entre ejecuciones. La posición en la secuencia no sirve de identidad: el filtro `skip_existing` de docking desplaza todo el flujo al relanzar. Dos chunks con el mismo payload dentro de un job cuentan como uno al reanudar.
 
 ### 3. Bucle del motor
 
@@ -99,6 +99,7 @@ En cada evento hace tres cosas: actualiza el estado, devuelve o toma tokens y de
 
 - **Hoy.** `_run_loop` hace en cada tick: sondeo de todos los chunks en vuelo (`adapter.poll` uno a uno), finalización de despachos (2 sesiones, 2 `SELECT` y 2 commits por chunk), ciclo de staging, sinks, flush de persistencia, alimentación, despacho, progreso, eventos y latidos. Después duerme 20 a 100 ms.
 - **Cambio.** Los ejecutores avisan al terminar (`add_done_callback` pone un evento en la cola). El bucle no sondea ni duerme con tareas pendientes.
+- **Cola y sondeo.** No hay gestor de eventos propio: es una `queue.SimpleQueue` de la biblioteca estándar y un bucle que saca de ella. Los eventos nunca viajan a los workers; los emite, en el proceso principal, el hilo que vigila a cada ejecutor (ver «Ejecutores»). El sondeo queda solo donde la fuente no puede avisar: HPC, cuando exista, y los tiempos límite. `blinker` no interviene en el motor: `send` ejecuta los receptores en el hilo que emite, sin relevo entre hilos. Sigue para lo que ya hace (ajustes, proyecto abierto y cerrado).
 - **Por qué.** El tick añade unos 50 ms al arranque de cada job y hasta un tick por finalización. En procesos, el hilo está saturado de CPU haciendo SQL, y por eso ningún ajuste mueve su coste.
 
 ### 4. Alimentadores
@@ -113,11 +114,23 @@ La etapa por chunk (`stage_ref`) encaja aquí: generador → etapa → cola de l
 
 ### 5. Tokens y planificación
 
-Contadores de CPU y GPU libres. Un chunk sale si hay tokens para su coste, si su job no supera su `max_job_cpu` y si su ventana tiene hueco. Entre jobs se respeta prioridad y política de cola como hoy.
+Contadores de CPU, GPU y memoria libres. Un chunk sale si hay tokens para su coste en los tres, si su job no supera su `max_job_cpu` y si su ventana tiene hueco. Entre jobs se respeta prioridad y política de cola como hoy.
 
 - **Hoy.** La lógica está repartida en tres módulos (`local_scheduler.py`, `local_compute_scheduler.py`, `resource_manager.py`) más consultas a la base de datos para saber el uso por job.
 - **Cambio.** Un módulo, todo en memoria. La ventana por defecto pasa de 16 fijo a un múltiplo de los workers del ejecutor.
 - **Por qué.** Con 28 hilos o 14 procesos, 16 deja workers sin alimentar.
+
+**Memoria.** Hoy la admisión solo mira CPU y GPU. `memory_gb` existe en los modelos de configuración y no lo usa nadie. Con Vina o GNINA por encima de 1 GB por docking, una máquina con tantos GB como núcleos se satura.
+
+Un tercer contador en el módulo de tokens.
+
+- **Coste declarado por chunk** (`mem_mb`), igual que `cpu_required`. Un job que no lo declara no cuenta memoria y se comporta como hoy. Lo declara quien conoce la herramienta (AMDock para docking), no el motor.
+- **Presupuesto** = RAM física menos una reserva: por defecto el 20 % con un mínimo de 2 GB, ajustable en configuración. La RAM total sale de `os.sysconf` (Windows necesita una llamada con `ctypes`); sin dependencia nueva.
+- **Admisión**: un chunk sale si hay CPU, GPU y memoria. La concurrencia efectiva pasa a ser el mínimo de núcleos y `presupuesto / mem_mb`.
+- **El mismo dato sirve fuera**: se pasa a Ray como `memory=` y a la plantilla de HPC como `--mem`.
+- **Medición**: el worker devuelve su pico de memoria (`resource.getrusage`, incluye subprocesos) y el job lo muestra, para corregir el valor declarado.
+
+Fuera de la primera versión: ajustar la reserva sola a partir del pico medido, y frenar el despacho según la memoria libre real del sistema (otras aplicaciones no cuentan en el presupuesto).
 
 ### 6. Ejecutores
 
@@ -126,6 +139,19 @@ Los adaptadores de hilos, procesos, Ray y HPC se quedan. Cambian tres cosas:
 - **Aviso en lugar de sondeo.** Los locales notifican por callback. Los externos (HPC, Ray) se sondean en lote desde un hilo propio, no desde el bucle.
 - **Pool que se recupera.** Ante `BrokenProcessPool` el adaptador recrea el pool y devuelve al motor los chunks que no llegaron a ejecutarse para que los reencole. Hoy `_reset_pool_locked` solo se llama desde `cancel`.
 - **Workers que mueren con el padre.** Cada worker vigila al proceso principal y termina si desaparece.
+
+**Un contrato para todos.** El adaptador recibe al registrarse una función `on_done(asa, estado, resultado, error)` y deja de exponer `poll`. Quién la llama depende del ejecutor; el bucle no distingue local de remoto.
+
+| Ejecutor | Quién avisa | Tokens locales |
+|---|---|---|
+| Hilos, procesos (loky) | El hilo del propio pool que recibe los resultados; `add_done_callback` solo le hace dejar el evento en la cola | Por chunk (`dynamic`, como hoy) |
+| Ray local | Un hilo vigía bloqueado en `ray.wait` sobre todas las referencias | Una porción fija reservada al activar (`reserved`, como hoy); Ray reparte dentro de ella |
+| Ray remoto | El mismo hilo vigía | Ninguno |
+| HPC | Un hilo que sondea: ficheros de estado primero, después una consulta al planificador para todos sus jobs | Ninguno |
+
+En los cuatro casos quien avisa es un hilo del proceso principal que espera a los workers. En loky ese hilo ya existe dentro del pool: es el que lee la tubería de resultados y completa el `Future`. El callback se registra en el proceso principal y no viaja al worker. Hoy el adaptador guarda los `Future` y el bucle pregunta `future.done()` uno a uno.
+
+Hoy `poll` de HPC lanza un `subprocess.run` por chunk dentro del hilo del motor, y `poll` de Ray hace un `ray.wait(timeout=0)` por referencia. La ventana de un ejecutor externo sale de la capacidad que declare el adaptador, no de los tokens locales. HPC y Ray siguen aplazados; lo que se fija ahora es el contrato.
 
 Agrupación automática: cuando la duración medida de los chunks es corta, el adaptador de procesos empaqueta varios en una tarea. El chunk sigue siendo la unidad de progreso, reintento y diario.
 
@@ -137,7 +163,7 @@ Una interfaz pequeña que el bucle llama para registrar, sin esperar respuesta:
 | --- | --- |
 | `job_created(job)` | Al aceptar el envío |
 | `job_changed(job)` | Cambio de fase o de contadores, como mucho una vez por lote |
-| `chunk_finished(job, índice, estado, intento, error)` | Chunk terminado (bien, mal, cancelado, tiempo agotado) |
+| `chunk_finished(job, clave, estado, intento, error)` | Chunk terminado (bien, mal, cancelado, tiempo agotado) |
 | `event(job, tipo, datos)` | Eventos de job siempre; eventos por chunk solo en nivel `full` |
 | `flush()` | Barrera: al terminar un job y al cerrar |
 | `load()` | Al conectar: jobs y chunks terminados, para reanudar |
@@ -160,15 +186,15 @@ CREATE TABLE jobs (
     created_at REAL, started_at REAL, finished_at REAL
 );
 CREATE TABLE chunks (
-    job INTEGER NOT NULL, idx INTEGER NOT NULL,
+    job INTEGER NOT NULL, key BLOB NOT NULL,     -- 16 bytes
     status INTEGER NOT NULL, attempt INTEGER NOT NULL, error TEXT,
-    PRIMARY KEY (job, idx)
+    PRIMARY KEY (job, key)
 ) WITHOUT ROWID;
 CREATE TABLE events (job INTEGER, ts REAL, kind TEXT, data TEXT);
 ```
 
 - **Hoy.** Fila de chunk de 22 columnas con 7 índices de una columna, el único de `chunk_id` y la clave primaria UUID; payload dentro de la fila; 2 eventos por chunk; latidos cada 0,5 s; motivo del planificador persistido.
-- **Cambio.** La fila de chunk son cuatro enteros y un error opcional, con un solo índice (la clave). Se escribe una vez, al terminar. El payload no se registra nunca: lo regenera el generador. Al terminar el job, `compact` borra las filas de chunks terminados bien y deja los contadores en la fila del job; las de fallos se quedan, con su error.
+- **Cambio.** La fila de chunk son la clave, tres enteros y un error opcional, con un solo índice (la clave). Se escribe una vez, al terminar. El payload no se registra nunca: lo regenera el generador. Al terminar el job, `compact` borra las filas de chunks terminados bien y deja los contadores en la fila del job; las de fallos se quedan, con su error.
 - **Por qué.** En el microbenchmark de la auditoría, las tres transiciones de un chunk cuestan 738 µs con el ORM y 99 µs con `sqlite3` directo y despacho agrupado. El diario hace una sola escritura por chunk, y por lotes. Y es la respuesta al tamaño de `executor.db`: un job terminado ocupa una fila más sus fallos.
 
 **Qué se puede perder.** En una caída se pierde como mucho el último lote sin escribir. Esos chunks constan como no terminados y se vuelven a ejecutar al reanudar. La garantía es "al menos una vez". Un chunk se registra como hecho después de que su sink confirme la escritura, así que el caso malo es: resultado escrito, registro perdido, chunk repetido. El contrato que ya existe para AMDockVS (escrituras idempotentes: upsert o saltar lo existente) lo cubre y sigue siendo obligatorio.
@@ -181,11 +207,13 @@ CREATE TABLE events (job INTEGER, ts REAL, kind TEXT, data TEXT);
 | Proyecto | El `executor.db` del proyecto | Campañas. El historial viaja con los datos |
 | Aplicación | Un diario en `~/.molsuite` | Jobs sin proyecto: instalación de herramientas y entornos de `ms_env` |
 
-El motor mantiene abiertos los diarios que tienen jobs. Abrir un proyecto conecta su diario; cerrarlo lo desconecta cuando no le quedan jobs activos. Los jobs de aplicación no se enteran.
+Como mucho hay dos diarios abiertos: el del proyecto activo y el de la aplicación. Cerrar un proyecto interrumpe sus jobs (quedan `interrupted`, reanudables), espera a que sinks y diario terminen de escribir y desconecta el diario. Del proyecto no queda nada en el motor; el motor, sus pools y los jobs de aplicación siguen. Seguir ejecutando jobs de un proyecto cerrado queda descartado: obligaría a mantener por job sus conexiones a `project.db` y a aislar esas piezas por proyecto dentro del motor.
+
+`project.db` y `executor.db` son del proyecto y cambian con él. El motor no guarda ninguna conexión propia a `project.db`: cada job trae sus destinos. Los workers nunca abren la base de datos (SQLite no admite escritores concurrentes): reciben el payload y devuelven el resultado; leen el generador y la etapa, y escriben los sinks, todos en el proceso principal. Por eso el pool de workers no guarda nada del proyecto y sigue vivo al cambiar. Al cerrar el proyecto A se cierran sus conexiones en el proceso principal, y eso incluye una cosa que hoy no se hace: vaciar la caché de conexiones por ruta (`dispose_cached_engines` en `core/database/base.py` no tiene ningún llamador). Lo que sobrevive al cambio no es de ningún proyecto: el objeto motor, sus pools, los tokens y el diario de la aplicación.
 
 Las dependencias entre jobs (`depends_on`) se resuelven en memoria, entre jobs de cualquier diario. Un job de docking de un proyecto puede esperar a un job de instalación registrado en el diario de la aplicación. La puerta `tool:<nombre>@<destino>` sigue consultando el estado de la herramienta, como hoy.
 
-**Propietario.** Cada fichero de diario tiene un dueño (pid, máquina, arranque). Un segundo proceso que lo abra recibe un error con el PID del dueño, o lo abre en solo lectura para observar. Hoy el segundo proceso marca como interrumpidos los jobs del primero.
+**Propietario.** Cada fichero de diario tiene un dueño: un bloqueo del sistema operativo sobre `executor.db.lock` (`fcntl.flock` en POSIX, `msvcrt.locking` en Windows). El kernel lo libera al morir el proceso, así que no quedan bloqueos huérfanos ni hay confusión por reutilización de pid; pid, máquina y arranque se escriben solo para el mensaje. Un segundo proceso abre el proyecto sin motor para él: ve datos y monitor (diario en solo lectura), no lanza jobs ni toca su estado. Hoy el segundo proceso marca como fallidos los jobs vivos del primero. Techo: sistemas de ficheros en red donde `flock` no es fiable.
 
 ### 9. Niveles de durabilidad
 
@@ -205,7 +233,7 @@ Sin cambios de concepto. El bucle entrega el resultado al manejador o al pool de
 
 ### 11. Observación
 
-- **Dentro del proceso.** `status(job)` devuelve una instantánea de los contadores en memoria. La interfaz se suscribe a cambios en lugar de preguntar. Observar no cuesta nada al motor.
+- **Dentro del proceso.** `status(job)` devuelve una instantánea de los contadores en memoria. El monitor mantiene su temporizador (`ms_monitor/polling.py`), pero lee instantáneas en memoria en lugar de consultas SQL: observar no cuesta nada al motor. Señales de `blinker` para jobs solo si un consumidor llega a necesitar aviso en lugar de pregunta.
 - **Desde otro proceso** (línea de comandos, otro monitor). Lee el diario en solo lectura. Ve los contadores con el retraso de un lote. En nivel `journal` no hay detalle de chunks en ejecución; en `full`, sí.
 
 - **Hoy.** `get_job` y el monitor consultan la base de datos, y `refresh_job_status` cuesta 11 ms por llamada.
@@ -220,7 +248,7 @@ sequenceDiagram
     participant S as Sink
     participant J as Escritor del diario
 
-    F->>L: chunk listo (índice, payload)
+    F->>L: chunk listo (clave, payload)
     Note over L: toma tokens, anota "en vuelo"
     L->>E: submit(payload)
     E-->>L: evento: terminado (resultado)
@@ -228,7 +256,7 @@ sequenceDiagram
     L->>S: escribir resultado
     S-->>L: evento: escrito
     Note over L: contador "hechos" +1, olvida el chunk
-    L-)J: chunk_finished(job, índice, hecho)
+    L-)J: chunk_finished(job, clave, hecho)
     Note over J: lo acumula y lo escribe con el lote
 ```
 
@@ -260,11 +288,24 @@ stateDiagram-v2
 
 ## Reanudación
 
-1. Al conectar un diario, el motor carga los jobs no terminados. Si su dueño ya no existe, pasan a `interrupted`.
+1. Al conectar un diario, el motor carga los jobs no terminados y los deja en `interrupted`. Nunca relanza nada solo: reanudar es una acción explícita.
 2. Reanudar necesita otra vez la fuente de chunks:
    - Si el job se envió con un generador importable, su referencia está en `spec` y el motor lo reanuda solo.
    - Si se envió con una lista o un iterador en memoria, quien lo envió lo vuelve a enviar con la misma clave de job. El motor reconoce el job y continúa.
-3. El motor carga del diario el conjunto de índices terminados, vuelve a recorrer el generador y salta esos índices. Ejecuta solo lo que falta.
+3. El motor carga del diario el conjunto de claves terminadas, vuelve a recorrer el generador y salta los chunks cuya clave está en él. Ejecuta solo lo que falta.
+
+La regla es: ante la duda se repite; nunca se salta algo que no esté probado como hecho. Si el flujo cambia entre ejecuciones (filas nuevas, límites de chunk desplazados), las claves dejan de coincidir y esos chunks se repiten. Repetir es seguro porque la escritura idempotente en los sinks es contrato.
+
+Dos condiciones y un límite:
+
+- El payload debe ser reproducible: sin rutas temporales, horas ni identificadores aleatorios. Si al reanudar no coincide ninguna clave habiendo chunks hechos, el motor lo avisa con un evento del job.
+- La garantía sigue siendo «al menos una vez». Un chunk escrito cuyo registro se perdió con el último lote se repite; con un sink que no sea idempotente, se duplica.
+- Un job que ya filtra lo hecho en su fuente de datos (`skip_existing` en docking) no necesita las claves: su flujo ya solo trae lo que falta. Las dos cosas conviven.
+
+Contrastado con las dos fuentes reales de AMDockVS:
+
+- **Base de datos.** `db_pages` pagina con `ORDER BY key`: mismo orden y mismos lotes mientras no cambien las filas.
+- **Fichero.** El proceso principal lee el fichero en secuencia y corta por bytes y registros (`stream_import_payload_batches`); el worker no elige su trozo. El payload lleva `file_path`, `span_offset`, `span_end` y `span_first_index`, así que la clave identifica un tramo exacto del fichero. Guarda necesaria: el job anota tamaño y fecha del fichero, y si cambian al reanudar se descartan las claves hechas.
 
 Hoy `resubmit_job` exige un generador persistido y empieza desde el cursor 0.
 
@@ -286,37 +327,40 @@ Hoy `resubmit_job` exige un generador persistido y empieza desde el cursor 0.
 - **`ms_projects`** recibe proyectos y ajustes (`core/project`, `core/settings`, el registro de `~/.molsuite`). Al abrir un proyecto llama a `attach` con su `executor.db`; al cerrarlo, a `detach`.
 - **`ms_env`** (nuevo) recibe las recetas de herramientas y la creación y gestión de entornos (`core/executor/tools.py`, `provisioning.py`). Envía sus instalaciones al motor como jobs con el diario de la aplicación y publica el estado que consulta la puerta `tool:`.
 
-El orden importa: el motor sin proyecto (cambio 8 de la lista siguiente) es el requisito de los dos traslados. Su planificación va en documentos aparte.
+El orden importa: el motor sin proyecto (el núcleo, B1 de la lista siguiente) es el requisito de los dos traslados. Su planificación va en documentos aparte.
 
 ## Cambios, en el orden propuesto
 
-Cada fila es una rama y un PR, con su paso en [03-impacto.html](03-impacto.html). Las piezas nuevas van a un paquete `ms_flow/engine/`; cada PR borra de `ExecutorManager` lo que sustituye, y la fachada pública se mantiene hasta la fase 3.
+El motor nuevo se construye entero en `ms_flow/engine/`, al lado del actual, que no se toca hasta el relevo. Cada pieza es una rama local con su test y su paso en [03-impacto.html](03-impacto.html), medido con el mismo banco de pruebas contra la línea base y contra los objetivos. Si los números y las comprobaciones acompañan, la fachada pasa al motor nuevo y el anterior se borra.
 
-| N.º | Cambio | Tarea | Qué debería mover en el informe |
+| N.º | Cambio | Tareas que absorbe | Qué debería mover en el informe |
 | --- | --- | --- | --- |
 | 0 | Banco de pruebas, línea base y estos documentos | — | Columna `baseline` |
-| 1 | Recrear el pool tras la muerte de un worker y reencolar lo que no se ejecutó | F0-1 | 2 comprobaciones de muerte de worker |
-| 2 | Ventana por defecto proporcional a los workers | F0-3 | `thread`, `process` |
-| 3 | Eventos por chunk desactivados por defecto | F0-4 | `thread`, `state` |
-| 4 | Índice `(job_id, status)` | F0-2 | `large job`. Desechable: la tabla se sustituye en el cambio 9 |
-| 5 | Workers que mueren con el padre | F1-4 | Comprobación `kill -9` |
-| 6 | Dueño por fichero de estado | F1-3 | Comprobación de segundo motor |
-| 7 | Estado en memoria: contadores incrementales, candidatos y ventana sin `SELECT` | F2-1, F2-4 | `thread`, `process`, `large job`, `growth` |
-| 8 | Motor por proceso; diarios que se conectan; destino por job | F2-2 | Ninguna métrica; habilita jobs sin proyecto |
-| 9 | Diario con `sqlite3` directo, hilo escritor, esquema compacto y compactación | F2-3, F2-8 | `thread`, `process`, `state` |
-| 10 | Bucle por eventos | F2-5 | `first job`, `thread` |
-| 11 | Alimentadores fuera del bucle | F2-1 | `process`, `large job` |
-| 12 | Reanudación, `interrupted`, `completed_with_errors`, niveles de durabilidad | F2-7, F1-5, F1-6, F3-2 | Comprobación nueva de reanudación |
-| 13 | Reintentos y tiempo máximo por chunk | F1-1, F1-2 | Comprobaciones nuevas |
-| 14 | Agrupación automática | F2-6 | `process` |
-| 15 | SQLModel fuera del motor; partir `_manager.py`; un solo módulo de planificación | F2-9, F2-10 | `import` |
+| B1 | Núcleo: estado en memoria, tokens de CPU, GPU y memoria, bucle por cola, contrato `on_done` con hilos y loky, pool que se recupera, workers que mueren con el padre | F0-1, F0-3, F1-4, F2-1, F2-4, F2-5 | `thread`, `process`, `large job`, `growth`; muerte de worker y `kill -9` |
+| B2 | Alimentadores fuera del bucle; clave de contenido; coste y clave por chunk (`_cpu_required`, `_key`) | F2-1 | `process`, `large job` |
+| B3 | Diario con `sqlite3` directo, hilo escritor, esquema compacto y compactación; dueño por fichero y un solo motor local por usuario | F2-3, F2-8, F1-3 | `state`; segundo motor |
+| B4 | Reanudación por clave, `interrupted`, dependencias entre jobs, niveles de durabilidad, cierre de proyecto que interrumpe | F2-7, F1-5, F1-6, F3-2 | Comprobación nueva de reanudación |
+| B5 | Reintentos y tiempo máximo por chunk; matar un chunk en ejecución (también al cancelar) | F1-1, F1-2 | Comprobaciones nuevas |
+| B6 | Agrupación automática | F2-6 | `process` |
+| C1 | Relevo: `job_api.py`, `tasking.py` y `project_runtime.py` pasan al motor nuevo, con sinks, etapas, `setup` y `finalize` | F2-2 | Ninguna métrica; se acepta con los flujos de AMDockVS de punta a punta |
+| C2 | Borrar el motor anterior y SQLModel del motor | F2-9, F2-10 | `import` |
 
-Respecto al plan de la auditoría cambian dos cosas. F1-1 y F1-2 (reintentos y tiempo máximo) pasan a después del estado en memoria, porque hacerlos sobre el motor actual obliga a rehacerlos. Y F1-5 y F1-6 (estados nuevos) van con la reanudación. F0-5, F0-6 y F0-7 no tocan el motor y pueden ir en cualquier momento.
+Lo que desaparece respecto al plan de la auditoría: F0-2 (índice `(job_id, status)`) y F0-4 (eventos por chunk), porque la tabla y los eventos que arreglaban no existen en el motor nuevo. F0-5, F0-6 y F0-7 no tocan el motor y pueden ir en cualquier momento.
+
+**Objetivos con los que se compara.** Orquestación por chunk ≤ 0,05 ms sin diario y ≤ 0,2 ms con él; coste plano (±10 %) de 1.000 a 1.000.000 de chunks; menos de 0,3 KB por chunk en disco; tras un `kill -9` el job se reanuda y solo repite el último lote sin registrar; la muerte de un worker cuesta un chunk.
+
+## Decisiones cerradas (2026-10-07)
+
+- **Historial de los `executor.db` actuales.** No se migra nada. El proyecto está en desarrollo activo y los cambios de esquema son esperados: el esquema nuevo sustituye al anterior.
+- **Ruta del diario de la aplicación.** La fija la aplicación que invoca `ms_flow`; el motor solo recibe una ruta.
+- **Reintentos y tiempo máximo por chunk (F1-1, F1-2).** Van detrás del estado en memoria (B5).
+- **Identidad del chunk.** Clave por contenido, no índice. Ver «Estado en memoria» y «Reanudación».
+- **Cerrar un proyecto con jobs activos.** Los interrumpe y deja el motor limpio para el siguiente proyecto. No hay jobs en segundo plano de proyectos cerrados. Ver «Dónde se registra cada job».
+- **Memoria como tercer recurso.** Aprobada. Entra con el núcleo (B1). Ver «Tokens y planificación».
+- **Dos aplicaciones a la vez.** No comparten recursos: un solo motor local por usuario, con bloqueo. Sin reparto entre procesos ni servicio.
+- **Eventos.** Cola estándar dentro del motor; `blinker` fuera de él; sondeo solo para HPC y tiempos límite.
+- **Método (2026-10-08).** Motor nuevo al lado del actual, comparado con la línea base y con los objetivos; si va bien, se muda todo a él. No se arregla antes el motor actual.
 
 ## Decisiones abiertas
 
-1. **Identidad del chunk por índice.** Reanudar exige que el generador repita la misma secuencia. Los generadores que leen de `project.db` con orden estable lo cumplen. Alternativa: clave por contenido del payload, más robusta y más cara; la propongo para la memoización (F3-4), no ahora.
-2. **Cerrar un proyecto con jobs activos.** El motor permite dos cosas: dejarlos terminar en segundo plano con su diario abierto, o interrumpirlos (quedan reanudables). Propongo que la aplicación pregunte y que el valor por defecto sea dejarlos terminar.
-3. **Historial de los `executor.db` actuales.** El esquema nuevo no es compatible. Propongo no migrar el historial de jobs: al abrir un fichero antiguo se crean las tablas nuevas y las viejas se dejan sin usar hasta una purga. Los datos de `project.db` no se ven afectados.
-4. **Quién elige la ruta del diario de la aplicación.** El motor solo recibe una ruta. Propongo que la fije la capa de aplicación (`ms_projects` cuando exista; hoy, la fachada `MolSuite`).
-5. **Mover F1-1 y F1-2** detrás del estado en memoria, como en la tabla.
+Ninguna.
