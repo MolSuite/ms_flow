@@ -76,6 +76,12 @@ Con 10 ms se pierde hasta un 22 %: despachar una tarea cuesta cerca de 1 ms cuan
 
 **Resultados.** Una sola puerta: lo que devuelve la task va a `output`. `finalize` corre una vez al terminar.
 
+Una puerta no es una tabla: `output` puede ser un `graph_sink` (ya existe; AMDockVS lo usa en import, química y descriptores). La task devuelve `{"tabla_a": filas, "tabla_b": filas}`, las hijas llevan una referencia a su fila madre y el sink pone la clave ajena al insertar, todo en una transacción. Una lista vacía en un nodo no escribe nada, así que un paso opcional es un `if` en la task.
+
+Caso que lo fija (decidido por Mario el 2026-10-08): las interacciones viven en `interaction_results`, y el docking con la opción marcada devuelve filas para `docking_results` e `interaction_results` desde una sola task. No son dos tasks encadenadas: la fila de interacción necesita el id de la pose, que no existe hasta que el hilo del job la escribe; con una task lo resuelve el sink, con dos haría falta escribir, devolver el id y mandar la segunda al mismo sitio donde está el fichero de la pose.
+
+Medido en una pose (1iep, Vina): detectar interacciones 0,04 s; lo que encarece el diagrama es lo que solo sirve para dibujar: exposición al solvente 3,0 s, layout 0,15 s, imagen 1,8 s (intérprete nuevo). Por eso lo barato y que es dato va dentro de la task de docking, y la imagen sigue en su job aparte, que espera al docking por tabla.
+
 **Datos y base de datos.** La base de datos solo se toca en el proceso que lanza el job. El hilo del job lee la fuente y arma el elemento con datos planos y rutas; el hilo de entrega escribe en `output` lo que devuelve la task. Un worker nunca recibe una conexión ni la ruta de la base: recibe datos y rutas de ficheros, y devuelve filas.
 
 **Entradas con ficheros.** Un `FileInputSpec` en un elemento lo resuelve el ejecutor (en local, la ruta tal cual; en remoto, copiar el fichero, una vez si varios elementos lo comparten). El motor llama a esa función desde el hilo del job, nunca desde el hilo de eventos: `submit` de un ejecutor no puede bloquear.
@@ -127,7 +133,7 @@ Pregunta de Mario (2026-10-08): encadenar varias tasks por elemento (preparar y 
 - En el diseño nuevo no pide un tipo de job distinto: una task compuesta es una función que llama a otras. Lo que `ms_flow` podría dar es un `chain(a, b)` que haga una task de varias: recursos = el máximo, tiempo límite = la suma, progreso = paso k de n.
 - Costes: la compuesta retiene los recursos del paso más caro durante todo el elemento; un reintento repite la cadena entera; lo intermedio no se guarda salvo que cada paso tenga su destino (un ligando preparado sirve para muchos receptores).
 - Es la única vía para ver resultados pronto: con el tope de `max(id)` un job no ve lo que otro escribe mientras corre.
-- No se construye ahora (decidido por Mario). El caso que hay hoy, docking con diagrama opcional, no la necesita: es un `if params.compute_diagram` dentro de la task de docking, y el job de diagramas suelto sigue aparte con el mismo dibujante.
+- No se construye ahora (decidido por Mario). El caso que hay hoy, docking con interacciones opcionales, no la necesita: es un `if` dentro de la task de docking con salida a dos tablas (ver Resultados).
 
 ## Hecho en el motor a raíz de este documento
 
