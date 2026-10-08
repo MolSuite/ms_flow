@@ -104,3 +104,37 @@ No propongo que el framework trocee por su cuenta (H10): el motor ya agrupa los 
 2. Al continuar un job cancelado, ¿qué espera el usuario: «termina lo que lancé» (conjunto congelado) o «haz todo lo que cumpla ahora» (como hoy)?
 3. ¿`reads`/`writes` por tabla es suficiente para las dependencias, o hace falta más detalle (por ejemplo, por set de ligandos)?
 4. ¿`setup` y `stage_chunk` se quedan? AMDockVS no los usa; tienen sentido para HPC (preparar ficheros antes de enviar).
+
+## 6. Discusión del 2026-10-08
+
+Mario explica el modelo que había detrás: el **job** es el trabajo global y su estado; la **task** es la base funcional (correr un docking); el **chunk** es la misma task aplicada a un lote, de 1 en local y de 1.000 en HPC. Job y task tienen progreso y log propios, y el de las tasks tributa al del job.
+
+Esto corrige dos puntos de arriba:
+
+- **Propuesta 1 y H1.** Task y job no son lo mismo y la task no se elimina. Lo que sobra es que `TaskDefinition` repita la configuración del job.
+- **H10 y la nota final de la sección 4.** Si el tamaño del lote depende del ejecutor, no es una decisión del dominio y no debe escribirse en cada chunker.
+
+**Dónde no coincide el código con ese modelo.** El modelo tiene tres niveles (job, lote, elemento) y el código da nombre a dos. La «task» de hoy recibe el lote entero y lo recorre a mano, así que cada una reescribe tres cosas: el troceo (en el chunker), el progreso dentro del lote (`index / len(rows) * 100`, 8 sitios en AMDockVS) y qué hacer cuando falla un elemento (contarlo y seguir, con un `print`). El docking normal, además, no informa de progreso: su `run_chunk` no recibe el callback.
+
+**Reparto propuesto.**
+
+| Nivel | Qué es | Qué declara |
+|---|---|---|
+| Task | la función sobre un elemento (o sobre un lote, si la herramienta es por lotes) | lo que cuesta un elemento: `cpu`, `gpu`, `mem_mb`, `timeout`, `retries`; si informa de progreso |
+| Job | una task aplicada a una fuente de elementos | fuente, destino de resultados, qué lee y qué escribe |
+| Envío | una ejecución del job | parámetros, ejecutor, dependencias |
+| Lote (chunk) | cuántos elementos viajan juntos | nada: lo decide el ejecutor (local: el motor, que ya agrupa; HPC: N por tarea) |
+
+Progreso del job = (elementos hechos + fracción de los que están corriendo) / total. El elemento es lo que el autor del job decida seguir: un par en un docking normal, un shard en HTP.
+
+Pendiente de construir para esto: en el motor nuevo no hay canal de progreso del worker al motor. El motor actual usa una cola de un proceso `Manager`.
+
+**Conjunto de entrada: ni congelar ni guardar payloads.** Fuente viva con tres anclas baratas (medido con 1 millón de filas en SQLite):
+
+| Ancla | Para qué | Coste |
+|---|---|---|
+| La tabla de resultados | saber qué está hecho (la fuente lo excluye) | nada nuevo |
+| `count(*)` del filtro al arrancar | total para el progreso; el final de la fuente lo corrige | 37 ms |
+| `max(id)` de cada tabla de origen al arrancar | que el job no crezca con filas nuevas | 0,03 ms y un entero por tabla |
+
+La lista de miembros queda como último recurso: 0,22 s y 10 bytes por elemento. El `max(id)` no cubre un elemento que ya existía y pasa a cumplir el filtro después (un ligando preparado más tarde).
