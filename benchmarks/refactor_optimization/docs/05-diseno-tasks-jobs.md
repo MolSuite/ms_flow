@@ -118,6 +118,17 @@ def docking_job(params, project, setup): ...
 2. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
 3. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
 
+## Para más adelante: task compuesta
+
+Pregunta de Mario (2026-10-08): encadenar varias tasks por elemento (preparar y hacer docking molécula a molécula) para ver resultados desde el principio, en lugar de esperar a que termine cada etapa.
+
+- En `ms_flow` no existe. `workflow()` es, pese al nombre, una entrada, un proceso y una salida: un job con una task. El `WorkflowRunner` de AMDockVS encadena jobs enteros, etapa tras etapa.
+- Sí existe escrito a mano dentro de una task: la de química acepta una lista de operaciones por molécula (protonar, 3D, minimizar) y el docking dibuja el diagrama en el mismo worker (`compute_diagram`).
+- En el diseño nuevo no pide un tipo de job distinto: una task compuesta es una función que llama a otras. Lo que `ms_flow` podría dar es un `chain(a, b)` que haga una task de varias: recursos = el máximo, tiempo límite = la suma, progreso = paso k de n.
+- Costes: la compuesta retiene los recursos del paso más caro durante todo el elemento; un reintento repite la cadena entera; lo intermedio no se guarda salvo que cada paso tenga su destino (un ligando preparado sirve para muchos receptores).
+- Es la única vía para ver resultados pronto: con el tope de `max(id)` un job no ve lo que otro escribe mientras corre.
+- No se construye ahora.
+
 ## Hecho en el motor a raíz de este documento
 
 - `refactor/engine-pack-target`: objetivo del lote automático de 100 ms y reparto del final del job.
