@@ -9,6 +9,7 @@ job, the callbacks on the delivery thread, the disk on the writer thread of each
 from __future__ import annotations
 
 import hashlib
+import heapq
 import itertools
 import json
 import logging
@@ -70,6 +71,7 @@ class JobSnapshot:
     started_at: float
     finished_at: float | None
     key: str | None  # what the job is called in its journal; submitting it again continues it
+    chunks_retried: int  # attempts beyond the first, over all its chunks
 
 
 class _Job:
@@ -77,31 +79,37 @@ class _Job:
                  "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
-                 "skip", "after", "chunks", "pace", "pack", "elastic")
+                 "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
+                 "retried")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
-                           self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid)
+                           self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
+                           self.retried)
 
 
 class _Chunk:
     """A chunk between dispatch and its result being delivered. Finished ones are only counted."""
 
-    __slots__ = ("job", "key", "payload", "cost", "handle", "alone", "pack", "started")
+    __slots__ = ("job", "key", "payload", "cost", "handle", "alone", "pack", "started", "attempt", "doomed",
+                 "spared")
 
     def __init__(self, job: _Job, key, payload, cost):
         self.job, self.key, self.payload, self.cost = job, key, payload, cost
         self.handle, self.alone, self.pack = None, False, None  # `pack`: the chunks sharing its task
+        self.attempt = 1
+        self.doomed = None  # why the engine is stopping it, when it is
+        self.spared = False  # running on an executor the engine is stopping for another chunk's sake
 
 
 class _Slot:
     """A registered executor and what the loop tracks about it."""
 
-    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs")
+    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
-        self.packs = hasattr(impl, "submit_many")
+        self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
 
 
 class Engine:
@@ -120,6 +128,8 @@ class Engine:
         self._active: list[_Job] = []  # running jobs, by priority and then arrival
         self._waiting: list[_Job] = []
         self._ids = itertools.count(1)
+        self._timers: list = []  # (when, tie-break, fn, args), a heap; the loop's own
+        self._ticks = itertools.count()
         self._events: queue.SimpleQueue = queue.SimpleQueue()  # into the loop
         self._deliveries: queue.SimpleQueue = queue.SimpleQueue()  # user callbacks, out of the loop
         self._closed = False
@@ -164,7 +174,8 @@ class Engine:
     def submit(self, executor: str, fn, chunks, *, cpu: float = 1, gpu: float = 0, mem_mb: float = 0,
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
-               after=(), on_result=None, on_error=None, on_terminal=None) -> int:
+               after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
+               on_result=None, on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
         `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
@@ -183,14 +194,23 @@ class Engine:
         continues it: the chunks it had done are recognised by their own keys and not run again.
         `after` is the ids of the jobs that must end first; `chunks` is not read until they do,
         and the job fails if one of them fails, is canceled or is interrupted.
+        A chunk that fails runs again up to `retries` times, `retry_wait` seconds after the first
+        failure and twice as long after each one that follows. Failing is raising, running past
+        `timeout` seconds or killing its worker; falling with somebody else's worker is not, and
+        costs the chunk nothing. `on_error` hears of a chunk only once it has failed for good.
+        `timeout` needs an executor that can stop a running chunk; the process pool stops all
+        of its chunks to stop one, and the others start again.
         """
         if self._closed:
             raise RuntimeError("engine is closed")
         slot = self._executors.get(executor)
         if slot is None:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
+        if timeout is not None and not slot.kills:
+            raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
         job.journal = job.n = job.uid = job.spec = job.skip = None
+        job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs[job_id] for job_id in after]
         if journal is not None:
             job.journal = self._journals.get(journal)
@@ -199,7 +219,8 @@ class Engine:
             job.uid = key or uuid.uuid4().hex
             job.spec = json.dumps({
                 "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
-                "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority})
+                "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
+                "retries": retries, "retry_wait": retry_wait, "timeout": timeout})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
         if job.cost is not None and not self.tokens.ever_fits(job.cost):
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
@@ -262,9 +283,12 @@ class Engine:
     # --- Loop thread ------------------------------------------------------------------
 
     def _loop(self) -> None:
-        get, get_nowait = self._events.get, self._events.get_nowait
+        get, get_nowait, timers = self._events.get, self._events.get_nowait, self._timers
         while True:
-            event = get()
+            try:
+                event = get(timeout=max(0.0, timers[0][0] - time.monotonic())) if timers else get()
+            except queue.Empty:
+                event = (self._on_fed,)  # nothing came: a timer is due
             while True:  # everything that is already waiting, then one dispatch pass
                 if event is None:
                     return
@@ -276,6 +300,12 @@ class Engine:
                     event = get_nowait()
                 except queue.Empty:
                     break
+            while timers and timers[0][0] <= time.monotonic():
+                _, _, fn, args = heapq.heappop(timers)
+                try:
+                    fn(*args)
+                except Exception:
+                    log.exception("engine loop: %s failed", fn.__name__)
             try:
                 self._dispatch()
                 for journal in self._journals.values():
@@ -313,15 +343,44 @@ class Engine:
         self._active.append(job)
         self._active.sort(key=lambda j: (-j.priority, j.id))
         threading.Thread(target=self._feed, args=(job, chunks), name=f"msflow-feed-{job.id}", daemon=True).start()
+        if job.timeout is not None:
+            self._watch(job)
+
+    def _later(self, seconds: float, fn, *args) -> None:
+        heapq.heappush(self._timers, (time.monotonic() + seconds, next(self._ticks), fn, args))
+
+    def _watch(self, job: _Job) -> None:
+        """Stop the chunks of `job` that ran past its time limit. Runs every tenth of the limit."""
+        if job.status != RUNNING:
+            return
+        now = time.perf_counter()
+        late = [chunk for chunk in job.flying if now - chunk.started > job.timeout]
+        for chunk in late:
+            chunk.doomed = f"timed out: it ran for more than {job.timeout} s"
+        if late:
+            self._kill(job.slot)
+        self._later(max(0.01, min(1.0, job.timeout / 10)), self._watch, job)
+
+    def _kill(self, slot: _Slot) -> None:
+        """Stop everything running on `slot`. What runs there for no fault of its own goes back in line."""
+        for job in self._active:
+            if job.slot is slot:
+                for chunk in job.flying:
+                    chunk.spared = chunk.doomed is None
+        slot.killing = True  # nothing new starts there until all of it has come back
+        slot.impl.kill()
 
     def _on_stop_job(self, job: _Job, status: str) -> None:
-        # ponytail: chunks already running are not killed; their tokens come back when they
-        # end and the result is dropped. Killing one arrives with the per-chunk time limit.
+        # An executor that cannot kill lets its running chunks end: their tokens come back
+        # then and the result is dropped.
         if job.status not in (RUNNING, WAITING):
             return
+        running = bool(job.flying)
         for chunk in tuple(job.flying):
             job.slot.impl.cancel(chunk.handle)
         self._finish(job, status)
+        if running and job.slot.kills:
+            self._kill(job.slot)
 
     def _on_stop_jobs_of(self, journal: Journal, status: str, fatal: str | None = None) -> None:
         for job in (*self._waiting, *self._active):  # waiting ones first: they are stopped, not failed
@@ -345,6 +404,8 @@ class Engine:
         job = chunk.job
         slot = job.slot
         slot.inflight -= 1
+        if not slot.inflight:
+            slot.killing = False
         if chunk.alone:
             slot.isolating = False
         job.flying.discard(chunk)
@@ -364,12 +425,16 @@ class Engine:
             job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
             if job.elastic:
                 job.window = 2 * slot.impl.capacity * job.pack
-        if pack is None:
+        if status == LOST and chunk.spared:  # it fell with a chunk the engine stopped
+            for member in reversed(pack or (chunk,)):
+                self._requeue(member)
+        elif pack is None:
             self._chunk_ended(chunk, status, result, error)
         elif status == DONE:  # the task ran: every chunk has its own outcome
             for member, (value, failure) in zip(pack, result):
                 self._chunk_ended(member, ERROR if failure else DONE, value, failure)
-        else:  # lost ones go on to run alone, like any other
+        else:  # lost, or stopped for running late: which one did it shows when each runs alone
+            chunk.doomed = None
             for member in pack:
                 self._chunk_ended(member, status, None, error)
 
@@ -377,23 +442,41 @@ class Engine:
         job = chunk.job
         if status == DONE:
             if job.on_result is None:
-                self._settle(job, chunk.key, None)
+                self._settle(job, chunk.key, chunk.attempt, None)
             else:
-                self._deliveries.put((job.on_result, (chunk.key, result), (job, chunk.key)))
+                self._deliveries.put((job.on_result, (chunk.key, result), (job, chunk.key, chunk.attempt)))
+        elif status == LOST and chunk.doomed:
+            self._attempt_failed(chunk, chunk.doomed)
         elif status == LOST and not chunk.alone:
             job.slot.suspects.append(chunk)  # collateral or culprit: running it alone will tell
         elif status == LOST:
-            self._settle(job, chunk.key, "the worker process died while running this chunk\n" + error)
+            self._attempt_failed(chunk, "the worker process died while running this chunk\n" + error)
         else:
-            self._settle(job, chunk.key, error or status)
+            self._attempt_failed(chunk, error or status)
 
-    def _settle(self, job: _Job, key, error: str | None) -> None:
+    def _attempt_failed(self, chunk: _Chunk, error: str) -> None:
+        job = chunk.job
+        if chunk.attempt > job.retries:
+            return self._settle(job, chunk.key, chunk.attempt, error)
+        job.retried += 1
+        self._later(job.retry_wait * 2 ** (chunk.attempt - 1), self._requeue, chunk)
+        chunk.attempt += 1
+
+    def _requeue(self, chunk: _Chunk) -> None:
+        """Back to the head of the line, as if it had never left."""
+        job = chunk.job
+        if job.status == RUNNING:
+            job.ready.appendleft(chunk)
+            job.open -= 1
+            job.seq -= 1
+
+    def _settle(self, job: _Job, key, attempt: int, error: str | None) -> None:
         """A chunk reached its end: count it and forget it. Also the delivery thread's confirmation."""
         if job.status != RUNNING:
             return
         job.open -= 1
         if job.journal is not None:
-            job.journal.chunk_finished(job, key, error)
+            job.journal.chunk_finished(job, key, attempt, error)
         if error is None:
             job.done += 1
         else:
@@ -437,7 +520,8 @@ class Engine:
 
     def _start_one(self, job: _Job) -> bool:
         slot = job.slot
-        if job.open >= job.window or slot.inflight >= slot.impl.capacity or slot.suspects or slot.isolating:
+        if (job.open >= job.window or slot.inflight >= slot.impl.capacity or slot.suspects or slot.isolating
+                or slot.killing):
             return False
         ready = job.ready
         if not ready:
@@ -464,7 +548,7 @@ class Engine:
                     chunk.pack = pack
             self._launch(chunk, alone=False)
         else:
-            self._settle(job, chunk.key, f"a chunk needing (cpu, gpu, mem_mb)={cost} can never run: "
+            self._settle(job, chunk.key, 1, f"a chunk needing (cpu, gpu, mem_mb)={cost} can never run: "
                                          f"the engine has {self.tokens.total}")
         if 2 * len(ready) <= job.window and not job.room.is_set():
             job.room.set()  # half empty: one wake-up refills it, instead of one per chunk
@@ -506,6 +590,7 @@ class Engine:
             job.cpu_used += chunk.cost[0]
         slot.inflight += 1
         slot.isolating = chunk.alone = alone
+        chunk.doomed, chunk.spared = None, False
         job.flying.add(chunk)
         chunk.started = time.perf_counter()
         try:

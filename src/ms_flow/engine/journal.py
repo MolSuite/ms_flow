@@ -117,9 +117,8 @@ class Journal:
             self._next += 1
         self._records.append((job,))
 
-    def chunk_finished(self, job, key, error: str | None) -> None:
-        # ponytail: the attempt is always 1 until chunks are retried
-        self._records.append((job.n, key, CHUNK_FAILED if error else CHUNK_DONE, 1, error))
+    def chunk_finished(self, job, key, attempt: int, error: str | None) -> None:
+        self._records.append((job.n, key, CHUNK_FAILED if error else CHUNK_DONE, attempt, error))
 
     def job_ended(self, job, forget_done: bool) -> None:
         """`forget_done` drops the rows of the chunks that went well: the job will not resume."""

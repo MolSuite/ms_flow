@@ -14,6 +14,8 @@ The engine knows an executor only through this contract:
 - `submit_many(fn, payloads, tag) -> handle`, optional: several chunks as one task, for the
   executors where a task costs more than a short chunk. Its `DONE` result is one
   `(result, error)` per payload, in order; any other status speaks for all of them.
+- `kill()`, optional: stop whatever is running, now. Every chunk in flight comes back `LOST`.
+  Without it a chunk cannot have a time limit, and one that started runs to its end.
 
 `status` is `DONE`, `ERROR` (the function raised), `LOST` (the worker went away: nobody
 knows whether the chunk ran) or `CANCELED`.
@@ -107,6 +109,15 @@ class ProcessExecutor:
 
     def cancel(self, handle) -> None:
         handle.cancel()
+
+    def kill(self) -> None:
+        # ponytail: loky gives up on the whole pool when one worker dies, so stopping one
+        # chunk stops them all. A time limit raised inside the worker (SIGALRM) would spare
+        # the rest, where the chunk is not stuck in native code; add it if limits fire often.
+        from loky.backend.utils import kill_process_tree
+
+        for process in list(self._pool._processes.values()):  # no public way to a busy worker
+            kill_process_tree(process)  # and the programs it launched
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True, kill_workers=True)  # waiting is what lets loky clean up after itself

@@ -1,9 +1,11 @@
 """The new engine core (`ms_flow.engine`): counters, admission by tokens, feeders, keys, worker death, cancel."""
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 
 import pytest
 
@@ -241,3 +243,45 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         died = engine.wait(engine.submit("process", workers.die_on_7, payloads), 120)
         assert (died.status, died.chunks_done, died.chunks_failed) == ("completed_with_errors", 2999, 1)
         assert "worker process died" in died.error and pool.tasks < 1500 and engine.tokens.free[0] == 4
+
+
+@pytest.mark.slow
+def test_retries_time_limit_and_cancel_that_kills(tmp_path):
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(4))
+        engine.register("thread", ThreadExecutor(2))
+        engine.attach("project", tmp_path / "executor.db")
+
+        # fails twice, works the third time: done, and nobody is told of an error
+        errors = []
+        flaky = [{"idx": 0, "path": str(tmp_path / "a"), "fails": 2}, {"idx": 1, "path": str(tmp_path / "b"), "fails": 9}]
+        snap = engine.wait(engine.submit("process", workers.flaky, flaky, retries=2, retry_wait=0.01, journal="project",
+                                         on_error=lambda key, error: errors.append(key)), 60)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed, snap.chunks_retried) == \
+            ("completed_with_errors", 1, 1, 4)
+        assert errors == [content_key(flaky[1])] and (tmp_path / "b").read_text() == "xxx"
+        with closing(sqlite3.connect(tmp_path / "executor.db")) as db:
+            assert db.execute("SELECT attempt FROM chunks").fetchall() == [(3,)]  # the one that failed for good
+
+        # a chunk that hangs is cut at the limit; the ones that fell with it are not charged
+        naps = [{"idx": i, "s": 60 if i == 5 else 0.2} for i in range(12)]
+        began = time.perf_counter()
+        snap = engine.wait(engine.submit("process", workers.nap, naps, timeout=1.0), 60)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed, snap.chunks_retried) == \
+            ("completed_with_errors", 11, 1, 0)
+        assert "timed out" in snap.error and time.perf_counter() - began < 15
+
+        with pytest.raises(ValueError, match="cannot stop a running chunk"):
+            engine.submit("thread", _echo, [{}], timeout=1.0)
+
+        # canceling stops what is running, and a job sharing the executor still ends well
+        hung = engine.submit("process", workers.nap, [{"idx": i, "s": 60} for i in range(2)])
+        other = engine.submit("process", workers.nap, [{"idx": i, "s": 0.3} for i in range(6)])
+        time.sleep(1.0)
+        engine.cancel(hung)
+        assert engine.wait(hung, 10).status == "canceled"
+        assert (engine.wait(other, 30).status, engine.status(other).chunks_done) == ("completed", 6)
+        deadline = time.monotonic() + 5
+        while engine.tokens.free[0] != 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert engine.tokens.free[0] == 4

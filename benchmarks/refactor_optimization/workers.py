@@ -18,3 +18,13 @@ def die_on_7(payload: dict) -> dict:
 def nap(payload: dict) -> dict:
     time.sleep(float(payload["s"]))
     return {"ok": 1}
+
+
+def flaky(payload: dict) -> dict:
+    """Fails until it has been tried `payload["fails"]` times; the count lives in a file, across workers."""
+    with open(payload["path"], "a+") as tries:
+        tries.write("x")
+        tries.seek(0)
+        if len(tries.read()) <= payload["fails"]:
+            raise RuntimeError("not yet")
+    return {"ok": 1}
