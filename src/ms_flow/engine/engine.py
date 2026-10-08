@@ -4,12 +4,13 @@ The state lives in memory and belongs to the loop thread alone. Everything else 
 it through one queue: callers leave orders, executors leave finished chunks, the delivery
 thread leaves confirmations. The loop only moves state and tokens and decides what is
 dispatched next. User code runs elsewhere: the source of chunks on a feeder thread per
-job, the callbacks on the delivery thread.
+job, the callbacks on the delivery thread, the disk on the writer thread of each journal.
 """
 from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import logging
 import os
 import pickle
@@ -20,8 +21,10 @@ import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 from .executors import DONE, ERROR, LOST
+from .journal import Journal, own
 from .tokens import Tokens, memory_budget_mb
 
 log = logging.getLogger(__name__)
@@ -68,7 +71,7 @@ class _Job:
     __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority",
                  "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
-                 "peak_mem_mb", "started_at", "finished_at", "finished")
+                 "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
@@ -95,11 +98,17 @@ class _Slot:
 
 
 class Engine:
-    def __init__(self, cpus: int | None = None, gpus: int = 0, mem_mb: int | None = None):
-        """`mem_mb` is the memory budget for chunks; by default physical RAM minus a reserve."""
+    def __init__(self, cpus: int | None = None, gpus: int = 0, mem_mb: int | None = None, state_dir=None):
+        """`mem_mb` is the memory budget for chunks; by default physical RAM minus a reserve.
+
+        With `state_dir`, this is the one engine that shares out the local machine: it owns
+        `engine.lock` there, and a second process gets `Busy` instead of the same CPUs.
+        """
+        self._lock = own(Path(state_dir) / "engine.lock") if state_dir is not None else None
         self.tokens = Tokens(cpus or os.cpu_count() or 1, gpus,
                              memory_budget_mb() if mem_mb is None else mem_mb)
         self._executors: dict[str, _Slot] = {}
+        self._journals: dict[str, Journal] = {}
         self._jobs: dict[int, _Job] = {}
         self._active: list[_Job] = []  # running jobs, by priority and then arrival
         self._ids = itertools.count(1)
@@ -124,10 +133,30 @@ class Engine:
         executor.bind(self._chunk_done)
         self._executors = {**self._executors, name: _Slot(executor)}  # the loop iterates the old one
 
+    def attach(self, name: str, path) -> None:
+        """Open the journal at `path`; jobs submitted with `journal=name` are recorded in it.
+
+        Raises `Busy` when another process owns that file.
+        """
+        if name in self._journals:
+            raise ValueError(f"a journal is already attached as {name!r}")
+        self._journals = {**self._journals, name: Journal(path)}
+
+    def detach(self, name: str) -> None:
+        """Interrupt the jobs recorded in this journal, wait until it is written and close it."""
+        if self._closed:
+            return
+        journal = self._journals[name]
+        self._journals = {k: v for k, v in self._journals.items() if k != name}
+        told = threading.Event()
+        self._events.put((self._on_detach, journal, told))
+        told.wait()
+        journal.close()
+
     def submit(self, executor: str, fn, chunks, *, cpu: float = 1, gpu: float = 0, mem_mb: float = 0,
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
-               total: int | None = None, name: str = "", on_result=None, on_error=None,
-               on_terminal=None) -> int:
+               total: int | None = None, name: str = "", journal: str | None = None, on_result=None,
+               on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
         `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
@@ -138,6 +167,7 @@ class Engine:
         A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
+        `journal` names an attached journal; without it nothing about the job reaches the disk.
         """
         if self._closed:
             raise RuntimeError("engine is closed")
@@ -145,6 +175,15 @@ class Engine:
         if slot is None:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         job = _Job()
+        job.journal = job.n = job.uid = job.spec = None
+        if journal is not None:
+            job.journal = self._journals.get(journal)
+            if job.journal is None or job.journal.failed:
+                raise ValueError(f"no usable journal {journal!r}; attached: {sorted(self._journals)}")
+            job.uid = uuid.uuid4().hex
+            job.spec = json.dumps({
+                "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
+                "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
         if job.cost is not None and not self.tokens.ever_fits(job.cost):
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
@@ -190,6 +229,10 @@ class Engine:
         self._threads[1].join()
         for slot in self._executors.values():
             slot.impl.shutdown()
+        for journal in self._journals.values():
+            journal.close()
+        if self._lock is not None:
+            self._lock.close()
 
     # --- Loop thread ------------------------------------------------------------------
 
@@ -210,12 +253,21 @@ class Engine:
                     break
             try:
                 self._dispatch()
+                for journal in self._journals.values():
+                    if journal.failed is None:
+                        journal.wait_if_behind()
+                    else:
+                        self._on_stop_jobs_of(journal, FAILED, "the journal could not be written\n" + journal.failed)
             except Exception:
                 log.exception("engine loop: dispatch failed")
 
     def _on_submit(self, job: _Job) -> None:
         self._active.append(job)
         self._active.sort(key=lambda j: (-j.priority, j.id))
+        if job.journal is not None:
+            job.journal.job_created(job)
+            if job.journal not in self._journals.values():  # detached between submit() and here
+                self._on_stop_jobs_of(job.journal, FAILED, "the journal of this job was detached")
 
     def _on_stop_job(self, job: _Job, status: str) -> None:
         # ponytail: chunks already running are not killed; their tokens come back when they
@@ -225,6 +277,16 @@ class Engine:
         for chunk in tuple(job.flying):
             job.slot.impl.cancel(chunk.handle)
         self._finish(job, status)
+
+    def _on_stop_jobs_of(self, journal: Journal, status: str, fatal: str | None = None) -> None:
+        for job in tuple(self._active):
+            if job.journal is journal:
+                job.fatal = fatal or job.fatal
+                self._on_stop_job(job, status)
+
+    def _on_detach(self, journal: Journal, told: threading.Event) -> None:
+        self._on_stop_jobs_of(journal, INTERRUPTED)
+        self._deliveries.put((told.set, (), None))  # behind the callbacks of the jobs just stopped
 
     def _on_close(self) -> None:
         for job in tuple(self._active):
@@ -265,6 +327,8 @@ class Engine:
         if job.status != RUNNING:
             return
         job.open -= 1
+        if job.journal is not None:
+            job.journal.chunk_finished(job, key, error)
         if error is None:
             job.done += 1
         else:
@@ -284,6 +348,8 @@ class Engine:
         job.error = job.fatal or job.error
         job.ready.clear()
         job.room.set()  # a feeder waiting for room wakes up, sees the status and leaves
+        if job.journal is not None:
+            job.journal.job_ended(job, forget_done=status != INTERRUPTED)  # an interrupted job resumes
         self._active.remove(job)
         self._deliveries.put((self._announce, (job,), None))
 
@@ -411,6 +477,8 @@ class Engine:
 
     def _announce(self, job: _Job) -> None:
         try:
+            if job.journal is not None:
+                job.journal.flush()  # whoever hears that the job ended finds it on disk
             if job.on_terminal is not None:
                 job.on_terminal(job.snapshot())
         finally:
