@@ -8,7 +8,7 @@ Sale de la auditoría (`04-auditoria-tasks-jobs.md`) y de sus cuatro rondas de d
 
 | Pieza | Qué es | Quién la escribe |
 |---|---|---|
-| Task | La función sobre **un** elemento, y lo que necesita: CPU, GPU, memoria, tiempo máximo, reintentos | El autor del job |
+| Task | La función sobre **un** elemento, y lo que necesita: CPU, GPU, memoria, reintentos | El autor del job |
 | Fuente | Un generador que da los elementos uno a uno | El autor, o una de `ms_flow` |
 | Job | Task + fuente + destino de los resultados | El autor |
 | Envío | Parámetros, ejecutor, dependencias extra | Quien lanza |
@@ -20,7 +20,7 @@ Sale de la auditoría (`04-auditoria-tasks-jobs.md`) y de sus cuatro rondas de d
 from ms_flow import job, report, table_sink, task
 
 
-@task(cpu=1, mem_mb=500, timeout=600, retries=1)
+@task(cpu=1, mem_mb=500, retries=1)
 def dock(pair: dict, params: DockingJobParams) -> list[dict]:
     """Dock one receptor-ligand pair."""
     ...
@@ -91,10 +91,10 @@ Medido en una pose (1iep, Vina): detectar interacciones 0,04 s; lo que encarece 
 **Pasos previos (`setup`).** Hoy un job ejecuta una sola task; `setup`, `stage_chunk` y `finalize` son funciones sueltas que corren en el proceso que lanza, en un pool aparte, sin recursos declarados ni reintentos. El motor nuevo también lleva una función por job. Acordado con Mario el 2026-10-08: un job sigue siendo una task aplicada a muchos elementos, y además puede listar pasos que corren una vez, en orden, antes del primer elemento:
 
 ```python
-@task(local=True, timeout=600)
+@task(local=True)
 def upload_inputs(params): ...      # runs where the job is submitted
 
-@task(timeout=60)
+@task
 def check_env(params): ...          # runs on the job's executor
 
 
@@ -102,7 +102,7 @@ def check_env(params): ...          # runs on the job's executor
 def docking_job(params, project, setup): ...
 ```
 
-- Cada paso es una task normal: declara recursos, tiempo máximo y reintentos, y tiene log y progreso. `local=True` lo fija al proceso que lanza; sin él corre en el ejecutor del job.
+- Cada paso es una task normal: declara recursos y reintentos, y tiene log y progreso. `local=True` lo fija al proceso que lanza; sin él corre en el ejecutor del job.
 - Si un paso falla, el job falla sin leer la fuente. El job muestra la fase en que está (preparando, ejecutando, finalizando).
 - Lo que devuelven los pasos lo recibe la fuente.
 - Al reanudar se repiten, así que deben poder repetirse sin daño (subir solo lo que falta).
@@ -141,13 +141,19 @@ amdock_docking_job  preparing 1/2   cluster   —         0/12000
 1. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
 2. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
 
+## Para más adelante: parar por tiempo
+
+Decidido por Mario el 2026-10-08: una task no declara tiempo máximo por ahora. Irá junto con el pool de procesos propio, que es quien puede parar una sola task; el pool actual, para parar una, para todas las suyas y las reinicia.
+
+El motor ya acepta `timeout` en `submit` (paso "retries"). Se queda como está y la API de tasks no lo pasa.
+
 ## Para más adelante: task compuesta
 
 Pregunta de Mario (2026-10-08): encadenar varias tasks por elemento (preparar y hacer docking molécula a molécula) para ver resultados desde el principio, en lugar de esperar a que termine cada etapa.
 
 - En `ms_flow` no existe. `workflow()` es, pese al nombre, una entrada, un proceso y una salida: un job con una task. El `WorkflowRunner` de AMDockVS encadena jobs enteros, etapa tras etapa.
 - Sí existe escrito a mano dentro de una task: la de química acepta una lista de operaciones por molécula (protonar, 3D, minimizar) y el docking dibuja el diagrama en el mismo worker (`compute_diagram`).
-- En el diseño nuevo no pide un tipo de job distinto: una task compuesta es una función que llama a otras. Lo que `ms_flow` podría dar es un `chain(a, b)` que haga una task de varias: recursos = el máximo, tiempo límite = la suma, progreso = paso k de n.
+- En el diseño nuevo no pide un tipo de job distinto: una task compuesta es una función que llama a otras. Lo que `ms_flow` podría dar es un `chain(a, b)` que haga una task de varias: recursos = el máximo, progreso = paso k de n.
 - Costes: la compuesta retiene los recursos del paso más caro durante todo el elemento; un reintento repite la cadena entera; lo intermedio no se guarda salvo que cada paso tenga su destino (un ligando preparado sirve para muchos receptores).
 - Es la única vía para ver resultados pronto: con el tope de `max(id)` un job no ve lo que otro escribe mientras corre.
 - No se construye ahora (decidido por Mario). El caso que hay hoy, docking con interacciones opcionales, no la necesita: es un `if` dentro de la task de docking con salida a dos tablas (ver Resultados).
@@ -172,7 +178,7 @@ Hace falta trabajo, ya medido o localizado:
 - **Progreso.** El fichero de ranuras está probado suelto (carrera y coste), no unido al motor ni a los workers.
 - **Monitor.** Lee el `executor.db` del motor viejo; `JobSnapshot` no lleva fase, progreso fino ni ritmo.
 
-Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolución de `FileInputSpec` en el hilo del job, progreso por lote en HPC. Límite conocido: el pool de procesos, para parar una task por tiempo, para todas las suyas y las reinicia.
+Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolución de `FileInputSpec` en el hilo del job, progreso por lote en HPC.
 
 ## Hecho en el motor a raíz de este documento
 
