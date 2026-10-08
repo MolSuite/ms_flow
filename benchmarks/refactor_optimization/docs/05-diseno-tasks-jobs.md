@@ -152,6 +152,28 @@ Pregunta de Mario (2026-10-08): encadenar varias tasks por elemento (preparar y 
 - Es la única vía para ver resultados pronto: con el tope de `max(id)` un job no ve lo que otro escribe mientras corre.
 - No se construye ahora (decidido por Mario). El caso que hay hoy, docking con interacciones opcionales, no la necesita: es un `if` dentro de la task de docking con salida a dos tablas (ver Resultados).
 
+## Comprobado y por comprobar (2026-10-08)
+
+Prueba de usar y tirar (`/tmp/api_spike/spike.py`, no está en el repo): decoradores de 60 líneas sobre el motor nuevo tal como está, pool de procesos, proyecto SQLite real, task sin trabajo (solo mide el camino).
+
+Funciona sin tocar el motor:
+
+- `@task` + `@job` con una fuente generadora que da elementos de uno en uno: 600 elementos, 0,43 s.
+- Parámetros como modelo pydantic hasta el worker.
+- Una task, dos tablas por `graph_sink`, escritas desde el hilo de entrega: 1800 poses y 3600 interacciones, ninguna con la clave ajena mal ni huérfana; con la opción sin marcar, 0 interacciones.
+- Dependencia por tabla resuelta a `after=`: el job que lee `docking_results` no leyó su fuente hasta que el docking tenía las 1800 poses.
+- Tope: 200 ligandos insertados durante la ejecución no entraron (600 de 800).
+
+Hace falta trabajo, ya medido o localizado:
+
+- **Escritura agrupada.** Una escritura por elemento cuesta 0,39 ms y con tasks rápidas es todo el tiempo del job (0,31 de 0,32 s en 800 elementos); agrupando 64 baja a 0,06 s. El motor da un elemento por hecho cuando vuelve `on_result`, así que agrupar fuera del motor dejaría elementos registrados como hechos sin estar en disco. Tiene que agrupar el motor y dar el lote por hecho al escribirlo.
+- **Lote forzado y task por lotes.** El motor solo empaqueta por su medida; faltan `batch=` y `@task(batched=True)`.
+- **Total que cambia.** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
+- **Progreso.** El fichero de ranuras está probado suelto (carrera y coste), no unido al motor ni a los workers.
+- **Monitor.** Lee el `executor.db` del motor viejo; `JobSnapshot` no lleva fase, progreso fino ni ritmo.
+
+Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolución de `FileInputSpec` en el hilo del job, progreso por lote en HPC. Límite conocido: el pool de procesos, para parar una task por tiempo, para todas las suyas y las reinicia.
+
 ## Hecho en el motor a raíz de este documento
 
 - `refactor/engine-pack-target`: objetivo del lote automático de 100 ms y reparto del final del job.
