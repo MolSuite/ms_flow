@@ -21,7 +21,8 @@ log = logging.getLogger(__name__)
 
 VERSION = 1
 CHUNK_DONE, CHUNK_FAILED = 1, 2
-INTERRUPTED = "interrupted"  # the one job status the journal acts on: it is the one that continues
+INTERRUPTED = "interrupted"
+RESUMABLE = (INTERRUPTED, "canceled")  # the job statuses that keep their done chunks: these continue
 
 _SCHEMA = """
 CREATE TABLE jobs (
@@ -145,7 +146,8 @@ class Journal:
     def claim(self, job_id: str):
         """Reserve `job_id` for a job about to start.
 
-        Returns `(n, chunks done)` when it continues an interrupted job and `None` when it is new.
+        Returns `(n, chunks done)` when it continues a job that was interrupted or canceled and
+        `None` when it is new.
         """
         with self._guard:
             if job_id in self._claimed:
@@ -157,8 +159,9 @@ class Journal:
                 row = db.execute("SELECT n, status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
                 if row is None:
                     return None
-                if row[1] != INTERRUPTED:
-                    raise ValueError(f"job {job_id!r} already ended as {row[1]}; only an interrupted job continues")
+                if row[1] not in RESUMABLE:
+                    raise ValueError(f"job {job_id!r} already ended as {row[1]}; "
+                                     "only an interrupted or canceled job continues")
                 done = db.execute("SELECT count(*) FROM chunks WHERE job = ? AND status = ?", (row[0], CHUNK_DONE))
                 return row[0], done.fetchone()[0]
         except BaseException:
@@ -173,6 +176,14 @@ class Journal:
         db = sqlite3.connect(self.path)
         find = "SELECT 1 FROM chunks WHERE job = ? AND key = ? AND status = ?"
         return (lambda key: db.execute(find, (n, key, CHUNK_DONE)).fetchone() is not None), db.close
+
+    def discard(self, job_id: str) -> None:
+        """Drop a job that is not running from the record, with its chunks. Its id is free again."""
+        with self._guard:  # against a `claim` of the same id
+            if job_id in self._claimed:
+                raise ValueError(f"job {job_id!r} is running")
+            self._records.append(job_id)
+        self.flush()
 
     def jobs(self) -> list[dict]:
         """Every job on record, oldest first."""
@@ -204,6 +215,10 @@ class Journal:
                     record = records.popleft()
                     if record is None:
                         open_ = False
+                    elif type(record) is str:  # a discard()
+                        db.execute("DELETE FROM chunks WHERE job = (SELECT n FROM jobs WHERE job_id = ?)", (record,))
+                        db.execute("DELETE FROM jobs WHERE job_id = ?", (record,))
+                        shrink = True
                     elif type(record) is not tuple:
                         waiting.append(record)  # a flush()
                     elif len(record) == 5:

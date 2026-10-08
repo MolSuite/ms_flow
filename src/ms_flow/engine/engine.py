@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .executors import DONE, ERROR, LOST
-from .journal import INTERRUPTED, Journal, own
+from .journal import INTERRUPTED, RESUMABLE, Journal, own
 from .tokens import Tokens, memory_budget_mb
 
 log = logging.getLogger(__name__)
@@ -192,8 +192,9 @@ class Engine:
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
-        `key` is what the job is called there. Submitting an interrupted job again under its key
-        continues it: the chunks it had done are recognised by their own keys and not run again.
+        `key` is what the job is called there. Submitting an interrupted or canceled job again
+        under its key continues it: the chunks it had done are recognised by their own keys and
+        not run again. `discard` is how such a job is given up instead.
         `after` is the ids of the jobs that must end first; `chunks` is not read until they do,
         and the job fails if one of them fails, is canceled or is interrupted.
         A chunk that fails runs again up to `retries` times, `retry_wait` seconds after the first
@@ -249,6 +250,13 @@ class Engine:
     def recorded(self, journal: str) -> list[dict]:
         """The jobs on record in an attached journal, oldest first, as rows of its `jobs` table."""
         return self._journals[journal].jobs()
+
+    def discard(self, journal: str, key: str) -> None:
+        """Drop the job recorded as `key`, which must not be running: what it had done is forgotten
+        and the key is free again. An interrupted or canceled job keeps a row per done chunk until
+        it is continued or discarded.
+        """
+        self._journals[journal].discard(key)
 
     def status(self, job_id: int) -> JobSnapshot:
         """Where the job is. An ended job is forgotten once `_REMEMBERED` others ended after it;
@@ -514,7 +522,7 @@ class Engine:
         for other in [j for j in self._waiting if job in j.after]:
             self._on_dependency_end(other)
         if job.journal is not None:
-            job.journal.job_ended(job, forget_done=status != INTERRUPTED)  # an interrupted job resumes
+            job.journal.job_ended(job, forget_done=status not in RESUMABLE)
         self._deliveries.put((self._announce, (job,), None))
 
     def _dispatch(self) -> None:

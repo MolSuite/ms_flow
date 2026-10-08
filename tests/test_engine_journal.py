@@ -113,3 +113,35 @@ def test_an_interrupted_job_continues_where_it_stopped(tmp_path):
         raw.commit()
     with _engine(tmp_path) as engine:
         assert engine.recorded("project")[0]["status"] == "interrupted"
+
+
+def test_a_canceled_job_continues_or_is_discarded(tmp_path):
+    db, payloads = tmp_path / "executor.db", [{"s": 0.005, "i": i} for i in range(400)]
+    with _engine(tmp_path) as engine:
+        job = engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1")
+        with pytest.raises(ValueError, match="is running"):
+            engine.discard("project", "dock-1")
+        while engine.status(job).chunks_done < 30:
+            time.sleep(0.01)
+        engine.cancel(job)
+        before = engine.wait(job, 30)
+        assert before.status == "canceled" and 30 <= before.chunks_done < 400
+        assert _rows(db, "SELECT count(*) FROM chunks") == [(before.chunks_done,)]  # kept: it may continue
+
+        ran = []
+        job = engine.submit("thread", workers.nap, payloads, journal="project", key="dock-1",
+                            on_result=lambda key, result: ran.append(key))
+        after = engine.wait(job, 60)
+        assert (after.status, after.chunks_done) == ("completed", 400)
+        assert len(ran) == 400 - before.chunks_done  # only what was missing
+
+        job = engine.submit("thread", workers.nap, payloads, journal="project", key="dock-2")
+        while engine.status(job).chunks_done < 30:
+            time.sleep(0.01)
+        engine.cancel(job)
+        engine.wait(job, 30)
+        engine.discard("project", "dock-2")
+        assert _rows(db, "SELECT job_id FROM jobs") == [("dock-1",)]
+        assert _rows(db, "SELECT count(*) FROM chunks") == [(0,)]
+        job = engine.submit("thread", workers.nap, payloads[:20], journal="project", key="dock-2")  # free again
+        assert engine.wait(job, 30).chunks_done == 20
