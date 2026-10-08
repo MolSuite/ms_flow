@@ -138,3 +138,18 @@ Pendiente de construir para esto: en el motor nuevo no hay canal de progreso del
 | `max(id)` de cada tabla de origen al arrancar | que el job no crezca con filas nuevas | 0,03 ms y un entero por tabla |
 
 La lista de miembros queda como último recurso: 0,22 s y 10 bytes por elemento. El `max(id)` no cubre un elemento que ya existía y pasa a cumplir el filtro después (un ligando preparado más tarde).
+
+### Segunda ronda (2026-10-08)
+
+Mario acepta la task sobre un elemento con el lote decidido por el ejecutor. AMDockVS se adapta después: sirve de referencia, no de oráculo.
+
+**Progreso: es un estado, no un evento** (propuesta, sin construir). Nadie necesita todas las actualizaciones, solo la última, así que no va por ninguna cola:
+
+- Un fichero mapeado en memoria con una casilla (un `float`) por tarea en vuelo. El motor asigna la casilla al lanzar; el worker escribe en ella; el motor la lee solo cuando alguien pide el estado del job.
+- Medido con loky: 217 ns por actualización, frente a 24 µs por la cola del `Manager` actual. Leer las casillas cuesta 232 ns. No pasa por la cola de eventos ni por el hilo que espera a los workers, así que no puede saturarlos.
+- Lote de un elemento: la task escribe su fracción con `report(0.4)`, una función del paquete, sin parámetro extra en la firma. Lote de varios: el bucle del worker escribe solo «hechos / tamaño del lote»; la task no hace nada.
+- El motor dice a la task si alguien quiere el progreso fino. Regla de Mario: sí cuando el job tiene pocos elementos (hasta 2 × workers), no por encima. Sirve para que la task no pague la vigilancia de la salida de su herramienta cuando es irrelevante.
+- Vigilar la salida de una herramienta (Vina) para sacar el progreso es cosa de la task. `ms_flow` puede dar un ayudante pequeño que lea la salida de un subproceso línea a línea; no se construye hasta que haya quien lo use.
+- HPC: las casillas no cruzan máquinas. Allí el progreso es el de los elementos terminados dentro de cada lote, leído al sondear. Queda con HPC.
+
+**Reutilizar entre elementos (lo que hoy justifica el lote de docking).** Hoy las cachés de Vina (`vina_cache`, `ad4_map_cache`) son diccionarios locales del chunk: viven lo que dura un lote. Con una caché por worker (un `lru_cache` a nivel de módulo; los workers de loky se reutilizan) la reutilización cruza lotes y el tamaño del lote deja de importar. Límite: cada worker carga cada receptor una vez (14 cargas, no 1), porque loky no deja elegir worker; la afinidad llegaría con el pool propio. Lo equivalente al `put` de Ray, datos preparados una vez para todos, es ya una ruta a un fichero en el payload.
