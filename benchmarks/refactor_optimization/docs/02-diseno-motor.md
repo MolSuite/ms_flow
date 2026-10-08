@@ -347,12 +347,13 @@ El motor nuevo se construye entero en `ms_flow/engine/`, al lado del actual, que
 
 Lo que desaparece respecto al plan de la auditoría: F0-2 (índice `(job_id, status)`) y F0-4 (eventos por chunk), porque la tabla y los eventos que arreglaban no existen en el motor nuevo. F0-5, F0-6 y F0-7 no tocan el motor y pueden ir en cualquier momento.
 
-**Estado a 2026-10-08.** Hechos y medidos B1 a B4, más un paso fuera de la tabla: el paquete `ms_flow` carga sus nombres al primer uso, para que un worker no importe toda la API (primer job de 563 a 80 ms). Cada uno es una rama local `refactor/*` y una columna del informe. Lo que cambió al construir:
+**Estado a 2026-10-08.** Hechos y medidos B1 a B4 y B6, más un paso fuera de la tabla: el paquete `ms_flow` carga sus nombres al primer uso, para que un worker no importe toda la API (primer job de 563 a 80 ms). Cada uno es una rama local `refactor/*` y una columna del informe. Lo que cambió al construir:
 
 - **Sin `exclusive=False`.** El motor toma `engine.lock` solo si recibe `state_dir`. Un script que no la pasa no bloquea ni es bloqueado; la aplicación la pasa siempre.
 - **Nivel de durabilidad = `journal=` del job.** Sin diario es `none`; con diario es `journal`. El nivel `full` (eventos y tiempos por chunk) y la tabla `events` no se han construido: no hay todavía quien los lea.
 - **Reanudar es volver a enviar con la misma `key`.** Solo continúa un job `interrupted`; uno terminado se rechaza. Al continuar, sus chunks fallidos se repiten. Reanudar solo desde un generador importable guardado en `spec` queda para el relevo (C1), que es donde existen esos generadores.
 - **Dependencias.** `after=[ids]`. Vale como terminado `completed` y `completed_with_errors`; `failed`, `canceled` e `interrupted` hacen fallar al que espera. La fuente de chunks del que espera no se lee hasta que arranca.
+- **Agrupación (B6).** La hace el motor, no el adaptador: es quien reparte las fichas, y un paquete de chunks ocupa las de uno solo porque corren uno tras otro en un worker. El adaptador solo ofrece `submit_many`; el de hilos no lo ofrece. La duración se mide desde el motor, ida y vuelta incluidas, así un payload caro de enviar nunca cuenta como chunk corto. Objetivo de 10 ms por tarea, máximo 64 chunks. Si el job no fija `window`, crece con el paquete. Tras la muerte de un worker, los chunks del paquete se repiten de uno en uno.
 - **Compactación.** Al terminar un job se borran sus chunks hechos y se devuelven las páginas al sistema (`auto_vacuum=INCREMENTAL`). Cuesta unos 2,5 s por millón de chunks, una vez, al final.
 
 **Objetivos con los que se compara.** Orquestación por chunk ≤ 0,05 ms sin diario y ≤ 0,2 ms con él; coste plano (±10 %) de 1.000 a 1.000.000 de chunks; menos de 0,3 KB por chunk en disco; tras un `kill -9` el job se reanuda y solo repite el último lote sin registrar; la muerte de un worker cuesta un chunk.

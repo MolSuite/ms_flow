@@ -39,6 +39,9 @@ STEPS = {
     "resume": (None, "A job has a key in its journal. Submitted again after an interruption or a kill, it skips the "
                      "chunks on record as done, recognised by their content key. Jobs can wait for other jobs "
                      "(after=), and their source is not read until those end.", True),
+    "batching": (None, "Chunks measured to take well under 10 ms share a pool task with the ones behind them, up "
+                       "to 64 to a task. Each still succeeds, fails, is retried alone after a worker death and is "
+                       "journaled on its own. Chunks worth a task of their own are left alone.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
