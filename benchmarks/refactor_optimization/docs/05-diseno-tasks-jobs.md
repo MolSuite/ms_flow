@@ -2,7 +2,7 @@
 
 Estado: acordado con Mario el 2026-10-08. Nada de esto está construido salvo lo que lista la última sección.
 
-Borrador del 2026-10-08 para revisar. Nada construido. Sale de la auditoría (`04-auditoria-tasks-jobs.md`) y de sus cuatro rondas de discusión.
+Sale de la auditoría (`04-auditoria-tasks-jobs.md`) y de sus cuatro rondas de discusión.
 
 ## Piezas
 
