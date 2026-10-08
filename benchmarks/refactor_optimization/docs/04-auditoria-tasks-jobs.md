@@ -1,0 +1,106 @@
+# ms_flow — Auditoría del diseño de tasks y jobs
+
+2026-10-08. Borrador para discutir antes del relevo (C1). Todo lo que se afirma está comprobado contra el código de `ms_flow` y contra el uso real en `AMDockVS/src`. Las propuestas del final son eso, propuestas.
+
+## Resumen
+
+- Hay **cinco formas** de declarar un job y AMDockVS usa dos. Una de las cinco no funciona.
+- Task y job son **dos objetos para una sola cosa**, con campos repetidos.
+- La definición de un job tiene **27 campos**; varios no los lee nadie.
+- Enviar un job admite **24 parámetros**; el motor nuevo necesita unos seis.
+- **El job no declara qué datos lee ni qué escribe.** De ahí salen tres problemas que hoy se resuelven por fuera: las dependencias se adivinan por el nombre del job, el total de chunks no se conoce, y al reanudar el conjunto de entrada cambia (tu punto 4.1).
+
+## 1. Qué hay hoy
+
+| Forma de declarar | Dónde | Usos en AMDockVS |
+|---|---|---|
+| `@task` + `@job` | `tasking.py` | 10 tasks, 14 jobs |
+| Clase `JobSpec` | `tasking.py` | 9 clases |
+| `streaming_job`, `batch_job`, `build_streaming_job_definition` | `job_templates.py` | 0 |
+| `workflow()` / `WorkflowSpec` + `molsuite.run(input=, process=, output=)` | `specs/workflow.py`, `job_api.py` | 0 |
+| `molsuite.task(...)` / `molsuite.job(...)` | `job_api.py` | 0 |
+
+La última está rota: llama a `task(name=, handler=)` y a `job(name=, task=, chunker=)`, y ninguna de las dos funciones tiene esos parámetros (`TypeError: task() got an unexpected keyword argument 'handler'`).
+
+Todas acaban en el mismo `JobDefinition`, que a su vez contiene un `TaskDefinition`.
+
+## 2. Hallazgos
+
+**H1. Task y job repiten campos.** `TaskDefinition` tiene `executor`, `supported_executors`, `cpu_required`, `description` y `tags`; `JobDefinition` los vuelve a tener y los pisa. En AMDockVS una task no vive sin su job: lo único que se comparte entre jobs es la función del worker, y para eso no hace falta un objeto.
+
+**H2. 27 campos, seis de ellos por duplicado.** Cada función (`chunker`, `chunk_counter`, `setup`, `stage_chunk`, `finalize`, `result_handler_factory`) va acompañada de su cadena `*_ref` para poder reimportarla. `with_options` existe solo para mantener las parejas alineadas.
+
+**H3. Campos que nadie lee o nadie usa.**
+
+| Campo | Lectores en `ms_flow` | Uso en AMDockVS |
+|---|---|---|
+| `required`, `produces` (`RequirementSpec`, `CapabilitySpec`) | 0 | 8 jobs los fijan a `()` |
+| `setup`, `stage_chunk` (y con ellos `stage_fail_policy`, `max_stage_failures`) | sí | 0 |
+| `chunk_counter` / `count_chunks` | sí | 1 job |
+| `finalize` | sí | 2 jobs |
+| `result_handler_factory` | sí | 4 usos |
+
+**H4. `store_results` tiene dos valores por defecto.** `False` en `_build_job_definition` y en `molsuite.run`; `True` en `JobDefinition`, `JobSpec` y `@job`. AMDockVS lo escribe a mano en cada job, siempre `False` (18 veces, ninguna `True`).
+
+**H5. Las firmas se adivinan.** `fn(params, config)` o `fn(params)`, y `fn(payload, progress)` o `fn(payload)`, se deciden contando parámetros con `inspect.signature`. Para la task se hace en cada chunk cuando hay `progress`.
+
+**H6. `config` es un saco.** La fachada mete en él objetos vivos (`project_store`, `project_db`, `project_context`, `project_resources`) y cada chunker los saca por nombre. Los chunkers de AMDockVS empiezan igual: sacar `project_db` de `config` y un `raise` si falta (17 veces en 9 ficheros). El job no puede decir «necesito la base del proyecto».
+
+**H7. Enviar un job tiene 24 parámetros.** Entre ellos tres frenos que se pisan (`max_inflight_tasks`, `max_inflight_items`, `operational_profile`), tres umbrales de corte por fallos (`chunk_fail_fast_*`) y `queue_policy`. `molsuite.run` tiene otros 23. El motor nuevo regula con `window` y las fichas.
+
+**H8. Los recursos se declaran a medias.** El job solo declara `cpu_required`. GPU y memoria viajan dentro de cada payload (`_cpu_required`, `_gpu_required`, vía `chunk_resources`). No hay dónde declarar reintentos ni tiempo máximo. El motor nuevo ya los acepta por job (`cpu`, `gpu`, `mem_mb`, `retries`, `timeout`).
+
+**H9. Los resultados salen por cuatro puertas.** `output_spec` (sink), `result_handler_factory`, `store_results` (copia en `executor.db`) y `finalize`. AMDockVS usa sobre todo sinks (11), y las otras tres como excepción.
+
+**H10. El troceo se escribe a mano en cada chunker.** Cada uno agrupa filas en lotes con su `batch_size`. En `docking/jobs.py` el diccionario del chunk está escrito dos veces seguidas (lote lleno y resto final), con 17 claves cada vez.
+
+**H11. La entrada no se declara: es lo que el chunker consulte cuando corra.** Es la raíz de la sección siguiente.
+
+**H12. Las dependencias se adivinan por el nombre.** `AMDockVS/runtime.py` clasifica cada job buscando subcadenas en su nombre (`"docking"`, `"prepare_"`, `"load_"`…) y espera a los jobs activos de las categorías previas. Hay además un canal lateral, `set_forced_dependencies`, para lo que la regla no cubre. `required`/`produces` nacieron para esto y nunca se conectaron.
+
+## 3. El conjunto de entrada (punto 4.1)
+
+Un job de AMDockVS recibe un filtro, no una lista: «ligandos preparados, de este set, sin docking hecho». El filtro se evalúa cuando el chunker corre. Eso da lo que querías (encadenar import → preparación → docking de una vez, sin futures), y tiene tres consecuencias.
+
+**a) Hay dos clases de fuente y el motor solo distingue una.**
+
+| | Fuente estable | Fuente filtrada por estado |
+|---|---|---|
+| Ejemplo | lista de ficheros, shards, ids explícitos | «preparados y no hechos» |
+| Al repetirla | trae los mismos payloads | trae solo lo que falta, agrupado de otra forma |
+| Quién recuerda lo hecho | el diario del motor (clave por chunk) | la propia tabla de resultados |
+| Registro por chunk en el diario | necesario | inútil: los chunks hechos no vuelven a aparecer |
+
+Lo segundo es el caso del docking: con `skip_existing` (activo por defecto) la fuente no vuelve a traer los pares hechos, así que ninguna clave registrada reaparece. Con el motor nuevo el resultado sería correcto (no se salta nada), pero guardaría una fila por chunk para nada y avisaría de que «la fuente no trajo ninguno de los chunks hechos».
+
+**b) Posición frente a clave.** Guardar «voy por el chunk 1.000» en lugar de la lista de hechos ahorra las filas (37 bytes por chunk) y las búsquedas (5 a 7 µs por chunk). Solo es válido si la fuente es estable *y* ordenada. Y como los chunks terminan desordenados (14 a la vez), en realidad sería «todo lo anterior a N, más unos pocos sueltos por encima». El riesgo es asimétrico: si la fuente no era tan estable como se creía, la posición se salta trabajo sin hacer y nadie se entera; la clave, en el mismo caso, simplemente no coincide y repite.
+
+**c) El conjunto cambia entre el envío y la reanudación.** Si se cancela a los 200 y mientras tanto se preparan 50 ligandos nuevos, al continuar el job hace 850, no 800. Tres formas de tratarlo:
+
+| Opción | Qué congela | Coste |
+|---|---|---|
+| Nada (hoy) | nada: continuar es «haz todo lo que cumpla el filtro ahora» | ninguno |
+| Fecha de corte (`created_at <= inicio del job`) | las filas añadidas después | una columna de fecha en cada tabla de origen. **No congela los cambios de estado**: un ligando que ya existía y se preparó después pasa el filtro |
+| Lista de miembros al arrancar (`INSERT INTO job_items SELECT id FROM <filtro>`, una sola sentencia) | exactamente el conjunto | unos bytes por elemento en `project.db`; a cambio da el total exacto para la barra de progreso |
+
+El corte tiene que ser «cuando el job empieza a leer», no «cuando se envía»: un docking encadenado detrás de la preparación debe ver lo que esa preparación produjo.
+
+## 4. Propuesta para discutir
+
+1. **Una sola declaración.** Un job es: la función del worker, la fuente de chunks y lo que declara. Sin `TaskDefinition` aparte. Dos formas de escribirlo como mucho (decorador para lo pequeño, clase para lo grande), un solo objeto debajo. Fuera plantillas, `workflow()`, `molsuite.run` y `molsuite.task/job`.
+2. **El job declara qué lee y qué escribe** (`reads=("ligands",)`, `writes=("docking_results",)`). Las dependencias salen de ahí y desaparecen las subcadenas del nombre y `set_forced_dependencies`.
+3. **La fuente declara de qué clase es.** Estable (por defecto): el diario registra cada chunk y reanuda exacto. «Ya excluye lo hecho»: el diario no guarda filas por chunk, solo los fallos. Con esto un docking interrumpido no deja nada que limpiar.
+4. **Congelar el conjunto, opcional por job**, con la lista de miembros. No lo haría por fecha.
+5. **Recursos y política de fallos en la declaración**: `cpu`, `gpu`, `mem_mb`, `retries`, `timeout`. El payload solo los pisa cuando un chunk concreto difiere.
+6. **Una puerta para los resultados**: `output` (un sink) y, si hace falta, `finalize`. Un handler a medida es un sink más. `store_results` desaparece.
+7. **Contexto explícito**: la fuente recibe `(params, project)`. Sin saco `config` y sin contar parámetros.
+8. **Enviar se queda en**: `params`, `after`, `priority`, `executor`, `window` y lo que se quiera pisar de la declaración.
+
+No propongo que el framework trocee por su cuenta (H10): el motor ya agrupa los chunks cortos, y el tamaño del lote de docking es una decisión del dominio.
+
+## 5. Preguntas
+
+1. ¿Decorador y clase, o solo una de las dos formas?
+2. Al continuar un job cancelado, ¿qué espera el usuario: «termina lo que lancé» (conjunto congelado) o «haz todo lo que cumpla ahora» (como hoy)?
+3. ¿`reads`/`writes` por tabla es suficiente para las dependencias, o hace falta más detalle (por ejemplo, por set de ligandos)?
+4. ¿`setup` y `stage_chunk` se quedan? AMDockVS no los usa; tienen sentido para HPC (preparar ficheros antes de enviar).
