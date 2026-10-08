@@ -65,42 +65,30 @@ class _Counter:
 
 class Engine:
     def __init__(self, workdir: Path, procs: int = CPUS):
-        from ms_flow.core.database.executor import ExecutorStore
-        from ms_flow.core.executor.manager._manager import ExecutorManager
-        from ms_flow.core.executor.result_handlers import ResultHandler
+        from ms_flow import engine
 
-        self._handler_cls = type("Counter", (_Counter, ResultHandler), {})
-        self.workdir = Path(workdir)
-        self.mgr = ExecutorManager(ExecutorStore(self.workdir / "executor.db"), total_cpu=CPUS)
-        self.mgr.register_thread_executor("thread", max_workers=2 * CPUS)
-        self.mgr.register_process_pool_executor("process", max_workers=procs)
-        self.mgr.start()
+        self.workdir = Path(workdir)  # no journal yet: nothing is written here
+        self.eng = engine.Engine(cpus=CPUS)
+        self.eng.register("thread", engine.ThreadExecutor(2 * CPUS))
+        self.eng.register("process", engine.ProcessExecutor(procs))
 
     def run(self, executor: str, payloads, fn=workers.noop, inflight: int | None = None,
             marks_every: int = 0, timeout: float = 1800.0):
         """Run one job to its end. Returns (seconds, marks, job_snapshot)."""
         payloads = list(payloads)
-        handler = self._handler_cls(marks_every)
-        extra = {} if inflight is None else {"max_inflight_tasks": inflight}
-        handler.t0 = time.perf_counter()
-        job_id = self.mgr.submit_job(
-            executor_name=executor, chunks=iter(payloads), run_chunk=fn, result_handler=handler,
-            store_results=False, total_chunks=len(payloads), **extra,
-        )
-        finished = handler.done.wait(timeout)
-        seconds = time.perf_counter() - handler.t0
-        job = self.mgr.get_job(job_id)
-        deadline = time.perf_counter() + 5.0
-        while finished and job.status not in TERMINAL and time.perf_counter() < deadline:
-            time.sleep(0.05)
-            job = self.mgr.get_job(job_id)
-        return seconds, handler.marks, job
+        counter = _Counter(marks_every)
+        counter.t0 = time.perf_counter()
+        job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight,
+                                 on_result=counter.handle, on_terminal=counter.on_job_terminal)
+        counter.done.wait(timeout)
+        seconds = time.perf_counter() - counter.t0
+        return seconds, counter.marks, self.eng.status(job_id)
 
     def state_bytes(self) -> int:
         return sum(f.stat().st_size for f in self.workdir.glob("executor.db*"))
 
     def close(self):
-        self.mgr.stop()
+        self.eng.close()
 
 
 # --- Measurements -------------------------------------------------------------------
