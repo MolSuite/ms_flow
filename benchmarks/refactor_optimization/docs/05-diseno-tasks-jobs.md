@@ -127,7 +127,7 @@ Pregunta de Mario (2026-10-08): encadenar varias tasks por elemento (preparar y 
 - En el diseño nuevo no pide un tipo de job distinto: una task compuesta es una función que llama a otras. Lo que `ms_flow` podría dar es un `chain(a, b)` que haga una task de varias: recursos = el máximo, tiempo límite = la suma, progreso = paso k de n.
 - Costes: la compuesta retiene los recursos del paso más caro durante todo el elemento; un reintento repite la cadena entera; lo intermedio no se guarda salvo que cada paso tenga su destino (un ligando preparado sirve para muchos receptores).
 - Es la única vía para ver resultados pronto: con el tope de `max(id)` un job no ve lo que otro escribe mientras corre.
-- No se construye ahora.
+- No se construye ahora (decidido por Mario). El caso que hay hoy, docking con diagrama opcional, no la necesita: es un `if params.compute_diagram` dentro de la task de docking, y el job de diagramas suelto sigue aparte con el mismo dibujante.
 
 ## Hecho en el motor a raíz de este documento
 
