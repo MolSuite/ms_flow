@@ -80,7 +80,7 @@ Una puerta no es una tabla: `output` puede ser un `graph_sink` (ya existe; AMDoc
 
 Caso que lo fija (decidido por Mario el 2026-10-08): las interacciones viven en `interaction_results`, y el docking con la opción marcada devuelve filas para `docking_results` e `interaction_results` desde una sola task. No son dos tasks encadenadas: la fila de interacción necesita el id de la pose, que no existe hasta que el hilo del job la escribe; con una task lo resuelve el sink, con dos haría falta escribir, devolver el id y mandar la segunda al mismo sitio donde está el fichero de la pose.
 
-Medido en una pose (1iep, Vina): detectar interacciones 0,04 s; lo que encarece el diagrama es lo que solo sirve para dibujar: exposición al solvente 3,0 s, layout 0,15 s, imagen 1,8 s (intérprete nuevo). Por eso lo barato y que es dato va dentro de la task de docking, y la imagen sigue en su job aparte, que espera al docking por tabla.
+Medido en una pose (1iep, Vina): detectar interacciones 0,04 s; lo que encarece el diagrama es lo que solo sirve para dibujar: exposición al solvente 3,0 s, layout 0,15 s, imagen 1,8 s (intérprete nuevo). Por eso lo barato y que es dato va dentro de la task de docking. La imagen no se genera en el docking (decidido por Mario): el diagrama se dibuja en la UI a partir de las interacciones. El cambio en AMDockVS queda anotado en su `docs/TODO.md` y espera a que el motor esté cerrado.
 
 **Datos y base de datos.** La base de datos solo se toca en el proceso que lanza el job. El hilo del job lee la fuente y arma el elemento con datos planos y rutas; el hilo de entrega escribe en `output` lo que devuelve la task. Un worker nunca recibe una conexión ni la ruta de la base: recibe datos y rutas de ficheros, y devuelve filas.
 
