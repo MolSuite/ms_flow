@@ -85,6 +85,14 @@ STEPS = {
                               "in executor.db. The facade submits on the new engine (ms.submit) and a "
                               "monitor reads ms.jobs() and ms.job_failures(). Importing the package costs 300 ms "
                               "instead of 365 ms; a chunk costs the same.", True),
+    "remote executor": (None, "An executor may end the chunks of a task one by one, be told what the job needs and "
+                              "say how many chunks it wants in a task. On that: RayExecutor, ms_flow.runner (a "
+                              "staged directory run to its end, continued when run again) and RemoteExecutor (a "
+                              "task is a job in the queue of another machine, polled with one command). The local "
+                              "path of a chunk gains one check per finished task. This record was taken with the "
+                              "machine in use; run side by side with the previous step, alternating four times, "
+                              "import is 294 against 291 ms, the first job 83 against 84 ms and a process chunk "
+                              "0.0130 against 0.0132 ms.", False),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.

@@ -65,21 +65,23 @@ Con esto no se reinventa nada: Ray reparte entre nodos; el `Engine` del runner p
 Un directorio por job del gestor de colas, bajo el directorio de trabajo configurado:
 
 ```
-<workdir>/<clave del job>/<n>/
-    spec.json        función ("módulo:nombre"), parámetros, recursos por elemento, versión de ms_flow
-    elements.bin     los elementos de este job del HPC: clave + payload, uno tras otro
-    files/           ficheros de entrada, copiados una vez aunque varios elementos los compartan
+<workdir>/<12 hex al azar>/
+    fn.bin           la función, en pickle (puede ser un partial con los parámetros del job)
+    spec.json        total, recursos por elemento, versión de Python, segundos por parte
+    elements.bin     los payloads de este job del HPC, uno tras otro; el elemento es su posición
     job.sh           la plantilla rellenada
-    results/         part-00001.bin, part-00002.bin...: (clave, resultado); una parte cerrada no cambia
-    progress.json    {total, done, failed, running, fase, actualizado}
-    errors.jsonl     clave, intento, traceback, entrada (el mismo repr corto del diario local)
+    results/         part-00001.bin, part-00002.bin...: (posición, resultado); una parte cerrada no cambia
+    progress.json    {total, done, failed, running, status, error, at}
+    errors.jsonl     {index, error} por elemento que falla del todo
     journal.db       el diario del Engine del runner
-    runner.log       y la salida del gestor de colas
+    runner.log       la salida del runner (con el gestor `none`; con Slurm, la que diga la plantilla)
 ```
+
+Sin construir: `files/` (ficheros de entrada copiados una vez aunque varios elementos los compartan).
 
 ### El runner
 
-1. Lee `spec.json` e importa la función por su nombre. La función tiene que existir en el entorno del HPC: paquete instalado, misma versión (lo comprueba y falla con un mensaje claro si no).
+1. Lee `spec.json` y carga la función de `fn.bin`. La función tiene que poder importarse en el entorno del HPC (paquete instalado); la versión de Python tiene que ser la misma que la de la PC, y si no lo es falla con un mensaje claro.
 2. Ray, según `--ray`: una dirección se une al cluster que la plantilla ya levantó (la cabeza en el primer nodo y un worker en cada uno de los demás, con `srun` en Slurm); `none` no usa Ray y corre con el pool de procesos en un nodo. Este último es también el camino del "otro tipo de trabajo": un job que es un solo cálculo grande no levanta cluster.
 3. Crea el `Engine` con el diario en `journal.db` y la clave del job. Si la cola mata el job y se reenvía, continúa: no repite los elementos hechos.
 4. Fuente: `elements.bin`, leído de uno en uno. Destino: una parte de resultados que se cierra cada N elementos o T segundos (renombrado atómico), para que desde fuera solo se vean partes completas.
@@ -149,6 +151,26 @@ Cada paso se prueba solo y deja algo utilizable.
 
 R1 a R4 no necesitan cluster. R5 necesita acceso a uno.
 
+### Estado (2026-10-09)
+
+R1 a R4 están construidos, cada uno en su rama local, con sus tests:
+
+| Paso | Dónde | Qué quedó distinto del diseño |
+|---|---|---|
+| R1 | `engine.py`, contrato en `executors.py` (`bind_parts`) | Nada. Además un ejecutor puede pedir el coste declarado del job (`wants_cost`) y decir cuántos elementos quiere por tarea (`batch`, la regla 2 de lotes) |
+| R2 | `RayExecutor` en `executors.py` | Sin límite de tiempo por elemento ni progreso dentro de un elemento |
+| R3 | `ms_flow/runner.py` (`stage` y `python -m ms_flow.runner <dir> [--ray DIRECCIÓN] [--cpus N]`) | La función viaja en pickle (`fn.bin`), no por nombre. Sin `--ray` usa el pool de procesos. Probado con pool, con un Ray local (`--ray auto`), con `SIGTERM` y con `SIGKILL`; tras un `SIGKILL` un elemento puede salir dos veces en las partes y quien lee ignora la repetición |
+| R4 | `ms_flow/remote.py` (`Remote`, `SCHEDULERS`, `JOB_SH`, `RemoteExecutor`) | **Probado contra esta máquina con `sh`, no por `ssh`**: `Remote(host=None)` ejecuta las mismas órdenes en local. El camino `ssh` es el mismo código con otro `argv`, y no se ha ejecutado: en la PC de desarrollo `ssh localhost` no entra por clave. La entrada de Slurm está escrita del manual y sin ejecutar |
+
+Cómo se comporta lo construido:
+
+- Un hilo del ejecutor habla con la otra máquina; el motor nunca espera por ella. Enviar es una orden (`mkdir`, `tar xf -`, la del gestor); sondear es otra para todos los jobs (quién sigue en la cola y un `tar` con el progreso, los errores y las partes nuevas).
+- Un job que sale de la cola sin haber terminado y **más lejos de donde estaba** al enviarlo (se le acabó el tiempo) se envía otra vez sobre el mismo directorio y el runner continúa. Si sale sin haber avanzado, el job falla con lo que dijo el runner y su directorio se queda en la otra máquina para mirarlo.
+- Lo que termina bien no deja nada en la otra máquina. Cancelar para el job en la cola y borra su directorio. Cerrar la aplicación no para lo que está en cola.
+- Un elemento que falla y se reintenta desde la PC va en un job del HPC propio. Los reintentos dentro del mismo job del HPC no están: `stage` los admite, el ejecutor no los pasa.
+
+Falta, además de R5 y R6: copiar ficheros de entrada, el registro del ejecutor desde los ajustes y el log por job.
+
 ## Para el artículo
 
 Usar Ray por dentro cambia cómo se cuenta: `ms_flow` no compite con Ray como planificador distribuido, lo usa. Lo que aporta encima es el diario y la continuación, los sinks, los tokens locales, la aplicación de escritorio que se cierra y vuelve, y una sola forma de escribir el job para la PC y el HPC. Las medidas externas quedan en dos: el coste de orquestar en local frente a joblib/loky, Dask y Ray local; y el coste de `ms_flow` sobre Ray frente a Ray solo.
@@ -163,7 +185,7 @@ Cerradas por Mario (2026-10-09):
 
 Tomadas con el valor propuesto, a falta de que Mario diga otra cosa:
 
-4. **Formato de `elements.bin` y de las partes: pickle**, como hacia un worker local. `spec.json` lleva la versión de Python y la de `ms_flow`, y el runner se niega a arrancar si no coinciden.
+4. **Formato de `elements.bin` y de las partes: pickle**, como hacia un worker local. `spec.json` lleva la versión de Python y el runner se niega a arrancar si no coincide; la de `ms_flow` no se comprueba todavía.
 5. **Cadencia: 30 s** para cerrar una parte de resultados y para sondear, configurables por ejecutor.
 6. **Ray lo levanta la plantilla**, no el runner. La de Slurm que se entrega lo hace con `srun`; el runner recibe la dirección o `--ray none`.
 7. **Payloads**: un fichero de elementos por job del HPC, generado al vuelo en la PC y borrado con su directorio.
