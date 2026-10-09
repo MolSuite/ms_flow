@@ -19,7 +19,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-VERSION = 1
+VERSION = 2
 CHUNK_DONE, CHUNK_FAILED = 1, 2
 INTERRUPTED = "interrupted"
 RESUMABLE = (INTERRUPTED, "canceled")  # the job statuses that keep their done chunks: these continue
@@ -32,7 +32,8 @@ CREATE TABLE jobs (
     status TEXT NOT NULL,
     spec TEXT NOT NULL,           -- JSON: executor, function, options
     total INTEGER, done INTEGER NOT NULL, failed INTEGER NOT NULL,
-    error TEXT, started_at REAL, finished_at REAL
+    error TEXT, started_at REAL, finished_at REAL,
+    source TEXT                   -- JSON: what its source asked to keep, given back when it continues
 );
 CREATE TABLE chunks (
     job INTEGER NOT NULL, key BLOB NOT NULL,
@@ -40,7 +41,8 @@ CREATE TABLE chunks (
     PRIMARY KEY (job, key)
 ) WITHOUT ROWID;
 """
-_JOB_COUNTERS = "UPDATE jobs SET status = ?, total = ?, done = ?, failed = ?, error = ?, finished_at = ? WHERE n = ?"
+_JOB_COUNTERS = ("UPDATE jobs SET status = ?, total = ?, done = ?, failed = ?, error = ?, finished_at = ?, source = ? "
+                 "WHERE n = ?")
 
 
 class Busy(RuntimeError):
@@ -146,8 +148,8 @@ class Journal:
     def claim(self, job_id: str):
         """Reserve `job_id` for a job about to start.
 
-        Returns `(n, chunks done)` when it continues a job that was interrupted or canceled and
-        `None` when it is new.
+        Returns `(n, chunks done, source)` when it continues a job that was interrupted or canceled
+        and `None` when it is new.
         """
         with self._guard:
             if job_id in self._claimed:
@@ -156,14 +158,14 @@ class Journal:
         try:
             self.flush()
             with closing(sqlite3.connect(self.path)) as db:
-                row = db.execute("SELECT n, status FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+                row = db.execute("SELECT n, status, source FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
                 if row is None:
                     return None
                 if row[1] not in RESUMABLE:
                     raise ValueError(f"job {job_id!r} already ended as {row[1]}; "
                                      "only an interrupted or canceled job continues")
                 done = db.execute("SELECT count(*) FROM chunks WHERE job = ? AND status = ?", (row[0], CHUNK_DONE))
-                return row[0], done.fetchone()[0]
+                return row[0], done.fetchone()[0], row[2]
         except BaseException:
             self._claimed.discard(job_id)
             raise
@@ -229,9 +231,9 @@ class Journal:
                         job = record[0]
                         if len(record) == 1:
                             live[job.n] = job
-                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                        (job.n, job.uid, job.name, job.status, job.spec, job.total, job.done,
-                                        job.failed, job.error, job.started_at, job.finished_at))
+                                        job.failed, job.error, job.started_at, job.finished_at, job.source))
                             # one that continues runs its failures again
                             db.execute("DELETE FROM chunks WHERE job = ? AND status = ?", (job.n, CHUNK_FAILED))
                         else:
@@ -257,4 +259,4 @@ class Journal:
 
 
 def _counters(job) -> tuple:
-    return job.status, job.total, job.done, job.failed, job.error, job.finished_at, job.n
+    return job.status, job.total, job.done, job.failed, job.error, job.finished_at, job.source, job.n

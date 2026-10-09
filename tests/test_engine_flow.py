@@ -1,12 +1,15 @@
 """`@task`, `@job` and `Flow.submit` on the new engine: params, sinks, batch levels, table dependencies."""
 import sqlite3
+import time
 from contextlib import closing
 
 import pytest
 from pydantic import BaseModel
 
-from ms_flow.api import MolSuite, graph_sink, table_sink
-from ms_flow.engine import Engine, Flow, ProcessExecutor, job, task
+from ms_flow.core.database.project import ProjectStore
+from ms_flow.engine import Engine, Flow, ProcessExecutor, ThreadExecutor, job, task
+from ms_flow.query import QuerySpec, Rows
+from ms_flow.sinks import graph_sink, table_sink
 
 SEEN = {}
 
@@ -60,18 +63,32 @@ def sizes(params, project):
     yield from range(params["n"])
 
 
+@task()
+def slowly(ligand: dict) -> dict:
+    time.sleep(0.005)
+    return {"ligand_id": ligand["id"], "pose_rank": 0}
+
+
+@job(task=slowly, output=table_sink("docking_results", columns=("ligand_id", "pose_rank")))
+def every_ligand(params, project):
+    return Rows(project, QuerySpec(table="ligands", fields=("id",)), page_size=7)
+
+
 @pytest.fixture
-def project(tmp_path, monkeypatch):
-    monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
-    monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
-    ms = MolSuite(app_id="testflow")
-    ms.create_or_open_project(name="p", folder=tmp_path / "p", description="", scope="testing", activate=True)
-    with closing(sqlite3.connect(str(ms.project_db.db_path))) as conn, conn:
+def project(tmp_path):
+    with closing(sqlite3.connect(tmp_path / "project.db")) as conn, conn:
+        conn.execute("CREATE TABLE ligands (id INTEGER PRIMARY KEY, smiles TEXT)")
         conn.execute("CREATE TABLE docking_results (id INTEGER PRIMARY KEY, ligand_id INT, pose_rank INT)")
         conn.execute("CREATE TABLE interaction_results (id INTEGER PRIMARY KEY, docking_result_id INT, residue TEXT)")
         conn.execute("CREATE TABLE sizes (element INT, travelled_with INT)")
-    yield ms.project_db
-    ms.shutdown()
+    return ProjectStore.open_at(tmp_path / "project.db")
+
+
+def _until(true, seconds: float = 20.0):
+    end = time.monotonic() + seconds
+    while not true():
+        assert time.monotonic() < end, "never happened"
+        time.sleep(0.005)
 
 
 def test_a_job_writes_its_tables_and_the_job_that_reads_them_waits(project):
@@ -109,3 +126,37 @@ def test_a_job_writes_its_tables_and_the_job_that_reads_them_waits(project):
         # a ref names a row of its element only: written in groups, none is tied to another's
         assert engine.wait(flow.submit(clashing), 120).chunks_done == 50
         assert rows(well_tied)[0][0] == 950
+
+
+def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(project, tmp_path, monkeypatch):
+    def sql(text, *args):
+        with closing(sqlite3.connect(str(project.db_path))) as conn, conn:
+            return conn.execute(text, args).fetchall()
+
+    monkeypatch.setattr("ms_flow.engine.engine._RECOUNT", 0)  # count again at every chunk
+    sql("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) "
+        "INSERT INTO ligands (smiles) SELECT 'C' FROM n")
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.attach("project", tmp_path / "executor.db")
+        engine.register("thread", ThreadExecutor(4))
+        flow = Flow(engine, project)
+        submit = lambda **more: flow.submit(every_ligand, executor="thread", journal="project", **more)  # noqa: E731
+
+        first = submit(key="all")
+        assert flow._writing[first] == {"docking_results"}
+        _until(lambda: engine.status(first).chunks_total == 400)
+        sql("DELETE FROM ligands WHERE id BETWEEN 381 AND 390")  # not read yet: the total follows
+        _until(lambda: engine.status(first).chunks_total == 390)
+        _until(lambda: engine.status(first).chunks_done >= 20)
+        engine.cancel(first)
+        assert engine.wait(first, 30).status == "canceled"
+
+        sql("INSERT INTO ligands (smiles) SELECT 'N' FROM ligands LIMIT 10")  # ids 401 to 410
+        again = engine.wait(submit(key="all"), 60)
+        assert (again.status, again.chunks_done, again.chunks_total) == ("completed", 390, 390)
+        assert sql("SELECT count(*), count(DISTINCT ligand_id), max(ligand_id) FROM docking_results") == \
+            [(390, 390, 400)]
+
+        new = engine.wait(submit(), 60)  # another job: its own cap
+        assert (new.status, new.chunks_total) == ("completed", 400)
+        assert sql("SELECT max(ligand_id) FROM docking_results") == [(410,)]

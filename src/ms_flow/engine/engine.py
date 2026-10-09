@@ -45,6 +45,7 @@ _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a 
 _TASK_SECONDS, _PACK_MAX = 0.1, 64
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
+_RECOUNT = 30.0  # seconds between two counts of what a source has left
 
 
 def content_key(payload) -> bytes:
@@ -83,7 +84,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched")
+                 "retried", "batch", "batched", "source")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
@@ -201,6 +202,11 @@ class Engine:
         `(key, result)` of the job that is waiting, up to `_DELIVER_MAX`, and all of them count as
         done once it returns. When it raises, each pair is offered again alone and only the ones
         that raise again fail, so it must leave nothing behind when it raises: one transaction.
+        `chunks` may know more than how to be read. With `remaining()`, how many chunks it has yet
+        to give, the job has a total while it runs: counted at its first chunk and every
+        `_RECOUNT` seconds after, exact once the source is read. With `open(state)`, it is called
+        before the first read and what it returns (JSON) is kept with the job in its journal and
+        passed back as `state` when the job continues; `state` is None the first time.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
@@ -226,7 +232,7 @@ class Engine:
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
-        job.journal = job.n = job.uid = job.spec = job.skip = None
+        job.journal = job.n = job.uid = job.spec = job.skip = job.source = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
         if journal is not None:
@@ -254,7 +260,7 @@ class Engine:
         if key is not None and job.journal is not None:
             resumed = job.journal.claim(key)
             if resumed is not None:
-                job.n, job.skip = resumed  # `skip`: how many chunks it had done
+                job.n, job.skip, job.source = resumed  # `skip`: how many chunks it had done
                 job.done = job.skip
         job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
         job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
@@ -652,6 +658,10 @@ class Engine:
         seen, close = job.journal.done_before(job.n) if job.skip else (None, None)
         try:
             ready, room = job.ready, job.room
+            remaining, fresh, recount = getattr(chunks, "remaining", None), 0, 0.0
+            if hasattr(chunks, "open"):
+                state = chunks.open(json.loads(job.source) if job.source else None)
+                job.source = None if state is None else json.dumps(state)
             for payload in chunks:
                 while len(ready) >= job.window:  # at most `window` chunks read ahead
                     room.clear()
@@ -671,6 +681,13 @@ class Engine:
                 if seen is not None and seen(key):  # done before the job was interrupted
                     continue
                 ready.append(_Chunk(job, key, payload, cost))
+                if remaining is not None:
+                    # First at the first chunk that is not done already: what a continued job had
+                    # done is mostly what its source brings first, and counting it twice would
+                    # show a total too high until the next count.
+                    fresh += 1
+                    if (now := time.monotonic()) >= recount:
+                        job.total, recount = (job.skip or 0) + fresh + remaining(), now + _RECOUNT
                 if job.hungry and len(ready) >= job.batch:
                     job.hungry = False
                     self._events.put((self._on_fed,))

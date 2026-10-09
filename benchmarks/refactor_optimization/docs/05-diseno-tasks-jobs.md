@@ -174,7 +174,7 @@ Hace falta trabajo, ya medido o localizado:
 
 - **Escritura agrupada (hecho, ver abajo).** Una escritura por elemento cuesta 0,39 ms y con tasks rápidas es todo el tiempo del job (0,31 de 0,32 s en 800 elementos); agrupando 64 baja a 0,06 s. El motor da un elemento por hecho cuando vuelve `on_result`, así que agrupar fuera del motor dejaría elementos registrados como hechos sin estar en disco. Tiene que agrupar el motor y dar el lote por hecho al escribirlo.
 - **Lote forzado y task por lotes (hecho, ver abajo).** El motor solo empaqueta por su medida; faltan `batch=` y `@task(batched=True)`.
-- **Total que cambia.** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
+- **Total que cambia (hecho, ver abajo).** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
 - **Progreso.** El fichero de ranuras está probado suelto (carrera y coste), no unido al motor ni a los workers.
 - **Monitor.** Lee el `executor.db` del motor viejo; `JobSnapshot` no lleva fase, progreso fino ni ritmo.
 
@@ -210,6 +210,25 @@ Lo que hay:
 - Dependencias: el job espera a los jobs sin terminar, enviados por el mismo `Flow`, que escriben una tabla de su `reads=`. Si uno de ellos falla o se cancela, el que espera falla (regla de `after=` del motor).
 - Lo demás de `Engine.submit` (`key`, `journal`, `priority`, `total`) pasa tal cual.
 
-Lo que no hay todavía: `file_sink` como destino (ningún job de AMDockVS lo usa), `source=` con objetos de `ms_flow`, `local=True`, pasos `setup` y `finalize`, `report()`, total con tope y recuento.
+Lo que no hay todavía: `file_sink` como destino (ningún job de AMDockVS lo usa), `source=` con objetos de `ms_flow`, `local=True`, pasos `setup` y `finalize`, `report()`.
 
 Medido con la máquina ocupada (200 000 elementos, una fila por elemento): 0,017 ms por elemento con el sink del proyecto frente a 0,0155 ms escribiendo con `sqlite3` a mano. Medida nueva en el informe: `api_long_ms`. Registro pendiente, igual que el del lote forzado.
+
+## Hecho: total y tope (2026-10-08)
+
+Rama `refactor/source-total-and-cap`.
+
+- **Motor.** Una fuente puede traer dos métodos, los dos opcionales. `remaining()`: cuántos elementos le quedan; con él el job tiene total mientras corre (contado en el primer elemento y cada 30 s, exacto al agotarse la fuente). `open(state)`: se llama antes de leer, y lo que devuelve se guarda con el job en el diario y vuelve como `state` al reanudar. Los dos corren en el hilo que lee la fuente. El diario pasa a la versión 2 (columna `source`).
+- **Fuente de tabla.** `ms_flow.query.Rows(project, QuerySpec(table=...))`: páginas por clave hasta el `max(id)` que había al empezar a leer, que es lo que guarda. La función del job la devuelve en lugar de hacer `yield`, y de ella sale también la tabla que lee, sin `reads=`:
+
+```python
+@job(task=dock, output=table_sink("docking_results", columns=(...)))
+def docking(params, project):
+    return Rows(project, QuerySpec(table="ligands", fields=("id", "smiles"), filters=params.filters))
+```
+
+- Comprobado en `tests/test_engine_flow.py`: 400 filas, el total baja a 390 al borrar 10 sin leer, se cancela, llegan 10 filas nuevas, se reanuda y termina con 390 hechas y ninguna de las nuevas; un job nuevo sí las toma.
+- El total antes de empezar a leer no existe (el job puede estar esperando a otro que escribe esa tabla).
+- Al reanudar, si la fuente vuelve a traer lo ya hecho en otro orden, el total sale alto hasta el siguiente recuento.
+- Límite conocido: el tope es `max(id)`. Si se borran las últimas filas de una tabla sin `AUTOINCREMENT`, SQLite vuelve a dar esas claves y las filas que las tomen entran.
+- Sin hacer: `source=` en `@job` para no escribir la función; se puede devolver la fuente desde ella, que además deja usar los parámetros en el filtro.

@@ -30,11 +30,14 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
 
 
 def job(*, task, name: str = "", params_model=None, output=None, reads=()):
-    """Mark a generator `(params, project)` as a job: its elements go to `task`, the results to `output`.
+    """Mark a function `(params, project)` as a job: the elements it gives go to `task`, the results to `output`.
 
+    It is a generator, or returns whatever can be read one element at a time: `ms_flow.query.Rows`
+    for the rows of a table, which also gives the job its total and the table it reads.
     `output` is a `table_sink` (the task returns rows) or a `graph_sink` (it returns
     `{node: rows}`; a `$ref` names its row within what the element returned). `reads` is the
-    tables the source reads: the job waits for the jobs writing them.
+    tables the source reads, besides the ones it says itself: the job waits for the jobs
+    writing them.
     """
     if not hasattr(task, "__task__"):
         raise TypeError(f"{task!r} is not a task: decorate it with @task(...)")
@@ -119,9 +122,11 @@ class Flow:
             if on_terminal is not None:
                 on_terminal(snapshot)
 
+        source = job(params, self.project)
+        reads = spec["reads"] | frozenset(getattr(source, "reads", ()))
         with self._lock:  # so `ended` cannot run before the job is in `_writing`
-            after = [*after, *(job_id for job_id, tables in self._writing.items() if tables & spec["reads"])]
-            job_id = self.engine.submit(executor, fn, job(params, self.project), name=spec["name"], after=after,
+            after = [*after, *(job_id for job_id, tables in self._writing.items() if tables & reads)]
+            job_id = self.engine.submit(executor, fn, source, name=spec["name"], after=after,
                                         on_results=write if output is not None else None, on_terminal=ended,
                                         **needs, **engine)
             self._writing[job_id] = _tables(output)

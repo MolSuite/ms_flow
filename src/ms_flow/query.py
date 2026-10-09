@@ -252,4 +252,49 @@ def db_pages(
             remaining -= len(rows)
 
 
-__all__ = ["QuerySpec", "db_input_for", "db_count", "db_pages", "db_rows", "db_stream"]
+class Rows:
+    """The rows of a table as the source of a job, read in pages by `key`.
+
+    It stops at the highest key the table had when the job first read it, and the job keeps that:
+    rows that arrive later stay out, also when the job continues. It knows how many rows it has
+    left, which gives the job its total.
+    """
+
+    def __init__(self, source: Any, spec: QuerySpec, *, key: str = "id", page_size: int = 500):
+        self._key = normalize_identifier(key, label="key")
+        if (not spec.table or spec.offset or spec.limit is not None
+                or (spec.fields and self._key not in spec.fields)
+                or (spec.order and tuple(spec.order) != (self._key,))):
+            raise ValueError("Rows reads a whole table in the order of its key: no query, limit, offset or "
+                             "other order, and the key among the fields")
+        self.reads = (spec.table,)
+        self._source, self._spec, self._size = source, spec, page_size
+        self._state = self._last = None
+
+    def open(self, state: dict | None) -> dict:
+        if state is None:
+            # ponytail: a table whose last rows are deleted gives their keys out again, and rows
+            # that take them get in. A cap by rowid of an AUTOINCREMENT key if that ever matters.
+            cap = db_rows(self._source, query=f"SELECT max({self._key}) AS cap FROM {self._spec.table}")
+            state = {"cap": cap[0]["cap"]}
+        self._state = state
+        return state
+
+    def _left(self) -> QuerySpec:
+        if self._state is None:
+            self.open(None)
+        filters = {**self._spec.filters, f"{self._key}__lte": self._state["cap"]}
+        if self._last is not None:
+            filters[f"{self._key}__gt"] = self._last
+        return replace(self._spec, filters=filters)
+
+    def remaining(self) -> int:
+        return db_count(self._source, self._left())
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for row in db_pages(self._source, self._left(), key=self._key, page_size=self._size):
+            self._last = row[self._key]
+            yield row
+
+
+__all__ = ["QuerySpec", "Rows", "db_input_for", "db_count", "db_pages", "db_rows", "db_stream"]
