@@ -209,8 +209,9 @@ Añadido el 2026-10-09, antes de R6 y en este orden:
 
 F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExecutor`; tests en `tests/test_files.py` y `tests/test_remote.py`), con estos techos, anotados en el código:
 
-- Los ficheros viajan en memoria: el `tar` del job y el del sondeo en la cola, los bytes con el resultado en Ray. Sirve para receptores y poses; una librería de GB pide un fichero por pieza.
-- En Ray un fichero queda en el almacén de objetos hasta cerrar el ejecutor, y la copia de cada nodo en su temporal hasta que lo limpie el sistema.
+- **Qué hay en memoria a la vez.** El motor entrega a un ejecutor tantas tareas como su `capacity` (en Ray, los núcleos del cluster) y lee por delante el doble; nunca el job entero. En Ray un fichero está en el almacén de objetos mientras alguna tarea en vuelo lo lee, y se suelta con la última: con 5 000 receptores viven los de las tareas que están corriendo. La copia de cada nodo en su temporal sí se queda hasta que lo limpie el sistema (disco, no memoria).
+- En la cola el job sale de un `tar` en disco, del tamaño que sea. Vuelven en memoria el `tar` de cada sondeo y, en Ray, los bytes de lo que un resultado nombra: lo producido por las tareas de un sondeo o de una tarea, no más.
+- En la cola un job de `ms_flow` es un job del HPC con **todos** sus elementos, salvo que `elements_per_job` diga otra cosa: ahí sí se materializa el job entero en la PC antes de enviarlo.
 - Las marcas se buscan en diccionarios, listas y tuplas del elemento; dentro de otros objetos no se miran.
 - Sin cluster, "otro disco" se ha probado como otra carpeta de esta máquina.
 

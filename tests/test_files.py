@@ -1,4 +1,5 @@
 """`File` and `Dir`: paths to whoever shares the disk, marks to whoever has to carry the files."""
+import gc
 import pickle
 
 import pytest
@@ -35,12 +36,15 @@ def test_on_ray_without_a_shared_disk_files_go_once_and_what_results_name_comes_
     (tmp_path / "receptor.txt").write_text("here")
     read, left, poses = [], [], tmp_path / "poses"
     with Engine(cpus=1) as engine:
-        engine.register("ray", RayExecutor(num_cpus=2, shared=False))
+        ray = RayExecutor(num_cpus=2, shared=False)
+        engine.register("ray", ray)
         one = engine.submit("ray", workers.read, [{"path": File(tmp_path / "receptor.txt"), "n": i} for i in range(6)],
                             on_results=read.extend)
         two = engine.submit("ray", workers.leave, [{"out": Dir(poses), "n": i} for i in range(7)], batch=3,
                             on_results=left.extend)
         assert (engine.wait(one, 120).status, engine.wait(two, 120).status) == ("completed", "completed")
+        gc.collect()
+        assert not ray._carried, "a file nobody reads any more is not kept in the object store"
     seen = {result["path"] for key, result in read}
     assert len(read) == 6 and all(result["text"] == "here" for key, result in read)
     assert len(seen) == 1 and not seen.pop().startswith(str(tmp_path)), "one copy, kept by the node"

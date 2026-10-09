@@ -59,9 +59,11 @@ class Remote:
     def __init__(self, host: str | None = None, ssh=("ssh", "-o", "BatchMode=yes")):
         self.host, self.ssh = host, tuple(ssh)
 
-    def run(self, command: str, data: bytes = b"", timeout: float = 600) -> bytes:
+    def run(self, command: str, data=b"", timeout: float = 600) -> bytes:
+        """What `command` printed there, given `data` (bytes, or an open file) to read."""
         argv = ["sh", "-c", command] if self.host is None else [*self.ssh, self.host, command]
-        done = subprocess.run(argv, input=data, capture_output=True, timeout=timeout)
+        feed = {"input": data} if isinstance(data, bytes) else {"stdin": data}
+        done = subprocess.run(argv, **feed, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         if done.returncode:
             said = done.stderr.decode(errors="replace").strip()
             if "Permission denied" in said:  # BatchMode: ssh does not ask, and here nobody could answer
@@ -187,23 +189,22 @@ class RemoteExecutor:
                 stage(tmp, sent.fn, payloads, batched=sent.whole, part_seconds=self.part_seconds,
                       cpu=cpu, gpu=gpu, mem_mb=mem_mb)
                 Path(tmp, "job.sh").write_text(self.script)
-                # ponytail: the whole job in memory, its files too; a file on disk fed to the command
-                # when what an element reads is counted in gigabytes.
-                packed = io.BytesIO()
-                with tarfile.open(fileobj=packed, mode="w", dereference=True) as tar:
-                    tar.add(tmp, arcname=".")
-                    for here, there in carried.items():
-                        tar.add(here, arcname=there)
-            sent.dir = uuid.uuid4().hex[:12]
-            where = f"{self.workdir}/{sent.dir}"
-            sent.id = self._queue(f"mkdir -p {where} && cd {where} && tar xf -", packed.getvalue())
+                sent.dir = uuid.uuid4().hex[:12]
+                where = f"{self.workdir}/{sent.dir}"
+                with tempfile.TemporaryFile() as packed:  # on disk: the job and its files, of any size
+                    with tarfile.open(fileobj=packed, mode="w", dereference=True) as tar:
+                        tar.add(tmp, arcname=".")
+                        for here, there in carried.items():
+                            tar.add(here, arcname=there)
+                    packed.seek(0)
+                    sent.id = self._queue(f"mkdir -p {where} && cd {where} && tar xf -", packed)
             sent.payloads = sent.fn = None  # they are over there now
             return True
         except Exception:
             self._on_done(sent.tag, ERROR, None, "the job could not be sent\n" + traceback.format_exc(), 0)
             return False
 
-    def _queue(self, first: str, data: bytes = b"") -> str:
+    def _queue(self, first: str, data=b"") -> str:
         # In braces: a `&` in what submits must not send what comes before it to the background too.
         said = self.remote.run(f"{first} && {{ {self.queue['submit']}; }}", data)
         return said.split()[-1].decode().split(";")[0]  # Slurm may print `id;cluster`

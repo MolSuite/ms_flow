@@ -45,6 +45,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
@@ -178,9 +179,9 @@ class RayExecutor:
         import ray
 
         self._ray, self.shared = ray, address is None if shared is None else shared
-        # ponytail: a file stays in the object store until `shutdown`; let go of those of a job
-        # when it ends once a library of one file per element fills the store.
-        self._carried = {}  # (path, when it changed, size) -> _Carried
+        # (path, when it changed, size) -> _Carried, for as long as a task that reads it is with
+        # Ray: after the last one nothing holds it and the object store lets it go.
+        self._carried = weakref.WeakValueDictionary()
         self._flying, self._killed = set(), set()  # the tasks Ray has, and those of them `kill` stopped
         # How far each watched task is: the nodes tell an actor, and what it holds is asked for
         # whenever `progress` is, so that one answers with what the time before brought.
@@ -204,9 +205,9 @@ class RayExecutor:
             cpu, gpu, mem_mb = cost
             run = self._sized[cost] = self._run.options(num_cpus=cpu, num_gpus=gpu,
                                                         memory=int(mem_mb * 2 ** 20) or None)
-        dirs = []
+        dirs, held = [], []  # where it writes, and the files it reads, held until it ends
         if not self.shared:
-            payload = swap(payload, partial(self._mark, dirs))
+            payload = swap(payload, partial(self._mark, dirs, held))
         call, index = call or _call, None
         if owner is not None:
             if self._tally is None:
@@ -216,7 +217,7 @@ class RayExecutor:
             call = partial(_told, self._tally, index, call)
         ref = run.remote(call, fn, payload)
         self._flying.add(ref)
-        ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs))
+        ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
         return ref
 
     def progress(self, owner) -> float:
@@ -237,23 +238,26 @@ class RayExecutor:
             self._killed.add(ref)
             self._ray.cancel(ref, force=True)
 
-    def _mark(self, dirs: list, mark):
+    def _mark(self, dirs: list, held: list, mark):
         if isinstance(mark, Dir):
             if mark not in dirs:
                 dirs.append(str(mark))
             return _Out(dirs.index(mark))
         at = os.stat(mark)
         key = (str(mark), at.st_mtime_ns, at.st_size)
-        if key not in self._carried:
+        carried = self._carried.get(key)
+        if carried is None:
             with open(mark, "rb") as file:
-                self._carried[key] = _Carried(os.path.basename(mark), hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(),
-                                              self._ray.put(file.read()))
-        return self._carried[key]
+                carried = self._carried[key] = _Carried(
+                    os.path.basename(mark), hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(),
+                    self._ray.put(file.read()))
+        held.append(carried)
+        return carried
 
     def submit_many(self, fn, payloads, tag, whole=False, cost=(1, 0, 0), owner=None):
         return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, cost, owner)
 
-    def _finished(self, tag, ref, index, dirs, future) -> None:
+    def _finished(self, tag, ref, index, dirs, held, future) -> None:
         self._flying.discard(ref)
         self._watched.pop(index, None)
         status, value, error = _outcome(future, self._lost)
