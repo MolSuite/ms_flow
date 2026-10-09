@@ -227,6 +227,29 @@ S2 está construido (en `test_the_same_jobs_on_ray`):
 - **Límite de tiempo**: `kill()` cancela a la fuerza todo lo que Ray tiene del ejecutor, que es lo que el motor pide a cualquier ejecutor; el elemento que se pasó falla con "timed out" y los demás vuelven a la cola sin cargo. El límite cuenta desde que Ray recibe la tarea: si los elementos piden más núcleos de los que Ray tiene libres, parte del límite se va esperando en Ray.
 - **Progreso**: lo que la task dice con `report()` va, como mucho dos veces por segundo, a un actor del ejecutor; `progress()` responde con lo último que trajo y pide lo nuevo, así que va una consulta por detrás.
 
+## R6: continuar tras cerrar la aplicación (propuesta, sin construir)
+
+Hoy cerrar cancela el job de la cola. Mientras no exista lo de abajo es lo correcto: dejarlo correr sin poder recogerlo serían horas de HPC perdidas.
+
+**Qué cambia**
+
+1. **El motor distingue interrumpir de cancelar.** Un ejecutor dice que sus tareas viven fuera de este proceso (`outlives = True`). Al interrumpir un job (cerrar la aplicación o el proyecto) el motor no cancela las tareas de ese ejecutor; al cancelarlo, sí.
+2. **El ejecutor recibe la clave del job** (la del diario, `key=`), igual que ya recibe el coste.
+3. **El registro vive en la otra máquina, no en la PC.** El directorio de un job de la cola se llama `<clave del job>-<n>` y guarda, además de lo de ahora, la clave de contenido de cada elemento en orden y el identificador de la cola. No hay fichero local que perder ni que sincronizar, y se puede continuar desde otra PC. Cuesta una orden más al primer envío de cada clave.
+4. **Continuar es reenviar el job con la misma clave**, que es como ya continúa cualquier job. El motor entrega los elementos que el diario no da por hechos; el ejecutor mira qué directorios hay de esa clave y cada elemento que ya está en uno **no se envía**: su resultado se espera de ahí. Lo que terminó con la aplicación cerrada llega en el primer sondeo. Los elementos que no están en ninguno van en un job nuevo.
+5. Para eso `RemoteExecutor` separa lo que hoy es una sola cosa: el job de la cola (lo que se sondea) y la tarea del motor (lo que se responde), unidos elemento a elemento. Al reabrir, los paquetes del motor no coinciden con los de antes.
+6. Un job sin clave no tiene con qué continuar: al cerrar se cancela, como hoy.
+
+**Lo que hay que decidir**
+
+| | Pregunta | Propuesta |
+|---|---|---|
+| A | ¿Quién reenvía al reabrir? Hoy tiene que hacerlo la aplicación, que entonces debe guardar con qué parámetros lanzó cada job | Que lo guarde `ms_flow`: el diario apunta el job y sus parámetros, `ms.resume(clave)` lo vuelve a lanzar y el monitor ofrece "Continuar" en un job interrumpido. Sirve igual para loky |
+| B | ¿Qué hace cerrar con jobs en la cola? | Siguen corriendo. Cancelar es siempre un gesto explícito |
+| C | ¿Y lo que nunca se reabre? Quedan directorios y horas de HPC | `ms.remote_jobs()`: lo que hay en la otra máquina de este usuario, con cancelar y borrar; el monitor lo enseña aunque el proyecto no esté abierto |
+
+`setup`, los campos del monitor y el log por job salen de R6 y van después, cada uno por su lado.
+
 ### Estado (2026-10-09)
 
 R1 a R4 están construidos, cada uno en su rama local, con sus tests:
@@ -242,10 +265,10 @@ Cómo se comporta lo construido:
 
 - Un hilo del ejecutor habla con la otra máquina; el motor nunca espera por ella. Enviar es una orden (`mkdir`, `tar xf -`, la del gestor); sondear es otra para todos los jobs (quién sigue en la cola y un `tar` con el progreso, los errores y las partes nuevas).
 - Un job que sale de la cola sin haber terminado y **más lejos de donde estaba** al enviarlo (se le acabó el tiempo) se envía otra vez sobre el mismo directorio y el runner continúa. Si sale sin haber avanzado, el job falla con lo que dijo el runner y su directorio se queda en la otra máquina para mirarlo.
-- Lo que termina bien no deja nada en la otra máquina. Cancelar para el job en la cola y borra su directorio. Cerrar la aplicación no para lo que está en cola.
+- Lo que termina bien no deja nada en la otra máquina. Cancelar para el job en la cola y borra su directorio. **Cerrar la aplicación o el proyecto también lo cancela y lo borra** (medido el 2026-10-09; aquí ponía lo contrario): al interrumpir un job el motor cancela lo que tiene en vuelo, en cualquier ejecutor. Que siga corriendo es R6.
 - Un elemento que falla y se reintenta desde la PC va en un job del HPC propio. Los reintentos dentro del mismo job del HPC no están: `stage` los admite, el ejecutor no los pasa.
 
-Falta, además de R5 y R6: copiar ficheros de entrada, el registro del ejecutor desde los ajustes y el log por job.
+Falta, además de R5 y R6: el log por job. Los ficheros de entrada y el registro desde los ajustes llegaron con F1-F4 y S1.
 
 ## Para el artículo
 
