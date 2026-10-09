@@ -1,9 +1,8 @@
 import sqlite3
 from pathlib import Path
 
-import pytest
 
-from ms_flow.core.database import ExecutorDB, MasterDB
+from ms_flow.core.database import MasterDB
 
 
 def _columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
@@ -98,26 +97,3 @@ def test_master_db_migration_preserves_rows_and_is_idempotent(tmp_path):
     assert version_row == (6,)
 
 
-def test_executor_db_rejects_superseded_operational_schema(tmp_path):
-    db_path = tmp_path / "legacy_executor.db"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute(
-            """
-            CREATE TABLE executor_jobs (
-                id TEXT PRIMARY KEY,
-                job_id TEXT,
-                status TEXT,
-                progress REAL,
-                payload_json TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    with pytest.raises(RuntimeError, match="Unsupported legacy operational schema"):
-        ExecutorDB(db_path)

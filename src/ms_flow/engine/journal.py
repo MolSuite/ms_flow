@@ -95,7 +95,7 @@ class Journal:
             if not version and not db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 db.executescript(f"PRAGMA auto_vacuum = INCREMENTAL; {_SCHEMA} PRAGMA user_version = {VERSION};")
             elif version != VERSION:
-                raise RuntimeError(f"{self.path} is not a version {VERSION} journal")
+                raise RuntimeError(f"{self.path} is not a version {VERSION} journal: move it away to start a new one")
             # Whatever never ended belonged to a process that is gone: the lock says so.
             db.execute("UPDATE jobs SET status = ?, finished_at = ? WHERE finished_at IS NULL",
                        (INTERRUPTED, time.time()))

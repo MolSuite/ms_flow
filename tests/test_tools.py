@@ -1,16 +1,11 @@
 """Tool specs: TOML binding, lookup order, env bootstrap script, project-less installs, feeder gate."""
 from __future__ import annotations
 
-import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterable
 
 from ms_flow.core.executor import tools
 from ms_flow.core.executor.provisioning import run_step
-from ms_flow.main import MolSuite
-from ms_flow.tasking import JobSpec
 
 _TOML = """
 [tool]
@@ -127,39 +122,3 @@ def test_install_needs_no_project(tmp_path, monkeypatch):
     assert tools.dependency_state("not-a-tool") is None
 
 
-class _NeedsTool(JobSpec):
-    name = "needs_tool"
-    executor = "thread"
-    supported_executors = ("thread",)
-    store_results = False
-
-    @staticmethod
-    def build_chunks(params: dict, config: dict | None = None) -> Iterable[dict]:
-        yield {"exe": params["exe"]}
-
-    @staticmethod
-    def run_chunk(payload: dict, progress=None):
-        assert Path(payload["exe"]).exists(), "the job ran before its tool was installed"
-        return {}
-
-
-def test_jobs_wait_for_the_install(tmp_path, monkeypatch):
-    monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
-    monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    ms = MolSuite(app_id="testtools")
-    try:
-        ms.create_or_open_project(
-            name="tools_project", folder=tmp_path / "tools_project", description="", scope="testing", activate=True
-        )
-        recipe = _plain_spec(tmp_path, slow=True)
-        key = tools.install_tool(recipe)
-        job_id = ms.submit_job(_NeedsTool.to_job_definition(), params={"exe": recipe.candidates[0]}, depends_on=[key])
-        assert ms.wait_for_job(job_id, poll_s=0.05).status == "completed"
-
-        broken = _plain_spec(tmp_path, fail=True, slow=True)
-        key = tools.install_tool(broken, SimpleNamespace(name="elsewhere"))
-        job_id = ms.submit_job(_NeedsTool.to_job_definition(), params={"exe": broken.candidates[0]}, depends_on=[key])
-        assert ms.wait_for_job(job_id, poll_s=0.05).status == "canceled"
-    finally:
-        ms.shutdown()

@@ -100,12 +100,9 @@ class BaseRuntime:
         self.on_project_activated(context)
         return context
 
-    def run(self, *args, **kwargs) -> str:
-        """Shortcut to run a declarative workflow on the active runtime."""
-        return self.molsuite.run(*args, **kwargs)
-
-    def submit_job(self, job, **kwargs) -> str:
-        return self.molsuite.submit_job(job, **kwargs)
+    def submit(self, job, params=None, **options) -> int:
+        """Run a job in the active project. See `MolSuite.submit`."""
+        return self.molsuite.submit(job, params, **options)
 
     @property
     def active_context(self) -> Optional[ProjectContext]:

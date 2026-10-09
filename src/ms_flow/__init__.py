@@ -1,21 +1,22 @@
 """Main MolSuite package.
 
 Recommended path:
-- `molsuite.api` for the normal public API
+- `ms_flow.api` for the normal public API
 
 Specialised surfaces:
-- `molsuite.tasking` for the full declarative layer
-- `molsuite.query` for query helpers
-- `molsuite.core.*` for internal/advanced extensions
+- `ms_flow.engine` for the engine without a project
+- `ms_flow.query` for query helpers
+- `ms_flow.core.*` for internal/advanced extensions
 """
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ms_flow.api import AppRuntime, MolSuite
-    from ms_flow.progress import watch_job, watch_jobs
+    from ms_flow.engine import job, report, task
     from ms_flow.runtime import BaseRuntime
     from ms_flow.selection import MultipleResultsFound, NoResultFound, Selection
+    from ms_flow.sinks import file_sink, graph_sink, table_sink
 
 # Loaded on first use: a worker process that only runs chunks must not pay for the whole API.
 _LAZY = {
@@ -25,8 +26,12 @@ _LAZY = {
     "MultipleResultsFound": "ms_flow.selection",
     "NoResultFound": "ms_flow.selection",
     "Selection": "ms_flow.selection",
-    "watch_job": "ms_flow.progress",
-    "watch_jobs": "ms_flow.progress",
+    "job": "ms_flow.engine",
+    "report": "ms_flow.engine",
+    "task": "ms_flow.engine",
+    "file_sink": "ms_flow.sinks",
+    "graph_sink": "ms_flow.sinks",
+    "table_sink": "ms_flow.sinks",
 }
 
 
@@ -46,6 +51,10 @@ __all__ = [
     "MultipleResultsFound",
     "NoResultFound",
     "Selection",
-    "watch_job",
-    "watch_jobs",
+    "file_sink",
+    "graph_sink",
+    "job",
+    "report",
+    "table_sink",
+    "task",
 ]

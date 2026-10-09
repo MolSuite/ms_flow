@@ -1,6 +1,6 @@
 # Diseño del motor de ms_flow
 
-Estado: propuesta para discutir. No hay código del motor nuevo. Parte de los hallazgos de [01-auditoria.md](01-auditoria.md) y de las decisiones del 2026-10-07. El flujo de trabajo por rama y PR está en el [README](../README.md).
+Estado: construido. El motor nuevo es el único desde el 2026-10-08 (el anterior se borró en la rama `refactor/delete-old-engine`); lo que cambió al construir está en «Estado a 2026-10-08». Parte de los hallazgos de [01-auditoria.md](01-auditoria.md) y de las decisiones del 2026-10-07. El flujo de trabajo por rama y PR está en el [README](../README.md).
 
 ## Resumen
 
@@ -345,6 +345,8 @@ El motor nuevo se construye entero en `ms_flow/engine/`, al lado del actual, que
 | C1 | Relevo: `job_api.py`, `tasking.py` y `project_runtime.py` pasan al motor nuevo, con sinks, etapas, `setup` y `finalize` | F2-2 | Ninguna métrica; se acepta con los flujos de AMDockVS de punta a punta |
 | C2 | Borrar el motor anterior y SQLModel del motor | F2-9, F2-10 | `import` |
 
+**C1 y C2, hechos el 2026-10-08.** La fachada (`MolSuite.submit`, `MolSuite.engine`) corre solo sobre el motor nuevo y el diario del proyecto es su `executor.db`. C1 no se aceptó con los flujos de AMDockVS: se decidió borrar primero y portar AMDockVS después, así que queda roto hasta entonces. `setup`, `finalize` y los sinks a fichero no se han construido. La lista de lo borrado y de los huecos está en [05-diseno-tasks-jobs.md](05-diseno-tasks-jobs.md), «Hecho: borrado del motor anterior». `import ms_flow.api` pasa de unos 370 a unos 300 ms (5 repeticiones, máquina ocupada; falta el registro oficial).
+
 Lo que desaparece respecto al plan de la auditoría: F0-2 (índice `(job_id, status)`) y F0-4 (eventos por chunk), porque la tabla y los eventos que arreglaban no existen en el motor nuevo. F0-5, F0-6 y F0-7 no tocan el motor y pueden ir en cualquier momento.
 
 **Estado a 2026-10-08.** Hechos y medidos B1 a B6 (el bloque B entero), más un paso fuera de la tabla: el paquete `ms_flow` carga sus nombres al primer uso, para que un worker no importe toda la API (primer job de 563 a 80 ms). Cada uno es una rama local `refactor/*` y una columna del informe. Lo que cambió al construir:
@@ -358,7 +360,7 @@ Lo que desaparece respecto al plan de la auditoría: F0-2 (índice `(job_id, sta
 - **Memoria.** Al reanudar, cada clave se busca en el fichero del diario en lugar de cargar todas las hechas: con 1,8 millones de chunks hechos el pico baja de 232 a 35 MB, a cambio de 5 a 7 µs por chunk de la fuente. Un payload igual a otro ya hecho en la misma ejecución también se salta. Un job terminado se suelta del motor (función y callbacks incluidos); queda su última foto, para los 1.000 jobs terminados más recientes.
 - **Ventana elástica, medida.** Con 14 workers y una fuente que no espera (payloads con `_key`, sin calcular la clave): payloads de 10 KB, 52 MB de pico frente a 26 con ventana fija de 28, y el doble de rápido; de 100 KB, 87 MB frente a 45, sin ganancia de tiempo; de 1 MB, igual en ambos (el paquete baja a 1 o 2). Con la clave calculada por el motor la fuente va más lenta que el pool y la ventana no llega a llenarse: de 1 KB a 1 MB la diferencia es de 0 a 4 MB. No se limita. Si hiciera falta, el límite sería un presupuesto en bytes de lo leído por adelantado.
 - **Pendiente para más adelante.**
-  - Un `executor.db` de formato antiguo hoy da error. Como su contenido es efímero, la sustitución podrá hacerse conciliada con el usuario cuando haya usuarios con ficheros viejos.
+  - Un `executor.db` de formato antiguo da error y pide apartar el fichero. Como su contenido es efímero, la sustitución podrá hacerse conciliada con el usuario cuando haya usuarios con ficheros viejos.
   - **Pool de procesos propio**, aplazado el 2026-10-08 hasta que los fallos de loky aprieten. Un proceso por worker con su canal: el motor sabe qué chunk lleva cada uno, corta solo el que se pasa de tiempo y la muerte de un worker cuesta un chunk, sin repetir en serie los demás. Hoy, con loky, matar un worker (a mano o por falta de RAM) tira el pool: 24 chunks de 1 s en 8 workers pasan de 3,1 a 10,6 s, sin perder ninguno. No rompe nada hacia fuera: queda detrás del contrato del ejecutor (`submit`, `submit_many`, `kill`), con el mismo nombre `ProcessExecutor`, y permite borrar del motor los sospechosos y el rearranque en serie. Debe seguir enviando las funciones con `cloudpickle`, como hace loky.
 - **Compactación.** Al terminar un job, salvo interrumpido o cancelado, se borran sus chunks hechos y se devuelven las páginas al sistema (`auto_vacuum=INCREMENTAL`). Cuesta unos 2,5 s por millón de chunks, una vez, al final.
 

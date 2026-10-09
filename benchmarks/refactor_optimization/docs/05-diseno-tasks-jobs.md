@@ -176,7 +176,7 @@ Hace falta trabajo, ya medido o localizado:
 - **Lote forzado y task por lotes (hecho, ver abajo).** El motor solo empaqueta por su medida; faltan `batch=` y `@task(batched=True)`.
 - **Total que cambia (hecho, ver abajo).** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
 - **Progreso.** Hecho en el ejecutor de procesos (ver «Hecho: progreso»). Falta el de HPC, por lote.
-- **Monitor.** Lee el `executor.db` del motor viejo; `JobSnapshot` no lleva fase, progreso fino ni ritmo.
+- **Monitor.** Sin datos desde el borrado del motor viejo (ver «Hecho: borrado del motor anterior»); `JobSnapshot` no lleva fase ni ritmo.
 
 Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolución de `FileInputSpec` en el hilo del job, progreso por lote en HPC.
 
@@ -252,7 +252,7 @@ Rama `refactor/job-progress`.
 
 ## Hecho: relevo, primer corte (2026-10-08)
 
-Rama `refactor/facade-new-engine`. La fachada tiene el motor nuevo al lado del viejo; nada de lo viejo cambia.
+Rama `refactor/facade-new-engine`. La fachada tiene el motor nuevo al lado del viejo; nada de lo viejo cambia. (El motor viejo se borró después: ver «Hecho: borrado del motor anterior».)
 
 ```python
 job_id = molsuite.submit(docking_job, {"exhaustiveness": 8})   # executor=, batch=, after=, progress=, key=
@@ -264,16 +264,36 @@ molsuite.engine.wait(job_id)                                   # status, cancel 
 - Cerrar o cambiar de proyecto interrumpe sus jobs, espera a que lo entregado esté escrito y cierra el diario. Enviar otra vez con la misma `key` lo continúa. `shutdown` cierra el motor.
 - Comprobado en `tests/test_engine_flow.py`: 300 ligandos de una tabla por el ejecutor de procesos; un segundo job cortado al cerrar el proyecto y continuado al reabrirlo, sin filas repetidas.
 
-Decisiones tomadas al construir, a revisar:
+Las tres decisiones que quedaron a revisar (`engine.db`, dos motores a la vez, nombres solo en `ms_flow.engine`) se cerraron al borrar el motor viejo.
 
-- El diario es `engine.db` en la carpeta del proyecto, porque `executor.db` es del motor viejo mientras exista.
-- Los dos motores reparten las mismas CPU sin saber uno del otro. Jobs de los dos a la vez sobrecargan la máquina.
-- `task`, `job` y `report` siguen en `ms_flow.engine`. Un test fija que `ms_flow` no exporta `task`, `job` ni `table_sink`, y `ms_flow.sinks` importa `sqlmodel` (290 ms en cada worker que lo cargue).
+## Hecho: borrado del motor anterior (2026-10-08)
 
-Falta del relevo (C1):
+Rama `refactor/delete-old-engine`. Decidido por Mario: se borra ya, el diario es el `executor.db` del proyecto y AMDockVS queda roto hasta que se reescriban sus jobs.
 
-1. Monitor (`ms_components`): lee el `executor.db` viejo. Los jobs del motor nuevo no salen, ni cuentan en `get_project_activity` / `can_switch_project`.
-2. Ejecutores remotos de los ajustes (HPC, Ray): no se registran en el motor nuevo. Van con el ejecutor remoto.
-3. Log por job: el motor nuevo no tiene.
-4. Los nombres viejos (`submit_job`, `run`, `molsuite.task`, `molsuite.job`, `workflow()`) siguen en el motor viejo. Borrarlo (C2) pide reescribir antes los jobs de AMDockVS con la forma nueva, o aceptar que AMDockVS quede roto un tiempo.
+Borrado (unas 14.000 líneas de `src` y 33 ficheros de test):
+
+- `core/executor` salvo `tools.py` y `provisioning.py`: manager, servicios, adaptadores local, HPC y Ray, despacho, handlers de resultados, monitorización.
+- `core/database/executor.py` y `executor_models.py` (el `executor.db` con SQLModel).
+- `tasking.py`, `job_templates.py`, `specs/workflow.py`, `specs/processor.py`, `progress.py`, `core/callable_refs.py`.
+- De la fachada: `run`, `submit_job`, `molsuite.task`, `molsuite.job`, `wait_for_job`, `get_executor_job`, `get_job_chunks`, eventos y salidas por job, `cancel_job`, `resubmit_job`, estado y matriz de ejecutores, `activate_compute_backend`, registro de HPC y Ray, `get_runtime_healthcheck`, `list_executor_jobs`, `cancel_executor_jobs`, `get_project_switch_status`, `can_switch_project`, `executor_db`, `executor_manager`.
+- Dependencia `tqdm` y el extra `ray`.
+
+Lo que hay ahora:
+
+- `MolSuite.submit(job, params, **opciones)` y `MolSuite.engine` son la única forma de ejecutar. `status`, `wait`, `cancel`, `jobs` y `recorded` son del motor.
+- El diario es `<proyecto>/executor.db`, abierto al primer `submit`. Un fichero de formato viejo da error con el mensaje «is not a version 2 journal: move it away to start a new one». No se migra (decisión cerrada en el documento 02).
+- `close_project` interrumpe los jobs del proyecto (no los cancela); con `cancel_running_tasks=False` falla si queda alguno. `get_project_activity` sale de `engine.jobs()`.
+- `from ms_flow import MolSuite, job, report, task, table_sink, graph_sink, file_sink`, cargados al primer uso. `ms_flow.api` exporta también `JobSnapshot`.
+- `core/executor` queda con `tools.py` y `provisioning.py`, que no son del motor. Su sitio final es `ms_env`.
+
+Se fue con el motor viejo y el nuevo no lo tiene todavía:
+
+1. **Sink de fichero.** `append` y `per_batch` estaban en el handler de resultados. `FileOutputSpec` sigue; falta escribirlo desde `Flow`.
+2. **Jobs que esperan a una instalación** (`depends_on=["tool:<nombre>@<destino>"]`). `tools.install_tool` sigue devolviendo la clave y `get_install` el future; el motor nuevo solo espera a otros jobs (`after=`).
+3. **Ejecutores remotos** (HPC, Ray) y su registro desde los ajustes. Van con el ejecutor remoto (paso 6).
+4. **`finalize` y `setup`**, `workflow()` y las entradas declaradas (`InputSource`, `FileInputSpec`): `specs/input.py`, `specs/output.py` y `core/data` siguen en el paquete, sin nadie del motor que los use.
+5. **Log por job** y `watch_job` (barra de `tqdm`).
+6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen.
+
+Sin tocar, a decidir: la tabla `project_job_index` de `projects.db` (nadie la escribe), los ajustes `operational_limits` y `workers` (nadie los lee en `ms_flow`), los benchmarks sueltos de `benchmarks/*.py` que importan el manager (no están en git) y la documentación de usuario de `docs/` (describe la API vieja; solo se actualizó el README).
 

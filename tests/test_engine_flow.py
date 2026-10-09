@@ -195,7 +195,12 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         # closing the project interrupts its job, with what it delivered written; the same key continues it
         cut = ms.submit(every_ligand, executor="thread", key="again")
         _until(lambda: ms.engine.status(cut).chunks_done >= 20)
+        activity = ms.get_project_activity()
+        assert (activity["active"], activity["can_switch_project"], activity["job_ids"]) == (True, False, [cut])
+        with pytest.raises(RuntimeError, match="active jobs remain"):
+            ms.close_project(cancel_running_tasks=False)
         ms.close_project()
+        assert ms.get_project_activity()["active"] is False
         assert ms.engine.status(cut).status == "interrupted"
         written = sql(db, "SELECT count(*) FROM docking_results")[0][0]
         assert 320 <= written < 600
@@ -204,6 +209,9 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         again = ms.engine.wait(ms.submit(every_ligand, executor="thread", key="again"), 120)
         assert (again.status, again.chunks_done) == ("completed", 300)
         assert sql(db, "SELECT count(*) FROM docking_results") == [(600,)]
+        assert ms.get_project_activity()["jobs_active"] == 0
+        assert [row["status"] for row in ms.engine.recorded("project")] == ["completed"] * 2
+        assert (tmp_path / "one" / "executor.db").exists()
     finally:
         ms.shutdown()
     assert ms._engine is None

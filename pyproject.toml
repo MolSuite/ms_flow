@@ -26,9 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
-# Core runtime: control plane + SQLite-backed persistence. loky is the local
-# compute backend (hard dependency); ray and the PySide6 UI are optional —
-# see [project.optional-dependencies].
+# Core runtime: engine + SQLite-backed projects. loky is the local process pool.
 dependencies = [
     "blinker>=1.6",
     "loky>=3.0",
@@ -36,12 +34,9 @@ dependencies = [
     "sqlalchemy>=2.0",
     "sqlmodel>=0.0.14",
     "toml>=0.10",
-    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
-# Ray executor (native and external modes) for distributed compute.
-ray = ["ray>=2.6"]
 # Test + development tooling.
 dev = ["pytest>=7.0"]
 
