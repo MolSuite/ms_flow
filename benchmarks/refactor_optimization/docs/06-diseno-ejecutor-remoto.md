@@ -1,6 +1,6 @@
 # 06 — Diseño del ejecutor remoto (HPC y Ray)
 
-Estado: **diseño acordado, 2026-10-09**. Recoge lo que Mario explicó ese día y lo aterriza sobre el motor nuevo. Las decisiones están al final: tres las cerró Mario y cuatro quedan con el valor propuesto, que se puede cambiar sin rehacer nada. Se construye en el orden R1-R6.
+Estado: **diseño acordado, 2026-10-09**. Recoge lo que Mario explicó ese día y lo aterriza sobre el motor nuevo. Las decisiones están al final: tres las cerró Mario y cuatro quedan con el valor propuesto, que se puede cambiar sin rehacer nada. Se construye en el orden R1-R6; R1 a R4 y R6 están construidos, R5 espera a un cluster.
 
 ## Lo que dijo Mario
 
@@ -192,7 +192,7 @@ Cada paso se prueba solo y deja algo utilizable.
 | R3 | `ms_flow.runner` con `--ray none` y con Ray local | un directorio de job preparado a mano, en la PC |
 | R4 | `Remote` + gestor `none` + `RemoteExecutor` | de punta a punta contra `localhost` por ssh |
 | R5 | Slurm, y la plantilla que levanta Ray en varios nodos | en el cluster de verdad |
-| R6 | Continuar tras cerrar la aplicación; `setup`; monitor | matar la aplicación con un job en cola y reabrir |
+| R6 ✔ | Continuar tras cerrar la aplicación (`setup` y monitor salieron de aquí) | cerrar con un job en cola y reabrir: se recoge sin enviar nada otra vez |
 
 R1 a R4 no necesitan cluster. R5 necesita acceso a uno.
 
@@ -209,7 +209,7 @@ Añadido el 2026-10-09, antes de R6 y en este orden:
 
 F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExecutor`; tests en `tests/test_files.py` y `tests/test_remote.py`), con estos techos, anotados en el código:
 
-- **Qué hay en memoria a la vez.** El motor entrega a un ejecutor tantas tareas como su `capacity` (en Ray, los núcleos del cluster) y lee por delante el doble; nunca el job entero. En Ray un fichero está en el almacén de objetos mientras alguna tarea en vuelo lo lee, y se suelta con la última: con 5 000 receptores viven los de las tareas que están corriendo. La copia de cada nodo en su temporal sí se queda hasta que lo limpie el sistema (disco, no memoria).
+- **Qué hay en memoria a la vez.** El motor entrega a un ejecutor tantas tareas como su `capacity` (en Ray, los núcleos del cluster) y lee por delante el doble; nunca el job entero. Es el esquema de joblib con una diferencia: lo adelantado (2 × núcleos) espera dentro del motor, ya leído, y el ejecutor tiene solo lo que puede correr; cuando una tarea termina, el motor entrega la siguiente en ese momento. Para que sea Ray quien tenga cola propia, `RayExecutor(capacity=)` por encima de sus núcleos (el límite de tiempo cuenta entonces esa espera). En Ray un fichero está en el almacén de objetos mientras alguna tarea en vuelo lo lee, y se suelta con la última: con 5 000 receptores viven los de las tareas que están corriendo. La copia de cada nodo en su temporal sí se queda hasta que lo limpie el sistema (disco, no memoria).
 - En la cola el job sale de un `tar` en disco, del tamaño que sea. Vuelven en memoria el `tar` de cada sondeo y, en Ray, los bytes de lo que un resultado nombra: lo producido por las tareas de un sondeo o de una tarea, no más.
 - En la cola un job de `ms_flow` es un job del HPC con **todos** sus elementos, salvo que `elements_per_job` diga otra cosa: ahí sí se materializa el job entero en la PC antes de enviarlo.
 - Las marcas se buscan en diccionarios, listas y tuplas del elemento; dentro de otros objetos no se miran.
@@ -228,28 +228,35 @@ S2 está construido (en `test_the_same_jobs_on_ray`):
 - **Límite de tiempo**: `kill()` cancela a la fuerza todo lo que Ray tiene del ejecutor, que es lo que el motor pide a cualquier ejecutor; el elemento que se pasó falla con "timed out" y los demás vuelven a la cola sin cargo. El límite cuenta desde que Ray recibe la tarea: si los elementos piden más núcleos de los que Ray tiene libres, parte del límite se va esperando en Ray.
 - **Progreso**: lo que la task dice con `report()` va, como mucho dos veces por segundo, a un actor del ejecutor; `progress()` responde con lo último que trajo y pide lo nuevo, así que va una consulta por detrás.
 
-## R6: continuar tras cerrar la aplicación (propuesta, sin construir)
+## R6: continuar tras cerrar la aplicación (construido, 2026-10-09)
 
-Hoy cerrar cancela el job de la cola. Mientras no exista lo de abajo es lo correcto: dejarlo correr sin poder recogerlo serían horas de HPC perdidas.
+Mario aprobó las tres decisiones (A, B y C) y está construido, cada parte en su rama local con sus tests.
 
-**Qué cambia**
+**Cómo queda**
 
-1. **El motor distingue interrumpir de cancelar.** Un ejecutor dice que sus tareas viven fuera de este proceso (`outlives = True`). Al interrumpir un job (cerrar la aplicación o el proyecto) el motor no cancela las tareas de ese ejecutor; al cancelarlo, sí.
-2. **El ejecutor recibe la clave del job** (la del diario, `key=`), igual que ya recibe el coste.
-3. **El registro vive en la otra máquina, no en la PC.** El directorio de un job de la cola se llama `<clave del job>-<n>` y guarda, además de lo de ahora, la clave de contenido de cada elemento en orden y el identificador de la cola. No hay fichero local que perder ni que sincronizar, y se puede continuar desde otra PC. Cuesta una orden más al primer envío de cada clave.
-4. **Continuar es reenviar el job con la misma clave**, que es como ya continúa cualquier job. El motor entrega los elementos que el diario no da por hechos; el ejecutor mira qué directorios hay de esa clave y cada elemento que ya está en uno **no se envía**: su resultado se espera de ahí. Lo que terminó con la aplicación cerrada llega en el primer sondeo. Los elementos que no están en ninguno van en un job nuevo.
-5. Para eso `RemoteExecutor` separa lo que hoy es una sola cosa: el job de la cola (lo que se sondea) y la tarea del motor (lo que se responde), unidos elemento a elemento. Al reabrir, los paquetes del motor no coinciden con los de antes.
-6. Un job sin clave no tiene con qué continuar: al cerrar se cancela, como hoy.
+- **Cerrar no para nada (B).** Un job con clave sigue en la cola al cerrar la aplicación o el proyecto. Cancelar lo saca de la cola y borra lo suyo, lo haya enviado esta sesión o una anterior. Un job sin clave no tiene con qué continuar: al cerrar se cancela y se borra, como antes.
+- **Continuar es reenviar con la misma clave.** El motor entrega los elementos que el diario no da por hechos. El ejecutor mira qué hay de esa clave en la otra máquina (una orden, la primera vez que ve la clave) y cada elemento que ya está allí **no se envía**: se espera de donde está. Lo que terminó con la aplicación cerrada llega en el primer sondeo. Lo que no está en ningún sitio va en un job nuevo de la cola. Se puede continuar desde otra PC: el registro está en la otra máquina, no en esta.
+- **`ms.resume(clave)` (A).** `Flow.submit` da clave a todo job que va a un diario y apunta en él con qué se lanzó: la función por su nombre (`módulo:nombre`), los parámetros y las opciones. `Flow.resume(clave, journal=...)` y `Workspace.resume(clave)` lo vuelven a lanzar; lo que no se puede escribir (`on_terminal`, `after`) se pasa de nuevo. Sirve igual para loky. Un job cuya función no es importable o cuyos parámetros no son JSON no se puede continuar así, y lo dice.
+- **`ms.remote_jobs()` y `ms.remove_remote_job(dir)` (C).** Lo que la cuenta tiene en la otra máquina, lo enviara la sesión o el proyecto que fuera y sin proyecto abierto: clave del job, función, total, hechos, estado, si sigue en la cola y si esta sesión lo está esperando. Borrar uno que esta sesión espera se rechaza: eso es cancelar el job.
 
-**Lo que hay que decidir**
+**Qué quedó distinto de la propuesta**
 
-| | Pregunta | Propuesta |
-|---|---|---|
-| A | ¿Quién reenvía al reabrir? Hoy tiene que hacerlo la aplicación, que entonces debe guardar con qué parámetros lanzó cada job | Que lo guarde `ms_flow`: el diario apunta el job y sus parámetros, `ms.resume(clave)` lo vuelve a lanzar y el monitor ofrece "Continuar" en un job interrumpido. Sirve igual para loky |
-| B | ¿Qué hace cerrar con jobs en la cola? | Siguen corriendo. Cancelar es siempre un gesto explícito |
-| C | ¿Y lo que nunca se reabre? Quedan directorios y horas de HPC | `ms.remote_jobs()`: lo que hay en la otra máquina de este usuario, con cancelar y borrar; el monitor lo enseña aunque el proyecto no esté abierto |
+| Propuesta | Construido |
+|---|---|
+| El motor no cancela las tareas al interrumpir | El motor cancela igual (así recupera sus huecos), pero `cancel` sobre una tarea de un job con clave no para nada en la cola. Lo que decide es `ended(clave, kept)`, que el motor dice al terminar el job: con `kept` (interrumpido) lo de la otra máquina sigue; sin él, se para y se borra |
+| Directorio `<clave del job>-<n>` | `<hash de la clave>-<n>`: la clave es texto libre y el nombre entra en órdenes de shell. La clave va dentro, en `record.json`, con las claves de los elementos en orden, los directorios de salida y la hora de envío; `queue.id` guarda el identificador de la cola |
+| El directorio se borra cuando termina el job de la cola | **Lo de un job con clave se queda hasta que el job termina para el motor.** Un resultado recogido y aún no escrito no se pierde si la aplicación muere: se vuelve a leer. Cuesta disco en la otra máquina mientras dura el job |
+| (no estaba) | Un elemento que falló allí no se espera: al continuar se ejecuta otra vez, como en loky. Un job de la cola que se da por perdido queda marcado (`failed`) para que ninguna sesión posterior lo espere, y su directorio se conserva para mirarlo |
+| (no estaba) | Con el gestor `none` los identificadores son pids, que el sistema reutiliza: un pid solo cuenta mientras sea el job (se mira su línea de órdenes antes de darlo por vivo o de matarlo) |
 
-`setup`, los campos del monitor y el log por job salen de R6 y van después, cada uno por su lado.
+**Techos**
+
+- Al recoger un job tras reabrir se leen otra vez **todos** sus resultados, también los que ya se escribieron antes de cerrar (y los ficheros que nombren bajo un `Dir` se traen de nuevo). Los que nadie reclama se guardan en memoria hasta que el job termina. Para resultados pesados, lo siguiente es dejarlos allí y leerlos al reclamarlos.
+- Si la red falla justo al terminar o cancelar un job cuya clave esta sesión no había visto, lo suyo se queda en la otra máquina: aparece en `ms.remote_jobs()`.
+- El botón "Continuar" del monitor y la vista de `remote_jobs` van en `ms_components`, sin hacer.
+- Sigue probado contra esta máquina con `sh`, no por `ssh` ni con Slurm.
+
+`setup`, los campos del monitor y el log por job van después, cada uno por su lado.
 
 ### Estado (2026-10-09)
 
@@ -266,10 +273,10 @@ Cómo se comporta lo construido:
 
 - Un hilo del ejecutor habla con la otra máquina; el motor nunca espera por ella. Enviar es una orden (`mkdir`, `tar xf -`, la del gestor); sondear es otra para todos los jobs (quién sigue en la cola y un `tar` con el progreso, los errores y las partes nuevas).
 - Un job que sale de la cola sin haber terminado y **más lejos de donde estaba** al enviarlo (se le acabó el tiempo) se envía otra vez sobre el mismo directorio y el runner continúa. Si sale sin haber avanzado, el job falla con lo que dijo el runner y su directorio se queda en la otra máquina para mirarlo.
-- Lo que termina bien no deja nada en la otra máquina. Cancelar para el job en la cola y borra su directorio. **Cerrar la aplicación o el proyecto también lo cancela y lo borra** (medido el 2026-10-09; aquí ponía lo contrario): al interrumpir un job el motor cancela lo que tiene en vuelo, en cualquier ejecutor. Que siga corriendo es R6.
+- Lo que termina bien no deja nada en la otra máquina. Cancelar para el job en la cola y borra su directorio. Cerrar la aplicación o el proyecto deja corriendo el job que tiene clave y cancela y borra el que no la tiene (R6, más arriba).
 - Un elemento que falla y se reintenta desde la PC va en un job del HPC propio. Los reintentos dentro del mismo job del HPC no están: `stage` los admite, el ejecutor no los pasa.
 
-Falta, además de R5 y R6: el log por job. Los ficheros de entrada y el registro desde los ajustes llegaron con F1-F4 y S1.
+Falta, además de R5: el log por job, `setup` y lo del monitor. Los ficheros de entrada y el registro desde los ajustes llegaron con F1-F4 y S1.
 
 ## Para el artículo
 
