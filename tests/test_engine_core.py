@@ -1,5 +1,6 @@
 """The new engine core (`ms_flow.engine`): counters, admission by tokens, feeders, keys, worker death, cancel."""
 import os
+import queue
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,33 @@ def _half_then_held(payload):
     while payload["held"] and not os.path.exists(payload["gate"]):
         time.sleep(0.01)
     return payload["idx"]
+
+
+class _Trickle:
+    """An executor that runs nothing: the test plays the remote side and says how each chunk ended."""
+
+    capacity, uses_tokens = 1, False
+
+    def __init__(self):
+        self.tasks = queue.Queue()
+
+    def bind(self, on_done):
+        self.on_done = on_done
+
+    def bind_parts(self, on_part):
+        self.on_part = on_part
+
+    def submit(self, fn, payload, tag):
+        self.tasks.put(([payload], tag))
+
+    def submit_many(self, fn, payloads, tag, whole=False):
+        self.tasks.put((payloads, tag))
+
+    def cancel(self, handle):
+        pass
+
+    def shutdown(self):
+        pass
 
 
 class _Gauge:
@@ -433,3 +461,25 @@ def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
         assert engine.status(unknown).progress is None
         ended.set()
         assert engine.wait(unknown, 30).progress == 1.0
+
+
+def test_the_chunks_of_a_task_can_end_ahead_of_it():
+    remote, got = _Trickle(), []
+    with Engine(cpus=1) as engine:
+        engine.register("remote", remote)
+        job = engine.submit("remote", _echo, ["a", "b", "c"], batch=3, retries=1, retry_wait=0,
+                            on_result=lambda key, result: got.append(result))
+        payloads, task = remote.tasks.get(timeout=5)
+        assert payloads == ["a", "b", "c"]
+        remote.on_part(task, 0, "error", None, "no luck")  # the one the task goes by: it runs again
+        remote.on_part(task, 1, "done", "B", None)
+        while engine.status(job).chunks_done < 1:  # counted and delivered with its task still running
+            time.sleep(0.005)
+        assert got == ["B"] and remote.tasks.empty()
+        remote.on_done(task, "done", [("never", None), None, ("C", None)], None, 0)
+        payloads, again = remote.tasks.get(timeout=5)
+        assert payloads == ["a"] and again is not task
+        remote.on_done(again, "done", "A", None, 0)
+        end = engine.wait(job, timeout=5)
+    assert (end.status, end.chunks_done, end.chunks_failed, end.chunks_retried) == ("completed", 3, 0, 1)
+    assert sorted(got) == ["A", "B", "C"]

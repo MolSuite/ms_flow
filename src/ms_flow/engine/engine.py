@@ -168,6 +168,8 @@ class Engine:
     def register(self, name: str, executor) -> None:
         """Add an executor (see `executors` for the contract)."""
         executor.bind(self._chunk_done)
+        if hasattr(executor, "bind_parts"):
+            executor.bind_parts(self._part_done)
         self._executors = {**self._executors, name: _Slot(executor)}  # the loop iterates the old one
 
     def attach(self, name: str, path) -> None:
@@ -470,6 +472,21 @@ class Engine:
         """What executors call. Any thread."""
         self._events.put((self._on_done, chunk, status, result, error, peak_mb))
 
+    def _part_done(self, chunk, index, status, result, error) -> None:
+        """What executors call for one chunk of a task that is still running. Any thread."""
+        self._events.put((self._on_part, chunk, index, status, result, error))
+
+    def _on_part(self, chunk: _Chunk, index: int, status: str, result, error) -> None:
+        job = chunk.job
+        member = chunk.pack and chunk.pack[index]
+        if job.status != RUNNING or not member:
+            return
+        chunk.pack[index] = None  # ended: the task has nothing more to say of it
+        if member is chunk:  # the task still goes by this one, so what ends, and may run again, is its twin
+            member = _Chunk(job, chunk.key, chunk.payload, chunk.cost)
+            member.attempt = chunk.attempt
+        self._chunk_ended(member, status, result, error)
+
     def _on_done(self, chunk: _Chunk, status: str, result, error, peak_mb: int) -> None:
         job = chunk.job
         slot = job.slot
@@ -498,16 +515,19 @@ class Engine:
                     job.window = 2 * slot.impl.capacity * job.pack
         if status == LOST and chunk.spared:  # it fell with a chunk the engine stopped
             for member in reversed(pack or (chunk,)):
-                self._requeue(member)
+                if member is not None:
+                    self._requeue(member)
         elif pack is None:
             self._chunk_ended(chunk, status, result, error)
-        elif status == DONE:  # the task ran: every chunk has its own outcome
-            for member, (value, failure) in zip(pack, result):
-                self._chunk_ended(member, ERROR if failure else DONE, value, failure)
+        elif status == DONE:  # the task ran: every chunk has its own outcome, unless it ended ahead
+            for member, outcome in zip(pack, result):
+                if member is not None:
+                    self._chunk_ended(member, ERROR if outcome[1] else DONE, *outcome)
         else:  # lost, or stopped for running late: which one did it shows when each runs alone
             chunk.doomed = None
             for member in pack:
-                self._chunk_ended(member, status, None, error)
+                if member is not None:
+                    self._chunk_ended(member, status, None, error)
 
     def _chunk_ended(self, chunk: _Chunk, status: str, result, error) -> None:
         job = chunk.job

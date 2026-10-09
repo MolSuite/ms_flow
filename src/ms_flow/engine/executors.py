@@ -15,6 +15,11 @@ The engine knows an executor only through this contract:
   the executors where a task costs more than a short chunk. Its `DONE` result is one
   `(result, error)` per payload, in order; any other status speaks for all of them. With
   `whole`, `fn` is called once with the list and returns one result per payload.
+- `bind_parts(on_part)`, optional, called once at registration: for the executors that learn how
+  each chunk of a `submit_many` task ended before the task is over. They call
+  `on_part(tag, index, status, result, error)`, with `DONE` or `ERROR`, for the chunk at `index`
+  of the payloads, at most once and before `on_done`; whatever `on_done` then says of that chunk
+  is ignored.
 - `kill()`, optional: stop whatever is running, now. Every chunk in flight comes back `LOST`.
   Without it a chunk cannot have a time limit, and one that started runs to its end.
 - `progress(owner) -> float`, optional: how many chunks' worth of work the tasks in flight that
