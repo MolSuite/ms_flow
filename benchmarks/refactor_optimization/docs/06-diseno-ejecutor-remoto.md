@@ -136,6 +136,51 @@ Lo acordado en el documento 05 más lo propio del remoto: nombre del ejecutor, f
 
 Primera versión: el usuario indica en los ajustes del ejecutor las líneas que activan el entorno (`module load`, `conda activate`), y un paso `setup` comprueba que `ms_flow`, el paquete de la aplicación y las herramientas están y en qué versión. Crear e instalar entornos remotos es de `ms_env`, aplazado.
 
+## Quién hace de `process`
+
+Decidido con Mario el 2026-10-09. Los jobs piden su ejecutor por nombre y casi todos piden `process`. Lo que cambia de una instalación a otra es **quién está registrado con ese nombre**, y es uno solo cada vez:
+
+| Ajuste | Quién hace de `process` | Para qué |
+|---|---|---|
+| `process` (por defecto en una PC) | loky | la PC sola |
+| `ray` + dirección | `RayExecutor` | la PC más las PC de la red (la PC es un nodo más), un cluster de Ray ajeno a la PC, o los nodos reservados de un HPC |
+| `queue` + gestor + plantilla (+ máquina) | `RemoteExecutor` | con máquina, el HPC por `ssh`; sin máquina, la cola del HPC en el que ya se está |
+
+- **Ray en local es una sustitución, nunca un segundo ejecutor.** Con loky y Ray a la vez en la misma PC habría dos contables de los mismos núcleos (el motor y Ray). Sustituyendo, solo cuenta Ray, que ya sabe qué tiene cada nodo, la PC incluida. Se descarta la reserva de recursos locales que se llegó a proponer.
+- **Se cambia sin jobs activos.** El motor se niega a cambiar el ejecutor de un nombre mientras tenga tareas suyas.
+- **Todo job vale con el ejecutor que haya.** Es la regla del documento 05 (un worker recibe datos y ficheros declarados, y devuelve filas): un job que la cumple corre igual en loky, en Ray o en una cola. No se construye la forma de fijar un job a un nodo. Lo que sí se exige es el mismo entorno (Python, paquetes, herramientas) en todos los nodos.
+- `thread` sigue en local para lo ligero. Con Ray sustituyendo hay que darle lo que hoy solo tiene loky: límite de tiempo por elemento y progreso dentro de un elemento.
+
+### `ms_flow` dentro del HPC
+
+Quien abre una notebook en el HPC ya está "en local" allí: no hay `ssh` ni copia de ficheros, y el disco es compartido.
+
+| Dónde se está | Quién hace de `process` | Estado |
+|---|---|---|
+| Nodo de login | `queue` sin máquina: `RemoteExecutor(host=None, scheduler="slurm")` | Construido (es el camino de los tests de R4); falta ejecutar la entrada de Slurm |
+| Nodos reservados (`salloc`, o dentro de un job) | `ray` sobre esos nodos, con el disco compartido | `RayExecutor` existe; falta la receta que levanta Ray en los nodos, la misma de la plantilla de R5 |
+| Un nodo de cómputo libre | `process` (loky) | Funciona; el motor tiene que contar los núcleos que dio la cola (`sched_getaffinity`) y no los del nodo |
+
+**En un nodo de login no corre loky.** Se reconoce sin configurar nada en Slurm (existe `sbatch` y no hay `SLURM_JOB_ID`): ahí el workspace no registra loky y pide elegir `queue` o `ray`. Forzarlo es una opción explícita.
+
+## Ficheros declarados
+
+Una ruta en un elemento solo vale donde existe el fichero. AMDockVS ya lo declara (`core/worker_io.py`: `worker_file`, `worker_output_dir`); con el motor nuevo son dos marcas, las dos `str`, así que donde el disco es el mismo no hay nada que hacer y la task las usa como rutas:
+
+| Marca | Qué declara | Donde el disco no es el mismo |
+|---|---|---|
+| `File(ruta)` | un fichero que la task lee | el ejecutor lo lleva, una vez aunque lo compartan muchos elementos, y la task recibe la ruta que tiene allí |
+| `Dir(ruta)` | un directorio donde la task deja ficheros | la task recibe un directorio de allí; lo que deja en él vuelve a `ruta`, y las rutas de allí que aparezcan en el resultado se cambian por las de aquí |
+
+| Ejecutor | Entradas (`File`) | Salidas (`Dir`) |
+|---|---|---|
+| loky, `thread` | la ruta tal cual | la ruta tal cual |
+| Ray o cola con disco compartido (`shared=True`; por defecto en la cola sin máquina) | la ruta tal cual | la ruta tal cual |
+| Ray sin disco compartido | los bytes van una vez al almacén de objetos; cada nodo los deja en un temporal la primera vez que los necesita | los bytes vuelven con el resultado |
+| Cola por `ssh` | van en el `tar` del job, bajo `files/` | vuelven en el `tar` del sondeo, antes que los resultados que los nombran |
+
+Solo los ejecutores que llevan ficheros recorren el elemento buscando marcas: el camino local no paga nada.
+
 ## Orden de construcción
 
 Cada paso se prueba solo y deja algo utilizable.
@@ -150,6 +195,17 @@ Cada paso se prueba solo y deja algo utilizable.
 | R6 | Continuar tras cerrar la aplicación; `setup`; monitor | matar la aplicación con un job en cola y reabrir |
 
 R1 a R4 no necesitan cluster. R5 necesita acceso a uno.
+
+Añadido el 2026-10-09, antes de R6 y en este orden:
+
+| Paso | Qué | Cómo se comprueba |
+|---|---|---|
+| F1 | Las marcas `File` y `Dir` | tests: en local son rutas |
+| F2 | `File` en la cola por `ssh` y en el runner | test de R4 con un fichero que solo existe "aquí" |
+| F3 | `File` en Ray sin disco compartido | Ray local, con el fichero borrado antes de que corra la task |
+| F4 | `Dir` en los dos | lo que la task deja aparece en la ruta de aquí |
+| S1 | El ajuste de quién hace de `process`, el cambio sin jobs activos y el bloqueo de loky en el nodo de login | tests del workspace |
+| S2 | Límite de tiempo y progreso por elemento en Ray | los tests que ya pasan con loky |
 
 ### Estado (2026-10-09)
 
