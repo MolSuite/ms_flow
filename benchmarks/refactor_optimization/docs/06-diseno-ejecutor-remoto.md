@@ -1,6 +1,6 @@
 # 06 — Diseño del ejecutor remoto (HPC y Ray)
 
-Estado: **propuesta, 2026-10-09**. Recoge lo que Mario explicó ese día y lo aterriza sobre el motor nuevo. Nada está construido. Las decisiones abiertas están al final; no se escribe código hasta cerrarlas.
+Estado: **diseño acordado, 2026-10-09**. Recoge lo que Mario explicó ese día y lo aterriza sobre el motor nuevo. Las decisiones están al final: tres las cerró Mario y cuatro quedan con el valor propuesto, que se puede cambiar sin rehacer nada. Se construye en el orden R1-R6.
 
 ## Lo que dijo Mario
 
@@ -12,6 +12,15 @@ Estado: **propuesta, 2026-10-09**. Recoge lo que Mario explicó ese día y lo at
 - Para el segundo tipo de trabajo, cuando haga falta, no se levanta Ray.
 - En teoría es lo mismo que ejecutar en Ray sobre las PC de la red; cambia que en local `ms_flow` habla con el cliente de Ray directamente y en el HPC no.
 - Por discutir: si el fichero lleva los payloads o si se generan al vuelo como en local.
+
+Y al responder a las preguntas de este documento:
+
+- **Cada cluster es distinto y hay que adaptarse a todos.** No se diseña para uno.
+- La PC entra por `ssh` al **nodo de login**. Desde ahí pregunta al gestor de colas por el estado de los jobs y lee **ficheros de estado** para saber cómo avanza cada uno en tiempo real.
+- **Nada de servicios en el HPC.** Se podría levantar un servidor, pero muchos clusters los bloquean, y más en el nodo de login.
+- Que él sepa no hay doble factor. Los nodos de cómputo deberían verse entre sí, igual que hace falta para MPI. No hay disco compartido con la PC.
+- Un job del HPC por job de `ms_flow` es lo normal, pero **no se limita**: el cluster deja encolar cientos y cada uno calcula cuando le toca en su cola.
+- Transporte: usaba `paramiko` por ser fácil de configurar; deja la elección abierta.
 
 ## La idea
 
@@ -45,9 +54,9 @@ Con esto no se reinventa nada: Ray reparte entre nodos; el `Engine` del runner p
 | Pieza | Dónde corre | Qué hace | Tamaño estimado |
 |---|---|---|---|
 | `RayExecutor` | PC o runner | El contrato de `executors.py` sobre `ray.remote`. Sirve tal cual para las PC de la red (`ray.init(address=...)` desde el escritorio) y dentro del runner | pequeño |
-| `ms_flow.runner` | HPC | `python -m ms_flow.runner <dir>`: levanta o se une a Ray, crea el `Engine`, lee `elements.bin`, ejecuta, escribe partes de resultados, progreso y errores | pequeño |
-| `Remote` | PC | Hablar con la máquina: ejecutar una orden y copiar ficheros. Primera versión: `ssh` y `rsync` del sistema | pequeño |
-| Gestor de colas | PC | Tres órdenes: enviar, estado, cancelar. Slurm primero; `none` (un `nohup` por ssh) para una estación sin cola | pequeño |
+| `ms_flow.runner` | HPC | `python -m ms_flow.runner <dir>`: se une a Ray si hay, crea el `Engine`, lee `elements.bin`, ejecuta, escribe partes de resultados, progreso y errores | pequeño |
+| `Remote` | PC | Hablar con el nodo de login: ejecutar una orden con entrada y salida. Los ficheros viajan como un `tar` por esa misma orden. `ssh` del sistema | pequeño |
+| Gestor de colas | PC | Una entrada por gestor: las tres órdenes (enviar, estado, cancelar) y cómo leer su salida. Slurm primero; `none` (un `nohup` por ssh) para una estación sin cola | pequeño |
 | `RemoteExecutor` | PC | Junta elementos en un job del HPC, lo prepara y envía, sondea, trae partes y entrega cada elemento al motor | mediano |
 | Ajustes | PC | Definición de cada ejecutor remoto: máquina, directorio, plantilla, recursos, lote, entorno | pequeño |
 
@@ -71,7 +80,7 @@ Un directorio por job del gestor de colas, bajo el directorio de trabajo configu
 ### El runner
 
 1. Lee `spec.json` e importa la función por su nombre. La función tiene que existir en el entorno del HPC: paquete instalado, misma versión (lo comprueba y falla con un mensaje claro si no).
-2. Ray, según `--ray`: `auto` levanta la cabeza en el primer nodo y un worker en cada uno de los demás con lo que diga la plantilla (`srun` en Slurm); `address` se une a uno que ya existe; `none` no usa Ray y corre con el pool de procesos en un nodo. Este último es también el camino del "otro tipo de trabajo": un job que es un solo cálculo grande no levanta cluster.
+2. Ray, según `--ray`: una dirección se une al cluster que la plantilla ya levantó (la cabeza en el primer nodo y un worker en cada uno de los demás, con `srun` en Slurm); `none` no usa Ray y corre con el pool de procesos en un nodo. Este último es también el camino del "otro tipo de trabajo": un job que es un solo cálculo grande no levanta cluster.
 3. Crea el `Engine` con el diario en `journal.db` y la clave del job. Si la cola mata el job y se reenvía, continúa: no repite los elementos hechos.
 4. Fuente: `elements.bin`, leído de uno en uno. Destino: una parte de resultados que se cierra cada N elementos o T segundos (renombrado atómico), para que desde fuera solo se vean partes completas.
 5. Escribe `progress.json` cada pocos segundos y una línea en `errors.jsonl` por elemento que falla del todo.
@@ -85,6 +94,28 @@ Un directorio por job del gestor de colas, bajo el directorio de trabajo configu
 - Cancelar: `scancel` y se recoge lo terminado.
 
 Esto pide **un cambio en el contrato de ejecutores**: hoy una tarea de varios elementos devuelve todos sus resultados al acabar. Hace falta que el ejecutor pueda dar por terminado cada elemento de una tarea cuando lo sabe, no al final. Es el único cambio en el `Engine`; el resto son piezas nuevas alrededor.
+
+### Adaptarse a cada cluster
+
+Lo que cambia de un cluster a otro queda en tres sitios, y los tres son datos del ejecutor en los ajustes, no código:
+
+| Qué cambia | Dónde se pone |
+|---|---|
+| Cómo se entra (usuario, salto por otra máquina, clave) | el `~/.ssh/config` del usuario; el ejecutor solo guarda el nombre de la máquina |
+| El gestor de colas (Slurm, PBS, SGE, LSF) | una entrada con tres órdenes y la forma de leer el identificador y el estado. Se entrega la de Slurm; otra es añadir una entrada |
+| Cómo se piden recursos, se activa el entorno y se levanta Ray | la plantilla de `job.sh`, que es un fichero de texto del usuario. Se entrega una para Slurm |
+
+Un cluster cuyos nodos no se vean entre sí, o que no deje a Ray abrir sus puertos, no rompe el diseño: se usa `--ray none` con jobs de un nodo. Como no hay límite de jobs encolados, **muchos jobs de un nodo sin Ray** es una forma tan válida de repartir como un job de muchos nodos con Ray, y la más simple. Ray hace falta solo cuando se reserva más de un nodo por job.
+
+### Sin servicios en el HPC
+
+Nada queda escuchando. Ray, cuando se usa, vive dentro de la reserva del job, en los nodos de cómputo, y muere con él; nunca en el nodo de login. Todo lo que la PC sabe lo saca de una orden por `ssh` que termina:
+
+- **Enviar**: una conexión. Por la entrada de la orden va un `tar` con `spec.json`, `elements.bin`, `job.sh` y los ficheros de entrada; la orden lo desempaqueta y llama al gestor de colas.
+- **Sondear**: una conexión para todos los jobs del ejecutor. Devuelve el estado en la cola, cada `progress.json` y, en un `tar` por la salida, las partes de resultados cerradas que la PC aún no tiene.
+- **Cancelar**: una conexión.
+
+Con un sondeo cada 30 s son dos conexiones por minuto al nodo de login, hagan falta uno o cien jobs.
 
 ## Payloads en el fichero o generados al vuelo
 
@@ -113,7 +144,7 @@ Cada paso se prueba solo y deja algo utilizable.
 | R2 | `RayExecutor` | los tests de ejecutores, contra un Ray local; mismo job en `process` y en `ray` |
 | R3 | `ms_flow.runner` con `--ray none` y con Ray local | un directorio de job preparado a mano, en la PC |
 | R4 | `Remote` + gestor `none` + `RemoteExecutor` | de punta a punta contra `localhost` por ssh |
-| R5 | Slurm, plantilla y `--ray auto` en varios nodos | en el cluster de verdad |
+| R5 | Slurm, y la plantilla que levanta Ray en varios nodos | en el cluster de verdad |
 | R6 | Continuar tras cerrar la aplicación; `setup`; monitor | matar la aplicación con un job en cola y reabrir |
 
 R1 a R4 no necesitan cluster. R5 necesita acceso a uno.
@@ -122,12 +153,17 @@ R1 a R4 no necesitan cluster. R5 necesita acceso a uno.
 
 Usar Ray por dentro cambia cómo se cuenta: `ms_flow` no compite con Ray como planificador distribuido, lo usa. Lo que aporta encima es el diario y la continuación, los sinks, los tokens locales, la aplicación de escritorio que se cierra y vuelve, y una sola forma de escribir el job para la PC y el HPC. Las medidas externas quedan en dos: el coste de orquestar en local frente a joblib/loky, Dask y Ray local; y el coste de `ms_flow` sobre Ray frente a Ray solo.
 
-## Decisiones abiertas
+## Decisiones
 
-1. **¿Un job del HPC por job de `ms_flow`, o varios?** Propuesta: lo decide la configuración del ejecutor (elementos por job del HPC y cuántos a la vez); por defecto uno solo. Depende de los límites de tiempo y de cola del cluster.
-2. **Transporte.** Propuesta: `ssh` y `rsync` del sistema, con las claves y el `~/.ssh/config` del usuario (una conexión persistente sirve también donde hay doble factor). Sin dependencia nueva. Alternativa: una biblioteca (`asyncssh`, `paramiko`).
-3. **Datos del cluster**, que no conozco: gestor de colas (¿Slurm?), si el acceso pide doble factor, si los nodos de cómputo se ven entre sí por TCP (Ray lo necesita) y si tienen salida a internet, y si hay un sistema de ficheros compartido con la PC.
-4. **Formato de `elements.bin` y de las partes.** Propuesta: pickle, como hacia un worker local; exige la misma versión mayor de Python y de los paquetes en los dos lados, y confiar en la cuenta propia del cluster.
-5. **Cada cuánto se cierra una parte de resultados** (elementos o segundos) y cada cuánto se sondea. Propuesta: 30 s las dos, configurables por ejecutor.
-6. **Quién levanta Ray en los nodos**: el runner (`--ray auto`, cómodo en Slurm) o la plantilla de `sh` (más adaptable a cada sitio). Propuesta: la plantilla manda; `auto` es lo que trae la plantilla de Slurm que se entrega.
-7. **Payloads**: lo propuesto arriba (fichero por job del HPC, generado al vuelo en la PC).
+Cerradas por Mario (2026-10-09):
+
+1. **Jobs del HPC por job de `ms_flow`.** Por defecto uno. Dos ajustes del ejecutor lo cambian: cuántos elementos lleva cada job del HPC (por defecto, todos) y cuántos jobs puede tener a la vez en la cola (por defecto, **sin límite**).
+2. **Transporte: `ssh` del sistema**, y nada más. Usa las claves, el agente y el `~/.ssh/config` que el usuario ya tiene, saltos incluidos; no añade dependencias; existe en Linux, macOS y Windows 10 en adelante. Los ficheros van como `tar` por la misma conexión (`tarfile` en la PC, `tar` en el HPC), así que no hace falta `rsync` ni `scp`. Pide acceso por clave: sin terminal no se puede escribir una contraseña, y el ejecutor lo dice claro si la máquina la pide. Un cluster que solo admita contraseña sería el motivo para añadir `paramiko`; `Remote` son dos funciones, se cambia ahí.
+3. **El cluster.** No se asume ninguno: entrada por `ssh` al nodo de login, sondeo con órdenes del gestor de colas y ficheros de estado, ningún servicio, ningún disco compartido con la PC. Que los nodos se vean entre sí se comprueba al levantar Ray; si no, jobs de un nodo.
+
+Tomadas con el valor propuesto, a falta de que Mario diga otra cosa:
+
+4. **Formato de `elements.bin` y de las partes: pickle**, como hacia un worker local. `spec.json` lleva la versión de Python y la de `ms_flow`, y el runner se niega a arrancar si no coinciden.
+5. **Cadencia: 30 s** para cerrar una parte de resultados y para sondear, configurables por ejecutor.
+6. **Ray lo levanta la plantilla**, no el runner. La de Slurm que se entrega lo hace con `srun`; el runner recibe la dirección o `--ray none`.
+7. **Payloads**: un fichero de elementos por job del HPC, generado al vuelo en la PC y borrado con su directorio.
