@@ -19,6 +19,18 @@ def die_on_7(payload: dict) -> dict:
     return {"ok": 1}
 
 
+def read(payload: dict) -> dict:
+    with open(payload["path"]) as file:
+        return {"path": str(payload["path"]), "text": file.read()}
+
+
+def leave(payload: dict) -> dict:
+    path = os.path.join(payload["out"], f"{payload['n']}.txt")
+    with open(path, "w") as file:
+        file.write(str(payload["n"]))
+    return {"made": path}
+
+
 def nap(payload: dict) -> dict:
     time.sleep(float(payload["s"]))
     return {"ok": 1}

@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import queue
 import shlex
 import subprocess
@@ -26,6 +27,7 @@ import uuid
 from pathlib import Path
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
+from ms_flow.engine.files import Dir, File, swap
 from ms_flow.runner import read_part, stage
 
 log = logging.getLogger(__name__)
@@ -72,11 +74,12 @@ class _Sent:
     """A task of the engine as a job in the queue."""
 
     __slots__ = ("tag", "fn", "payloads", "whole", "single", "cost", "dir", "id", "parts", "errors", "left",
-                 "done", "ending", "canceled", "outcome")
+                 "done", "ending", "canceled", "outcome", "dirs")
 
     def __init__(self, tag, fn, payloads, whole, single, cost):
         self.tag, self.fn, self.payloads, self.whole, self.single, self.cost = tag, fn, payloads, whole, single, cost
         self.dir = self.id = self.outcome = None
+        self.dirs = {}  # where its tasks write over there -> the directory here that it stands for
         self.parts = self.errors = self.done = 0  # the last part fetched, the error lines read, what it had done when sent
         self.left = set(range(len(payloads)))  # the elements nothing is known of yet
         self.ending = self.canceled = False
@@ -91,7 +94,10 @@ class RemoteExecutor:
     jobs it has there at once, any number by default.
 
     The function has to be importable on the other side, and an element that fails and is tried
-    again goes in a job of its own.
+    again goes in a job of its own. Each `File` in an element travels with the job, once however
+    many elements name it, and what a result names under a `Dir` comes back before the result is
+    given, unless `shared` says that the other side sees the disk of this one (as it does without
+    a `host`).
     """
 
     # ponytail: no `kill` (no time limit: the queue has its own) and no `progress` inside an element.
@@ -100,11 +106,11 @@ class RemoteExecutor:
     def __init__(self, host: str | None = None, *, workdir: str = "ms_flow_jobs", scheduler: str = "none",
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
-                 part_seconds: float = 30):
+                 part_seconds: float = 30, shared: bool | None = None):
         self.remote, self.workdir, self.queue = Remote(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
-        self.poll_s, self.part_seconds = poll_s, part_seconds
+        self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
         self._inbox, self._wake, self._closed = queue.SimpleQueue(), threading.Event(), False
         self._thread = threading.Thread(target=self._watch, name="msflow-remote", daemon=True)
         self._thread.start()
@@ -165,12 +171,29 @@ class RemoteExecutor:
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 cpu, gpu, mem_mb = sent.cost
-                stage(tmp, sent.fn, sent.payloads, batched=sent.whole, part_seconds=self.part_seconds,
+                payloads, carried = sent.payloads, {}
+
+                def carry(mark):
+                    if isinstance(mark, Dir):
+                        there = next((there for there, here in sent.dirs.items() if here == mark), f"out/{len(sent.dirs)}")
+                        sent.dirs[there] = str(mark)
+                        return Dir(there)
+                    if mark not in carried:
+                        carried[mark] = f"files/{len(carried)}/{os.path.basename(mark)}"
+                    return File(carried[mark])
+
+                if not self.shared:
+                    payloads = [swap(payload, carry) for payload in payloads]
+                stage(tmp, sent.fn, payloads, batched=sent.whole, part_seconds=self.part_seconds,
                       cpu=cpu, gpu=gpu, mem_mb=mem_mb)
                 Path(tmp, "job.sh").write_text(self.script)
+                # ponytail: the whole job in memory, its files too; a file on disk fed to the command
+                # when what an element reads is counted in gigabytes.
                 packed = io.BytesIO()
-                with tarfile.open(fileobj=packed, mode="w") as tar:
+                with tarfile.open(fileobj=packed, mode="w", dereference=True) as tar:
                     tar.add(tmp, arcname=".")
+                    for here, there in carried.items():
+                        tar.add(here, arcname=there)
             sent.dir = uuid.uuid4().hex[:12]
             where = f"{self.workdir}/{sent.dir}"
             sent.id = self._queue(f"mkdir -p {where} && cd {where} && tar xf -", packed.getvalue())
@@ -216,16 +239,22 @@ class RemoteExecutor:
             self.remote.run(f"cd {self.workdir} && rm -rf {' '.join(gone)}")
 
     def _read(self, sent: _Sent, files: dict, queued: bool, gone: list) -> None:
-        for name in sorted(name for name in files if name.startswith(f"{sent.dir}/results/")):
-            for index, result in read_part(io.BytesIO(files[name])):
-                self._end(sent, index, DONE, result, None)
-            sent.parts = max(sent.parts, int(name[-9:-4]))
+        told = json.loads(files.get(f"{sent.dir}/progress.json") or b"{}")
+        parts = sorted(name for name in files if name.startswith(f"{sent.dir}/results/"))
+        if parts and sent.dirs and "home" not in told:
+            return  # not yet known where its tasks write: the next round reads these parts
+        pairs = [pair for name in parts for pair in read_part(io.BytesIO(files[name]))]
+        if pairs and sent.dirs:
+            pairs = self._bring(sent, told["home"], pairs)
+        for index, result in pairs:
+            self._end(sent, index, DONE, result, None)
+        if parts:
+            sent.parts = max(sent.parts, int(parts[-1][-9:-4]))
         lines = files.get(f"{sent.dir}/errors.jsonl", b"").splitlines()
         for line in lines[sent.errors:]:
             row = json.loads(line)
             self._end(sent, row["index"], ERROR, None, row["error"])
         sent.errors = len(lines)
-        told = json.loads(files.get(f"{sent.dir}/progress.json") or b"{}")
         over = told.get("status") in ("completed", "completed_with_errors", "failed")
         if queued and not over:
             sent.ending = False
@@ -244,6 +273,31 @@ class RemoteExecutor:
             why = told.get("error") or "the job left the queue before its end, no further than when it was sent"
             self._over(sent, ERROR, None, f"{why}\nits directory is kept: {self.workdir}/{sent.dir} "
                                           f"on {self.remote.host or 'this machine'} (see runner.log)")
+
+    def _bring(self, sent: _Sent, home: str, pairs: list) -> list:
+        """The results with the paths they have here, once what they name is here."""
+        root, wanted = f"{home}/out/", set()
+
+        def here(text):
+            if not text.startswith(root):
+                return text
+            n, _, rest = text[len(root):].partition("/")
+            wanted.add(f"{sent.dir}/out/{n}/{rest}")
+            return os.path.join(sent.dirs[f"out/{n}"], rest)
+
+        pairs = [(index, swap(result, here, str)) for index, result in pairs]
+        if wanted:
+            # What a result names and is not there is the task's to explain, not a reason to stop.
+            packed = self.remote.run(f"cd {self.workdir} && tar cf - --ignore-failed-read -T - 2>/dev/null || :",
+                                     "\n".join(sorted(wanted)).encode())
+            for name, data in _untar(packed).items():
+                n, _, rest = name[len(sent.dir) + 5:].partition("/")
+                if ".." in rest.split("/"):
+                    raise RemoteError(f"a file that would land outside its directory: {name}")
+                target = Path(sent.dirs[f"out/{n}"], rest)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        return pairs
 
     def _end(self, sent: _Sent, index: int, status: str, result, error) -> None:
         if index in sent.left:  # a part that a killed run wrote twice says it twice

@@ -35,8 +35,10 @@ knows whether the chunk ran) or `CANCELED`.
 """
 from __future__ import annotations
 
+import hashlib
 import mmap
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -44,6 +46,8 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+
+from .files import Dir, swap
 
 try:
     import resource
@@ -158,22 +162,30 @@ class RayExecutor:
     `address=None` starts a cluster on this machine and stops it at `shutdown`; `"auto"` or
     `host:port` joins one that is running, on this machine or on others. What `ray.init` takes
     goes through. The functions and what they import have to be installed on every node.
+
+    `shared` says that every node sees the disk of this machine, as a cluster started here does.
+    Without it each `File` of an element goes once to Ray's object store and a node keeps its
+    copy in its temporary directory, and what a result names under a `Dir` comes back with it.
     """
 
     # ponytail: no `kill`, so no time limit for a chunk on Ray, and no `progress`. A forced
     # `ray.cancel` of each task in flight is the first; the second needs a way back from the nodes.
     uses_tokens, wants_cost = False, True
 
-    def __init__(self, address: str | None = None, capacity: int | None = None, **init):
+    def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None, **init):
         import ray
 
-        self._ray = ray
+        self._ray, self.shared = ray, address is None if shared is None else shared
+        # ponytail: a file stays in the object store until `shutdown`; let go of those of a job
+        # when it ends once a library of one file per element fills the store.
+        self._carried = {}  # (path, when it changed, size) -> _Carried
         ray.init(address=address, **{"include_dashboard": False, "log_to_driver": False, **init})
         # How many tasks are handed to Ray at once: it queues those it has no room for.
         self.capacity = capacity or int(ray.cluster_resources().get("CPU", 1))
         self._lost = (ray.exceptions.WorkerCrashedError, ray.exceptions.NodeDiedError,
                       ray.exceptions.ObjectLostError, ray.exceptions.OutOfMemoryError)
-        self._run = ray.remote(max_retries=0)(_apply)  # the engine is the one that runs a chunk again
+        # max_retries=0: the engine is the one that runs a chunk again
+        self._run = ray.remote(max_retries=0)(_apply if self.shared else _apply_far)
         self._sized = {}  # cost -> `_run` asking Ray for that much
 
     def bind(self, on_done) -> None:
@@ -185,17 +197,49 @@ class RayExecutor:
             cpu, gpu, mem_mb = cost
             run = self._sized[cost] = self._run.options(num_cpus=cpu, num_gpus=gpu,
                                                         memory=int(mem_mb * 2 ** 20) or None)
+        dirs = []
+        if not self.shared:
+            payload = swap(payload, partial(self._mark, dirs))
         ref = run.remote(call or _call, fn, payload)
-        ref.future().add_done_callback(partial(self._finished, tag))
+        ref.future().add_done_callback(partial(self._finished, tag, dirs))
         return ref
+
+    def _mark(self, dirs: list, mark):
+        if isinstance(mark, Dir):
+            if mark not in dirs:
+                dirs.append(str(mark))
+            return _Out(dirs.index(mark))
+        at = os.stat(mark)
+        key = (str(mark), at.st_mtime_ns, at.st_size)
+        if key not in self._carried:
+            with open(mark, "rb") as file:
+                self._carried[key] = _Carried(os.path.basename(mark), hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(),
+                                              self._ray.put(file.read()))
+        return self._carried[key]
 
     def submit_many(self, fn, payloads, tag, whole=False, cost=(1, 0, 0)):
         return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, cost)
 
-    def _finished(self, tag, future) -> None:
+    def _finished(self, tag, dirs, future) -> None:
         status, value, error = _outcome(future, self._lost)
         if status == ERROR and isinstance(future.exception(), self._ray.exceptions.TaskCancelledError):
             status = CANCELED
+        if status == DONE and not self.shared:
+            (result, peak_mb), root, files = value
+
+            def here(text):  # a path of the node's directory, as the one it stands for here
+                if not text.startswith(root + os.sep):
+                    return text
+                n, _, rest = text[len(root) + 1:].partition(os.sep)
+                return os.path.join(dirs[int(n)], rest) if rest else dirs[int(n)]
+
+            # ponytail: written on Ray's own thread; a thread of the executor once files get large.
+            for name, data in files.items():
+                target = here(os.path.join(root, name))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "wb") as file:
+                    file.write(data)
+            value = swap(result, here, str), peak_mb
         result, peak_mb = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, peak_mb)
 
@@ -267,6 +311,63 @@ def _call(fn, payload):
 
 def _apply(call, fn, payload):
     return call(fn, payload)
+
+
+class _Carried:
+    """A file in Ray's object store."""
+
+    def __init__(self, name, id, ref):
+        self.name, self.id, self.ref = name, id, ref
+
+    def land(self) -> str:
+        """Its path on this node, which keeps it for the tasks that follow."""
+        # ponytail: nothing takes the copies away but whatever cleans the node's temporary
+        # directory; a sweep at `shutdown` once a cluster that lives for weeks fills its disks.
+        path = os.path.join(tempfile.gettempdir(), "msflow-files", self.id, self.name)
+        if not os.path.exists(path):
+            import ray
+
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, coming = tempfile.mkstemp(dir=os.path.dirname(path))
+            with os.fdopen(fd, "wb") as file:
+                file.write(ray.get(self.ref))
+            os.replace(coming, path)  # whole or not there: another task of this node may be bringing it too
+        return path
+
+
+class _Out:
+    """The n-th `Dir` of a task."""
+
+    def __init__(self, n):
+        self.n = n
+
+
+def _apply_far(call, fn, payload):
+    """`_apply` on a node with a disk of its own: the files come first, and what the result names goes back."""
+    root = tempfile.mkdtemp(prefix="msflow-out-")
+    try:
+        def land(mark):
+            if isinstance(mark, _Carried):
+                return mark.land()
+            os.makedirs(os.path.join(root, str(mark.n)), exist_ok=True)
+            return os.path.join(root, str(mark.n))
+
+        value, files = call(fn, swap(payload, land, (_Carried, _Out))), {}
+
+        def take(text):
+            if text.startswith(root + os.sep):
+                inside = [os.path.join(folder, name) for folder, _, names in os.walk(text) for name in names]
+                # ponytail: the files go back in memory with the result; a file of the store for
+                # each once a task leaves more than fits there.
+                for path in inside or [text] * os.path.isfile(text):
+                    with open(path, "rb") as file:
+                        files[os.path.relpath(path, root)] = file.read()
+            return text
+
+        swap(value[0], take, str)
+        return value, root, files
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _call_many(fn, payloads):

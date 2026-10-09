@@ -7,9 +7,12 @@
 
 - `results/part-00001.bin`...: `(index, result)` pickles, `index` being the place of the element
   in `elements.bin`. A part that is there is whole and never changes.
-- `progress.json`: `{total, done, failed, running, status, error, at}`.
+- `progress.json`: `{total, done, failed, running, status, error, home, at}`.
 - `errors.jsonl`: a line `{index, error}` for each element that failed for good.
 - `journal.db`: run again on the same directory, it goes on from where it was stopped.
+
+A `File` in an element that is not a whole path is one that came with the job, under `<dir>`,
+and a `Dir` that is not a whole path is made under `<dir>` for the task to write in.
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
 the elements run in a process pool on this machine; with it, on the Ray cluster at that address
@@ -29,6 +32,7 @@ import traceback
 from pathlib import Path
 
 from ms_flow.engine import Engine, ProcessExecutor, RayExecutor, content_key
+from ms_flow.engine.files import Dir, swap
 
 _PYTHON = "%d.%d" % sys.version_info[:2]
 _GOING = ("waiting", "running")
@@ -96,13 +100,13 @@ class _Parts:
 
 
 def _tell(home: Path, **progress) -> None:
-    (home / "progress.tmp").write_text(json.dumps({**progress, "at": time.time()}))
+    (home / "progress.tmp").write_text(json.dumps({**progress, "home": str(home.resolve()), "at": time.time()}))
     os.replace(home / "progress.tmp", home / "progress.json")
 
 
 def run(home, ray: str | None = None, cpus: int | None = None) -> str:
     """Run the job staged in `home` to its end. Returns the status it ended with."""
-    home = Path(home)
+    home = Path(home).resolve()
     spec = json.loads((home / "spec.json").read_text())
     if spec["python"] != _PYTHON:
         raise RuntimeError(f"staged with Python {spec['python']} and this is {_PYTHON}: what one pickles the "
@@ -110,10 +114,16 @@ def run(home, ray: str | None = None, cpus: int | None = None) -> str:
     fn = pickle.loads((home / "fn.bin").read_bytes())
     index_of, parts = {}, _Parts(home / "results", spec["part_seconds"])
 
+    def here(mark):
+        if isinstance(mark, Dir) and not os.path.isabs(mark):
+            os.makedirs(home / mark, exist_ok=True)
+        return os.path.join(home, mark)
+
     def elements():
         with open(home / "elements.bin", "rb") as file:
             for index in range(spec["total"]):
-                payload = pickle.load(file)
+                # Plain paths from here on: whatever runs the task shares this disk.
+                payload = swap(pickle.load(file), here)
                 index_of[content_key(payload)] = index  # ponytail: equal payloads are one element, as in a journal
                 yield payload
 

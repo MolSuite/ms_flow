@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.refactor_optimization import workers
-from ms_flow.engine import Engine
+from ms_flow.engine import Dir, Engine, File
 from ms_flow.remote import RemoteExecutor
 
 pytestmark = pytest.mark.slow
@@ -77,6 +77,30 @@ def test_a_canceled_job_leaves_the_queue_and_nothing_behind(tmp_path):
         engine.cancel(job)
         assert engine.wait(job, 60).status == "canceled"
         assert _until(lambda: not _inside(home) and not home.exists())
+
+
+def test_a_file_an_element_names_goes_with_the_job_once(tmp_path):
+    (tmp_path / "receptor.txt").write_text("here")
+    got, far = [], _far(tmp_path, shared=False)
+    with Engine(cpus=2) as engine:
+        engine.register("far", far)
+        job = engine.submit("far", workers.read, [{"path": File(tmp_path / "receptor.txt"), "n": i} for i in range(6)],
+                            on_results=got.extend)
+        assert engine.wait(job, 120).status == "completed"
+    seen = {result["path"] for key, result in got}
+    assert len(got) == 6 and all(result["text"] == "here" for key, result in got)
+    assert len(seen) == 1 and seen.pop().startswith(str(tmp_path / "far")), "one copy, read where the job ran"
+
+
+def test_what_a_result_names_in_a_dir_comes_back_to_it(tmp_path):
+    got, poses = [], tmp_path / "poses"
+    with Engine(cpus=2) as engine:
+        engine.register("far", _far(tmp_path, shared=False, elements_per_job=4))
+        job = engine.submit("far", workers.leave, [{"out": Dir(poses), "n": i} for i in range(7)], on_results=got.extend)
+        assert engine.wait(job, 120).status == "completed"
+    assert sorted(result["made"] for key, result in got) == [str(poses / f"{i}.txt") for i in range(7)]
+    assert [(poses / f"{i}.txt").read_text() for i in range(7)] == [str(i) for i in range(7)]
+    assert list((tmp_path / "far").iterdir()) == []
 
 
 def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
