@@ -183,6 +183,40 @@ class MolSuiteJobApiMixin:
             priority=priority,
         )
 
+    @property
+    def engine(self):
+        """The engine behind `submit`, built at first use: `status`, `wait`, `cancel` and `jobs` are its own.
+
+        Raises `ms_flow.engine.Busy` when another process of this user already shares out the machine.
+        """
+        if self._engine is None:
+            from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor
+
+            local = self.settings_manager.settings.resources.local
+            # ponytail: the executor manager behind `submit_job` shares out the same CPUs by
+            # itself. Jobs of the two at once oversubscribe the machine, until that one is gone.
+            engine = Engine(cpus=local.cpus, gpus=local.gpus, state_dir=self._master_db_path.parent)
+            engine.register("process", ProcessExecutor(local.cpus))
+            engine.register("thread", ThreadExecutor(local.cpus))
+            self._engine = engine
+        return self._engine
+
+    def submit(self, job, params=None, **options) -> int:
+        """Start a job written with `ms_flow.engine.job` in the active project. Returns its id in `engine`.
+
+        `options` is what `ms_flow.engine.Flow.submit` takes: `executor`, `batch`, `after`,
+        `progress`, `key`... The job is recorded in the project, so closing the project
+        interrupts it, and submitting it again with the same `key` continues it.
+        """
+        project = self._require_active_project_runtime()
+        if self._flow is None:
+            from ms_flow.engine import Flow
+
+            # ponytail: its own file while `executor.db` is the old engine's.
+            self.engine.attach("project", project.context.path / "engine.db")
+            self._flow = Flow(self.engine, project.project_db)
+        return self._flow.submit(job, params, journal="project", **options)
+
     def task(self, name: str, **kwargs):
         """Decorator to define a task."""
 

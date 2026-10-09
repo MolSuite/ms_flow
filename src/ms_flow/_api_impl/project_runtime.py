@@ -311,6 +311,9 @@ class MolSuiteProjectRuntimeMixin:
     def _shutdown_runtime_stack(self):
         runtime = self._runtime_state
         active_project = runtime.active_project
+        if self._engine is not None:
+            self._engine.close()
+            self._engine = self._flow = None
         try:
             if runtime.executor_manager is not None:
                 runtime.executor_manager.stop()
@@ -337,6 +340,10 @@ class MolSuiteProjectRuntimeMixin:
         manager = runtime.executor_manager
         active_project = runtime.active_project
         executor_db = active_project.executor_db if active_project is not None else None
+
+        if self._flow is not None:  # before the project goes: what its jobs delivered is written first
+            self._flow = None
+            self._engine.detach("project")
 
         try:
             if active_project is not None and active_project.project_db is not None:

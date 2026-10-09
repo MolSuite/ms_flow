@@ -249,3 +249,31 @@ Rama `refactor/job-progress`.
 - Límite conocido: una task que termina deja de contar en su casilla un instante antes de que sus elementos cuenten como hechos (cuentan al entregarse), así que el valor puede retroceder un poco. En Windows el fichero temporal se queda al cerrar.
 - Sin hacer: progreso por lote en HPC (va con el ejecutor remoto), y el monitor, que todavía lee el motor viejo.
 - Registro de coste pendiente, como los anteriores (máquina ocupada). Lo añadido por elemento en un lote es una escritura en memoria (217 ns medidos sueltos).
+
+## Hecho: relevo, primer corte (2026-10-08)
+
+Rama `refactor/facade-new-engine`. La fachada tiene el motor nuevo al lado del viejo; nada de lo viejo cambia.
+
+```python
+job_id = molsuite.submit(docking_job, {"exhaustiveness": 8})   # executor=, batch=, after=, progress=, key=
+molsuite.engine.wait(job_id)                                   # status, cancel y jobs son del motor
+```
+
+- `MolSuite.engine`: se crea al primer uso con las CPU y GPU de los ajustes, ejecutores `process` y `thread`, y el bloqueo de un motor por usuario (`~/.molsuite/engine.lock`). Un segundo proceso recibe `Busy` al enviar, no al arrancar.
+- `MolSuite.submit`: un `Flow` por proyecto activo (así valen las dependencias por tabla entre sus jobs). Todo job va al diario del proyecto.
+- Cerrar o cambiar de proyecto interrumpe sus jobs, espera a que lo entregado esté escrito y cierra el diario. Enviar otra vez con la misma `key` lo continúa. `shutdown` cierra el motor.
+- Comprobado en `tests/test_engine_flow.py`: 300 ligandos de una tabla por el ejecutor de procesos; un segundo job cortado al cerrar el proyecto y continuado al reabrirlo, sin filas repetidas.
+
+Decisiones tomadas al construir, a revisar:
+
+- El diario es `engine.db` en la carpeta del proyecto, porque `executor.db` es del motor viejo mientras exista.
+- Los dos motores reparten las mismas CPU sin saber uno del otro. Jobs de los dos a la vez sobrecargan la máquina.
+- `task`, `job` y `report` siguen en `ms_flow.engine`. Un test fija que `ms_flow` no exporta `task`, `job` ni `table_sink`, y `ms_flow.sinks` importa `sqlmodel` (290 ms en cada worker que lo cargue).
+
+Falta del relevo (C1):
+
+1. Monitor (`ms_components`): lee el `executor.db` viejo. Los jobs del motor nuevo no salen, ni cuentan en `get_project_activity` / `can_switch_project`.
+2. Ejecutores remotos de los ajustes (HPC, Ray): no se registran en el motor nuevo. Van con el ejecutor remoto.
+3. Log por job: el motor nuevo no tiene.
+4. Los nombres viejos (`submit_job`, `run`, `molsuite.task`, `molsuite.job`, `workflow()`) siguen en el motor viejo. Borrarlo (C2) pide reescribir antes los jobs de AMDockVS con la forma nueva, o aceptar que AMDockVS quede roto un tiempo.
+

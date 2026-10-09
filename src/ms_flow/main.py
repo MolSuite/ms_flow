@@ -78,6 +78,7 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
         )
 
         self._runtime_state = ProjectRuntimeState()
+        self._engine = self._flow = None  # see `MolSuite.engine` and `MolSuite.submit`
         self.project_logger = None
         self._advanced = MolSuiteAdvancedAccess(self)
 

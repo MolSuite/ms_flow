@@ -160,3 +160,43 @@ def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(proj
         new = engine.wait(submit(), 60)  # another job: its own cap
         assert (new.status, new.chunks_total) == ("completed", 400)
         assert sql("SELECT max(ligand_id) FROM docking_results") == [(410,)]
+
+
+def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path, monkeypatch):
+    from ms_flow.api import MolSuite
+
+    monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
+
+    def sql(db, text):
+        with closing(sqlite3.connect(str(db))) as conn, conn:
+            return conn.execute(text).fetchall()
+
+    ms = MolSuite(app_id="facade")
+    try:
+        ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
+        db = ms.project_db.db_path
+        sql(db, "CREATE TABLE ligands (id INTEGER PRIMARY KEY, smiles TEXT)")
+        sql(db, "CREATE TABLE docking_results (id INTEGER PRIMARY KEY, ligand_id INT, pose_rank INT)")
+        sql(db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) "
+                "INSERT INTO ligands (smiles) SELECT 'C' FROM n")
+
+        done = ms.engine.wait(ms.submit(every_ligand), 120)
+        assert (done.status, done.chunks_done, done.progress) == ("completed", 300, 1.0)
+        assert sql(db, "SELECT count(DISTINCT ligand_id) FROM docking_results") == [(300,)]
+
+        # closing the project interrupts its job, with what it delivered written; the same key continues it
+        cut = ms.submit(every_ligand, executor="thread", key="again")
+        _until(lambda: ms.engine.status(cut).chunks_done >= 20)
+        ms.close_project()
+        assert ms.engine.status(cut).status == "interrupted"
+        written = sql(db, "SELECT count(*) FROM docking_results")[0][0]
+        assert 320 <= written < 600
+
+        ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
+        again = ms.engine.wait(ms.submit(every_ligand, executor="thread", key="again"), 120)
+        assert (again.status, again.chunks_done) == ("completed", 300)
+        assert sql(db, "SELECT count(*) FROM docking_results") == [(600,)]
+    finally:
+        ms.shutdown()
+    assert ms._engine is None
