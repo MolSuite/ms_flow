@@ -205,7 +205,7 @@ Añadido el 2026-10-09, antes de R6 y en este orden:
 | F3 ✔ | `File` en Ray sin disco compartido | Ray local con `shared=False`: la task lee una copia fuera de la carpeta de aquí |
 | F4 ✔ | `Dir` en los dos | lo que la task deja aparece en la ruta de aquí |
 | S1 ✔ | El ajuste de quién hace de `process`, el cambio sin jobs activos y el bloqueo de loky en el nodo de login | tests del workspace |
-| S2 | Límite de tiempo y progreso por elemento en Ray | los tests que ya pasan con loky |
+| S2 ✔ | Límite de tiempo y progreso por elemento en Ray | los tests que ya pasan con loky |
 
 F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExecutor`; tests en `tests/test_files.py` y `tests/test_remote.py`), con estos techos, anotados en el código:
 
@@ -222,6 +222,11 @@ S1 está construido (`tests/test_process_role.py`):
 - El motor, el runner y los ajustes cuentan los núcleos con `sched_getaffinity`: dentro de un job de la cola son los que dio la cola.
 - Sin construir: que la interfaz de ajustes llame a `reload_executors()` al guardar. Y un resto que estorba aquí: `_HARDCODED_LOCAL_CPU_LIMIT = 14` en los ajustes limita `resources.local.cpus` a 14 en cualquier máquina.
 
+S2 está construido (en `test_the_same_jobs_on_ray`):
+
+- **Límite de tiempo**: `kill()` cancela a la fuerza todo lo que Ray tiene del ejecutor, que es lo que el motor pide a cualquier ejecutor; el elemento que se pasó falla con "timed out" y los demás vuelven a la cola sin cargo. El límite cuenta desde que Ray recibe la tarea: si los elementos piden más núcleos de los que Ray tiene libres, parte del límite se va esperando en Ray.
+- **Progreso**: lo que la task dice con `report()` va, como mucho dos veces por segundo, a un actor del ejecutor; `progress()` responde con lo último que trajo y pide lo nuevo, así que va una consulta por detrás.
+
 ### Estado (2026-10-09)
 
 R1 a R4 están construidos, cada uno en su rama local, con sus tests:
@@ -229,7 +234,7 @@ R1 a R4 están construidos, cada uno en su rama local, con sus tests:
 | Paso | Dónde | Qué quedó distinto del diseño |
 |---|---|---|
 | R1 | `engine.py`, contrato en `executors.py` (`bind_parts`) | Nada. Además un ejecutor puede pedir el coste declarado del job (`wants_cost`) y decir cuántos elementos quiere por tarea (`batch`, la regla 2 de lotes) |
-| R2 | `RayExecutor` en `executors.py` | Sin límite de tiempo por elemento ni progreso dentro de un elemento |
+| R2 | `RayExecutor` en `executors.py` | Límite de tiempo y progreso dentro de un elemento llegaron con S2 |
 | R3 | `ms_flow/runner.py` (`stage` y `python -m ms_flow.runner <dir> [--ray DIRECCIÓN] [--cpus N]`) | La función viaja en pickle (`fn.bin`), no por nombre. Sin `--ray` usa el pool de procesos. Probado con pool, con un Ray local (`--ray auto`), con `SIGTERM` y con `SIGKILL`; tras un `SIGKILL` un elemento puede salir dos veces en las partes y quien lee ignora la repetición |
 | R4 | `ms_flow/remote.py` (`Remote`, `SCHEDULERS`, `JOB_SH`, `RemoteExecutor`) | **Probado contra esta máquina con `sh`, no por `ssh`**: `Remote(host=None)` ejecuta las mismas órdenes en local. El camino `ssh` es el mismo código con otro `argv`, y no se ha ejecutado: en la PC de desarrollo `ssh localhost` no entra por clave. La entrada de Slurm está escrita del manual y sin ejecutar |
 
