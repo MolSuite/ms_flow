@@ -58,9 +58,9 @@ def resolve_project_store_ops(source: Any) -> "_ProjectStoreSqliteOps":
             ops = _ops_from_candidate(project_db)
             if ops is not None:
                 return ops
-        molsuite = getattr(candidate, "molsuite", None)
-        if molsuite is not None and molsuite is not candidate:
-            ops = _ops_from_candidate(molsuite)
+        workspace = getattr(candidate, "workspace", None)
+        if workspace is not None and workspace is not candidate:
+            ops = _ops_from_candidate(workspace)
             if ops is not None:
                 return ops
         return None
@@ -68,7 +68,7 @@ def resolve_project_store_ops(source: Any) -> "_ProjectStoreSqliteOps":
     ops = _ops_from_candidate(source)
     if ops is None:
         raise ValueError(
-            "Could not resolve project store SQLite operations from source. Usa MolSuite, ProjectDataContext o ProjectStore."
+            "Could not resolve project store SQLite operations from source. Use Workspace, ProjectDataContext or ProjectStore."
         )
     return ops
 

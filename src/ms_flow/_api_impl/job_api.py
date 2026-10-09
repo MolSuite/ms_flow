@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-class MolSuiteJobApiMixin:
+class WorkspaceJobApiMixin:
     @property
     def engine(self):
         """The engine behind `submit`, built at first use: the one that shares out this machine.
@@ -75,4 +75,4 @@ class MolSuiteJobApiMixin:
         return self.advanced.project_store
 
 
-__all__ = ["MolSuiteJobApiMixin"]
+__all__ = ["WorkspaceJobApiMixin"]

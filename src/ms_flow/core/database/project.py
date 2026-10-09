@@ -665,9 +665,9 @@ def resolve_project_store(source: Any) -> ProjectStore:
             store = _store_from_candidate(project_db)
             if store is not None:
                 return store
-        molsuite = getattr(candidate, "molsuite", None)
-        if molsuite is not None and molsuite is not candidate:
-            store = _store_from_candidate(molsuite)
+        workspace = getattr(candidate, "workspace", None)
+        if workspace is not None and workspace is not candidate:
+            store = _store_from_candidate(workspace)
             if store is not None:
                 return store
         return None

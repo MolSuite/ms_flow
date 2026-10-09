@@ -12,7 +12,7 @@ from ms_flow.core.project.resources import ProjectResource
 from ms_flow.core.project.manager import SettingsProfile
 
 
-class MolSuiteProjectRuntimeMixin:
+class WorkspaceProjectRuntimeMixin:
     def get_project_resource_contract(self):
         return self._project_resource_contract
 
@@ -383,4 +383,4 @@ class MolSuiteProjectRuntimeMixin:
             pass
 
 
-__all__ = ["MolSuiteProjectRuntimeMixin"]
+__all__ = ["WorkspaceProjectRuntimeMixin"]

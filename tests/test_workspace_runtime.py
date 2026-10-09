@@ -8,7 +8,7 @@ from ms_flow.core.project.context import ProjectContext
 from ms_flow.core.project.resources import ProjectResourceSpec
 from ms_flow.core.settings.models import Settings
 from ms_flow.runtime import AppRuntime
-from ms_flow.main import MolSuite
+from ms_flow.main import Workspace
 from ms_flow.runtime import BaseRuntime
 
 
@@ -33,7 +33,7 @@ def test_open_project_after_create_project_works_on_molsuite(tmp_path, monkeypat
     _patch_fake_home(monkeypatch, tmp_path)
     project_dir = tmp_path / "project_alias_runtime"
 
-    ms = MolSuite(app_id="testruntime")
+    ms = Workspace(app_id="testruntime")
     try:
         created = ms.create_or_open_project(
             name="project_alias_runtime",
@@ -54,7 +54,7 @@ def test_register_task_canceller_requires_active_project_and_is_project_scoped(t
     _patch_fake_home(monkeypatch, tmp_path)
     project_dir = tmp_path / "project_canceller_scope"
 
-    ms = MolSuite(app_id="testruntime")
+    ms = Workspace(app_id="testruntime")
     try:
         with pytest.raises(RuntimeError):
             ms.register_task_canceller("00000000-0000-0000-0000-000000000000", lambda: None)
@@ -77,7 +77,7 @@ def test_register_task_canceller_requires_active_project_and_is_project_scoped(t
 
 def test_a_canceller_that_fails_keeps_the_project_open(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = MolSuite(app_id="testruntime")
+    ms = Workspace(app_id="testruntime")
     try:
         one = ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
         other = ms.create_or_open_project(name="other", folder=tmp_path / "other", description="", activate=False)
@@ -104,7 +104,7 @@ def test_switch_project_executes_registered_project_cancellers(tmp_path, monkeyp
     project_a_dir = tmp_path / "project_cancel_a"
     project_b_dir = tmp_path / "project_cancel_b"
 
-    ms = MolSuite(app_id="testruntime")
+    ms = Workspace(app_id="testruntime")
     try:
         project_a = ms.create_or_open_project(
             name="project_cancel_a",
@@ -136,7 +136,7 @@ def test_entity_loader_context_exposes_project_db(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     project_dir = tmp_path / "project_loader_ctx"
 
-    ms = MolSuite(app_id="testruntime")
+    ms = Workspace(app_id="testruntime")
     try:
         ms.create_or_open_project(
             name="project_loader_ctx",
@@ -146,7 +146,7 @@ def test_entity_loader_context_exposes_project_db(tmp_path, monkeypatch):
             activate=True,
         )
         loader_ctx = ms.get_entity_loader_context()
-        assert loader_ctx.molsuite is ms
+        assert loader_ctx.workspace is ms
         assert loader_ctx.active_context is ms.active_context
         assert loader_ctx.project_db is ms.project_db
         assert loader_ctx.project_store is ms.project_store
@@ -158,11 +158,11 @@ def test_entity_loader_context_exposes_project_db(tmp_path, monkeypatch):
         ms.shutdown()
 
 
-def test_molsuite_project_resources_are_resolved_from_active_project(tmp_path, monkeypatch):
+def test_workspace_project_resources_are_resolved_from_active_project(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     project_dir = tmp_path / "project_resources_runtime"
 
-    ms = MolSuite(
+    ms = Workspace(
         app_id="testruntime",
         project_resources=(
             ProjectResourceSpec(key="ligands", relative_path="data/ligands"),
@@ -197,7 +197,7 @@ def test_base_runtime_open_project_accepts_owned_project(tmp_path, monkeypatch):
     runtime = BaseRuntime("amdockvs")
 
     try:
-        owned_context = runtime.molsuite.create_project(
+        owned_context = runtime.workspace.create_project(
             name="dock-owned",
             folder=tmp_path / "dock-owned",
             description="owned by runtime",
@@ -216,7 +216,7 @@ def test_base_runtime_open_project_accepts_owned_project(tmp_path, monkeypatch):
 def test_base_runtime_open_project_rejects_foreign_app_project(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     runtime = BaseRuntime("amdockvs")
-    foreign_ms = MolSuite(app_id="otherapp")
+    foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_context = foreign_ms.create_project(
@@ -238,7 +238,7 @@ def test_base_runtime_open_project_rejects_foreign_app_project(tmp_path, monkeyp
 def test_base_runtime_create_or_open_project_ignores_foreign_name_match(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     runtime = BaseRuntime("amdockvs")
-    foreign_ms = MolSuite(app_id="otherapp")
+    foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_context = foreign_ms.create_project(
@@ -265,7 +265,7 @@ def test_base_runtime_create_or_open_project_ignores_foreign_name_match(tmp_path
 def test_base_runtime_create_or_open_project_rejects_foreign_path_match(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     runtime = BaseRuntime("amdockvs")
-    foreign_ms = MolSuite(app_id="otherapp")
+    foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_ms.create_project(
@@ -288,10 +288,10 @@ def test_base_runtime_create_or_open_project_rejects_foreign_path_match(tmp_path
         runtime.shutdown()
 
 
-def test_molsuite_open_project_rejects_foreign_project_id(tmp_path, monkeypatch):
+def test_workspace_open_project_rejects_foreign_project_id(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = MolSuite(app_id="amdockvs")
-    foreign_ms = MolSuite(app_id="otherapp")
+    scoped_ms = Workspace(app_id="amdockvs")
+    foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_context = foreign_ms.create_project(
@@ -310,10 +310,10 @@ def test_molsuite_open_project_rejects_foreign_project_id(tmp_path, monkeypatch)
         scoped_ms.shutdown()
 
 
-def test_molsuite_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatch):
+def test_workspace_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = MolSuite(app_id="amdockvs")
-    foreign_ms = MolSuite(app_id="otherapp")
+    scoped_ms = Workspace(app_id="amdockvs")
+    foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_ms.create_project(
@@ -339,9 +339,9 @@ def test_molsuite_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatch
         scoped_ms.shutdown()
 
 
-def test_molsuite_scoped_app_id_filters_pagination_at_query_level(tmp_path, monkeypatch):
+def test_workspace_scoped_app_id_filters_pagination_at_query_level(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = MolSuite(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="amdockvs")
 
     try:
         now = datetime.now()
@@ -388,9 +388,9 @@ def test_molsuite_scoped_app_id_filters_pagination_at_query_level(tmp_path, monk
         scoped_ms.shutdown()
 
 
-def test_molsuite_scoped_app_id_filters_pagination_across_multiple_pages(tmp_path, monkeypatch):
+def test_workspace_scoped_app_id_filters_pagination_across_multiple_pages(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = MolSuite(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="amdockvs")
 
     try:
         now = datetime.now()
@@ -426,9 +426,9 @@ def test_molsuite_scoped_app_id_filters_pagination_across_multiple_pages(tmp_pat
         scoped_ms.shutdown()
 
 
-def test_molsuite_scoped_app_id_defaults_project_creation(tmp_path, monkeypatch):
+def test_workspace_scoped_app_id_defaults_project_creation(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = MolSuite(app_id="amdockvs")
+    ms = Workspace(app_id="amdockvs")
 
     try:
         context = ms.create_project(

@@ -7,7 +7,7 @@ daemon, no server. Works from a Qt app, a notebook or a plain script.
 ```python
 import sqlite3
 
-from ms_flow import MolSuite, job, table_sink, task
+from ms_flow import Workspace, job, table_sink, task
 
 
 @task()
@@ -20,7 +20,7 @@ def double_values(params, project):
     yield from range(1000)
 
 
-ms = MolSuite(app_id="demo")
+ms = Workspace(app_id="demo")
 ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
 with sqlite3.connect(ms.project_db.db_path) as db:
     db.execute("CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)")

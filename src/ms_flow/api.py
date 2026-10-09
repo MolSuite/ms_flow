@@ -9,7 +9,7 @@ from ms_flow.core.configuration import ConfigurationEntry, PydanticConfiguration
 from ms_flow.artifacts import ArtifactRegistry
 from ms_flow.core.data import FileArtifact, FileInputSpec, ProjectOutputDirSpec
 from ms_flow.engine import JobSnapshot, job, report, task
-from ms_flow.main import MolSuite
+from ms_flow.main import Workspace
 from ms_flow.core.project.catalog import (
     AppProjectCatalog,
     ProjectCatalog,
@@ -44,7 +44,6 @@ __all__ = [
     "FileArtifact",
     "FileInputSpec",
     "JobSnapshot",
-    "MolSuite",
     "ProjectCatalog",
     "ProjectCatalogBackend",
     "ProjectCatalogEditor",
@@ -54,6 +53,7 @@ __all__ = [
     "ProjectResourceContract",
     "ProjectResourceSpec",
     "PydanticConfiguration",
+    "Workspace",
     "file_sink",
     "graph_sink",
     "inline_items",

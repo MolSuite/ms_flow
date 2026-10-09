@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ms_flow.api import MolSuite, graph_sink, job, task
+from ms_flow.api import Workspace, graph_sink, job, task
 
 
 def _patch_fake_home(monkeypatch, fake_home: Path):
@@ -68,7 +68,7 @@ def _deferred_graph_job(params, project):
 
 def test_deferred_relation_points_the_parent_at_its_own_child(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = MolSuite(app_id="testdeferred")
+    ms = Workspace(app_id="testdeferred")
     try:
         ms.create_or_open_project(
             name="deferred_project",

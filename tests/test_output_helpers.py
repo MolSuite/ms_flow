@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from ms_flow.api import MolSuite, file_sink, graph_sink, job, table_sink, task
+from ms_flow.api import Workspace, file_sink, graph_sink, job, table_sink, task
 
 
 def _patch_fake_home(monkeypatch, fake_home: Path):
@@ -92,7 +92,7 @@ def _graph_job(params, project):
 
 def test_jobs_persist_through_table_and_graph_sinks(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = MolSuite(app_id="testsinks")
+    ms = Workspace(app_id="testsinks")
     try:
         ms.create_or_open_project(name="sinks", folder=tmp_path / "sinks", description="", scope="testing",
                                   activate=True)

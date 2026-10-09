@@ -4,9 +4,9 @@ from typing import Optional
 from uuid import UUID
 
 from ms_flow._api_impl import (
-    MolSuiteAdvancedAccess,
-    MolSuiteJobApiMixin,
-    MolSuiteProjectRuntimeMixin,
+    WorkspaceAdvancedAccess,
+    WorkspaceJobApiMixin,
+    WorkspaceProjectRuntimeMixin,
 )
 from ms_flow.artifacts import ArtifactRegistry
 from ms_flow.core.app_settings import coerce_app_setting_specs
@@ -20,7 +20,7 @@ from ms_flow.core.settings.manager import SettingsManager
 from ms_flow.logger import LoggingManager
 
 
-class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
+class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
     """
     Main core facade.
 
@@ -39,7 +39,7 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
     ):
         self.app_id = str(app_id).strip()
         if not self.app_id:
-            raise ValueError("MolSuite requires a non-empty app_id.")
+            raise ValueError("Workspace requires a non-empty app_id.")
         self.host_namespace = str(host_namespace or "").strip() or self.app_id
         self.settings_manager = SettingsManager()
         legacy_specs = coerce_app_setting_specs(app_settings)
@@ -75,9 +75,9 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
         )
 
         self._runtime_state = ProjectRuntimeState()
-        self._engine = self._flow = None  # see `MolSuite.engine` and `MolSuite.submit`
+        self._engine = self._flow = None  # see `Workspace.engine` and `Workspace.submit`
         self.project_logger = None
-        self._advanced = MolSuiteAdvancedAccess(self)
+        self._advanced = WorkspaceAdvancedAccess(self)
 
     def app_setting_specs(self):
         return self.settings_manager.app_setting_specs(self.app_id)
@@ -120,7 +120,7 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
             runtime.project_logger = value
 
     @property
-    def advanced(self) -> MolSuiteAdvancedAccess:
+    def advanced(self) -> WorkspaceAdvancedAccess:
         """Explicit access to advanced surfaces outside the public happy path."""
         return self._advanced
 
@@ -149,5 +149,5 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
 
 
 if __name__ == "__main__":
-    ms = MolSuite(app_id="molsuite")
+    ms = Workspace(app_id="molsuite")
     print(ms)

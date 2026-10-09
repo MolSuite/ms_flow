@@ -256,7 +256,7 @@ def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(proj
 
 
 def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path, monkeypatch):
-    from ms_flow.api import MolSuite
+    from ms_flow.api import Workspace
 
     monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
     monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
@@ -265,7 +265,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         with closing(sqlite3.connect(str(db))) as conn, conn:
             return conn.execute(text).fetchall()
 
-    ms = MolSuite(app_id="facade")
+    ms = Workspace(app_id="facade")
     try:
         assert ms.jobs() == []
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)

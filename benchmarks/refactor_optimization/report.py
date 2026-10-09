@@ -82,7 +82,7 @@ STEPS = {
                             "running chunks are, and a stopped job records the results its callback still took. "
                             "Same cost per chunk.", False),
     "new engine only": (None, "The old engine is gone: tasking, the handler, the executor adapters and their tables "
-                              "in executor.db. The MolSuite facade submits on the new engine (ms.submit) and a "
+                              "in executor.db. The facade submits on the new engine (ms.submit) and a "
                               "monitor reads ms.jobs() and ms.job_failures(). Importing the package costs 300 ms "
                               "instead of 365 ms; a chunk costs the same.", True),
 }

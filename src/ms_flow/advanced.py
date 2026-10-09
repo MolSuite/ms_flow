@@ -1,5 +1,5 @@
-"""Explicit public surface for advanced access to the MolSuite runtime."""
+"""Explicit public surface for advanced access to the Workspace runtime."""
 
-from ms_flow._api_impl import MolSuiteAdvancedAccess
+from ms_flow._api_impl import WorkspaceAdvancedAccess
 
-__all__ = ["MolSuiteAdvancedAccess"]
+__all__ = ["WorkspaceAdvancedAccess"]

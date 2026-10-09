@@ -3,7 +3,7 @@ from pathlib import Path
 
 from ms_flow.core.data import DataBridge, DataContext
 from ms_flow.query import QuerySpec, db_input_for, db_rows, db_stream
-from ms_flow.main import MolSuite
+from ms_flow.main import Workspace
 
 
 def _patch_fake_home(monkeypatch, fake_home: Path):
@@ -48,7 +48,7 @@ def test_project_rows_and_stream_use_active_project_without_sqlmodel(tmp_path, m
     _patch_fake_home(monkeypatch, tmp_path)
     project_dir = tmp_path / "data_api_project"
 
-    ms = MolSuite(app_id="testdataapi")
+    ms = Workspace(app_id="testdataapi")
     try:
         ms.create_or_open_project(
             name="data_api_project",
