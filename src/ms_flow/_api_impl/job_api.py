@@ -103,6 +103,19 @@ class WorkspaceJobApiMixin:
         origin = self._project_flow().origin(key, journal="project")
         return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
 
+    def remote_jobs(self) -> list[dict]:
+        """What the executor that plays `process` has on another machine, whichever session or
+        project sent it and with or without a project open: see `RemoteExecutor.jobs_there`.
+        Nothing when it runs its jobs here. It asks that machine, so not from a thread that
+        cannot wait."""
+        slot = self.engine._executors.get("process")
+        return slot.impl.jobs_there() if hasattr(getattr(slot, "impl", None), "jobs_there") else []
+
+    def remove_remote_job(self, dir: str) -> None:
+        """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
+        this session waits for is refused: cancel the job."""
+        self.engine.executor("process").remove_there(dir)
+
     def jobs(self, limit: int | None = None) -> list:
         """The jobs of the active project, oldest first; with `limit`, the last ones.
 

@@ -141,6 +141,28 @@ def test_closing_leaves_a_job_with_a_key_running_and_it_is_taken_up_again(tmp_pa
         assert _until(lambda: not home.exists())  # the engine said it ended
 
 
+def test_what_was_left_there_is_listed_and_removed_by_hand(tmp_path):
+    with Engine(cpus=2) as engine:
+        job = _napping(engine, tmp_path, [])
+        assert _until(lambda: engine.status(job).chunks_done)
+        (home,) = (tmp_path / "far").iterdir()
+        (row,) = engine.executor("far").jobs_there()
+        assert (row["dir"], row["followed"]) == (home.name, True)
+        with pytest.raises(ValueError, match="cancel the job"):
+            engine.executor("far").remove_there(home.name)
+    far = _far(tmp_path)  # another run, with no job of its own
+    try:
+        (row,) = far.jobs_there()
+        assert (row["dir"], row["key"], row["total"], row["in_queue"], row["followed"]) == (home.name, "naps", 12, True, False)
+        assert row["status"] == "running" and 0 < row["done"] < 12 and "nap" in row["fn"]
+        with pytest.raises(ValueError, match="not a directory of a job"):
+            far.remove_there("../" + home.name)
+        far.remove_there(home.name)
+        assert _until(lambda: not _inside(home)) and not home.exists() and far.jobs_there() == []
+    finally:
+        far.shutdown()
+
+
 def test_canceling_stops_what_an_earlier_run_left_there(tmp_path):
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])

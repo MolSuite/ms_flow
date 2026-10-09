@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shlex
 import subprocess
 import sys
@@ -193,6 +194,45 @@ class RemoteExecutor:
         self._wake.set()
         self._thread.join(5)  # ponytail: a command that is taking longer is left to end by itself
 
+    # --- For whoever looks after the other machine: these wait for it, so not for the engine ---
+
+    def jobs_there(self) -> list[dict]:
+        """What the account has in `workdir` over there, whichever process sent it: for each job
+        of the queue its `dir`, the `key` of the job of the engine it belongs to (None without
+        one), `fn`, `total`, `done`, `failed`, `status` (what its runner last said, `at` that
+        time), `sent_at`, whether it is `in_queue`, and whether this executor is waiting for it
+        (`followed`)."""
+        found = {}
+        for name, data in _untar(self.remote.run(
+                f"cd {self.workdir} 2>/dev/null || exit 0; f=$(ls */spec.json */record.json */queue.id "
+                "*/progress.json */failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f")).items():
+            folder, _, file = name.partition("/")
+            found.setdefault(folder, {})[file] = data
+        ids = {folder: _job_id(has["queue.id"]) for folder, has in found.items() if has.get("queue.id", b"").strip()}
+        alive = self.queue["alive"].format(ids=",".join(ids.values()))
+        in_queue = set(self.remote.run(f"{{ {alive}; }} 2>/dev/null || :").decode().split()) if ids else set()
+        followed = {queued.dir for queued in tuple(self._jobs)}
+        rows = []
+        for folder, has in sorted(found.items()):
+            spec, record, told = (json.loads(has.get(file) or b"{}") for file in ("spec.json", "record.json", "progress.json"))
+            rows.append({"dir": folder, "key": record.get("key"), "fn": (spec.get("fn") or "")[:200],
+                         "total": spec.get("total"), "done": told.get("done", 0), "failed": told.get("failed", 0),
+                         "status": "failed" if "failed" in has else told.get("status", "waiting"), "at": told.get("at"),
+                         "sent_at": record.get("at"), "in_queue": ids.get(folder) in in_queue,
+                         "followed": folder in followed})
+        return rows
+
+    def remove_there(self, dir: str) -> None:
+        """Take the job in `dir` (as `jobs_there` names it) out of the queue and remove what it
+        has there. Not one this executor is waiting for: that is for canceling its job."""
+        if not re.fullmatch(r"[0-9a-f]+(-\d+)?", dir):
+            raise ValueError(f"not a directory of a job: {dir!r}")
+        if dir in {queued.dir for queued in tuple(self._jobs)}:
+            raise ValueError(f"{dir} belongs to a job that is running here: cancel the job")
+        said = self.remote.run(f"cat {self.workdir}/{dir}/queue.id 2>/dev/null || :")
+        stop = self.queue["cancel"].format(id=_job_id(said)) if said.strip() else ":"
+        self.remote.run(f"cd {self.workdir} || exit 1; {stop}; rm -rf {dir} 2>/dev/null || {{ sleep 2; rm -rf {dir}; }}")
+
     # --- The one thread that talks to the other machine --------------------------------
 
     def _watch(self) -> None:
@@ -310,7 +350,8 @@ class RemoteExecutor:
                   cpu=cpu, gpu=gpu, mem_mb=mem_mb)
             Path(tmp, "job.sh").write_text(self.script)
             # What another run needs to take this job up: whose it is, its elements in order, its dirs.
-            Path(tmp, "record.json").write_text(json.dumps({"key": task.key, "keys": queued.keys, "dirs": queued.dirs}))
+            Path(tmp, "record.json").write_text(json.dumps({"key": task.key, "keys": queued.keys, "dirs": queued.dirs,
+                                                            "at": time.time()}))
             where = f"{self.workdir}/{queued.dir}"
             with tempfile.TemporaryFile() as packed:  # on disk: the job and its files, of any size
                 with tarfile.open(fileobj=packed, mode="w", dereference=True) as tar:

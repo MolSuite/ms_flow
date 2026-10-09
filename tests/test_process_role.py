@@ -91,8 +91,10 @@ def test_the_workspace_puts_in_process_whoever_the_settings_name(tmp_path, monke
         assert isinstance(ms.engine.executor("process"), RemoteExecutor)
         done = ms.engine.wait(ms.engine.submit("process", workers.row, [{"idx": i} for i in range(3)]), 120)
         assert (done.status, done.chunks_done) == ("completed", 3)
+        assert _until(lambda: ms.remote_jobs() == [])  # asked of that machine: what ended well leaves nothing
 
         choose(kind="process", on_login_node=True)  # said in so many words
         assert isinstance(ms.engine.executor("process"), ProcessExecutor)
+        assert ms.remote_jobs() == []  # nothing is anywhere else
     finally:
         ms.shutdown()
