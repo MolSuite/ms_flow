@@ -172,7 +172,7 @@ Funciona sin tocar el motor:
 
 Hace falta trabajo, ya medido o localizado:
 
-- **Escritura agrupada.** Una escritura por elemento cuesta 0,39 ms y con tasks rápidas es todo el tiempo del job (0,31 de 0,32 s en 800 elementos); agrupando 64 baja a 0,06 s. El motor da un elemento por hecho cuando vuelve `on_result`, así que agrupar fuera del motor dejaría elementos registrados como hechos sin estar en disco. Tiene que agrupar el motor y dar el lote por hecho al escribirlo.
+- **Escritura agrupada (hecho, ver abajo).** Una escritura por elemento cuesta 0,39 ms y con tasks rápidas es todo el tiempo del job (0,31 de 0,32 s en 800 elementos); agrupando 64 baja a 0,06 s. El motor da un elemento por hecho cuando vuelve `on_result`, así que agrupar fuera del motor dejaría elementos registrados como hechos sin estar en disco. Tiene que agrupar el motor y dar el lote por hecho al escribirlo.
 - **Lote forzado y task por lotes.** El motor solo empaqueta por su medida; faltan `batch=` y `@task(batched=True)`.
 - **Total que cambia.** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
 - **Progreso.** El fichero de ranuras está probado suelto (carrera y coste), no unido al motor ni a los workers.
@@ -184,3 +184,4 @@ Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolució
 
 - `refactor/engine-pack-target`: objetivo del lote automático de 100 ms y reparto del final del job.
 - `refactor/engine-resume-count`: sin aviso al reanudar; lo hecho cuenta aunque la fuente no lo traiga.
+- `refactor/engine-grouped-delivery`: escritura agrupada. `on_results(pares)` recibe de una vez todos los resultados del job que están esperando (hasta 256) y se dan por hechos cuando vuelve. Si falla, se ofrecen de uno en uno y solo fallan los malos, así que tiene que ser todo o nada (una transacción). Guardar una fila por resultado cuesta 0,004 ms por elemento, frente a 0,02-0,03 ms con una transacción por resultado. Límite: resultados de dos jobs que llegan intercalados salen de uno en uno.

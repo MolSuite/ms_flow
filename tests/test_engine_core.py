@@ -77,6 +77,35 @@ def test_failing_source_and_failing_callback():
         assert snap.status == "failed" and snap.chunks_failed == 2 and "ZeroDivisionError" in snap.error
 
 
+def test_results_are_taken_in_groups_and_done_only_once_taken():
+    written, sizes, errors, go = {}, [], {}, threading.Event()
+
+    def write(pairs):  # all or nothing, as a transaction is
+        sizes.append(len(pairs))
+        if len(sizes) == 1:
+            go.wait(10)  # a slow first write: what ends meanwhile queues up behind it
+        if any(result == 8 for _, result in pairs):
+            raise ValueError("cannot store 8")
+        written.update(pairs)
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        with pytest.raises(ValueError):
+            engine.submit("thread", _boom_on_3, [1], on_result=print, on_results=write)
+        job = engine.submit("thread", _boom_on_3, range(200), window=200, on_results=write,
+                            on_error=errors.__setitem__)
+        while engine.status(job).chunks_inflight < 199:  # 3 raised; the rest ended or is being written
+            time.sleep(0.01)
+        time.sleep(0.1)
+        assert engine.status(job).chunks_done == 0  # ended is not done: nothing has been taken yet
+        go.set()
+        snap = engine.wait(job, 30)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 198, 2)
+        assert max(sizes) > 100  # one call for what had queued up, then one each to find the bad one
+        assert len(written) == 198 and content_key(4) not in written
+        assert "cannot store 8" in errors[content_key(4)] and "three" in errors[content_key(3)]
+
+
 @pytest.mark.parametrize("cost, expected", [
     ({"cpu": 2}, 4),                # 8 CPUs / 2
     ({"mem_mb": 400}, 2),           # 1000 MB / 400

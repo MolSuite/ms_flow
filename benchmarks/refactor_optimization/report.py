@@ -59,12 +59,19 @@ STEPS = {
     "resume count": (None, "A job that continues counts what it had done whether or not its source brings it back, "
                            "and no longer warns about it: total = done + pending. Nothing on the path of a chunk "
                            "changes. From this step on the long-job measures are recorded with the rest; for the "
-                           "steps before, they were taken on 2026-10-08 from each step's own commit.", True),
+                           "steps before, they were taken on 2026-10-08 from each step's own commit.", False),
+    "grouped delivery": (None, "A job that writes its results takes them in groups (on_results): every result of the "
+                               "job that is waiting, up to 256, in one call, and all of them count as done once it "
+                               "returns, so nothing is on record as done before it is stored. When the call raises, "
+                               "each result is offered again alone and only the bad ones fail. Storing a row per "
+                               "result costs 0.004 ms per chunk this way against 0.02 to 0.03 ms with one "
+                               "transaction per result. Jobs that take results one at a time cost the same as "
+                               "before, run side by side with the previous step.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
 TARGETS = {"thread_ms_per_chunk": 0.2, "process_ms_per_chunk": 0.2, "scale_last_ms": 0.2, "scale_first_ms": 0.2,
-           "thread_long_ms": 0.2, "process_long_ms": 0.2, "scale_long_last_ms": 0.2,
+           "thread_long_ms": 0.2, "process_long_ms": 0.2, "scale_long_last_ms": 0.2, "write_long_ms": 0.2,
            "scale_growth": 1.1, "state_kb_per_chunk": 0.3}
 
 # key, short name, chart title, how it is measured. The first CHARTED get a chart panel.
@@ -84,6 +91,9 @@ METRICS = [
      "The process job with 200,000 chunks. Median of 5."),
     ("scale_long_last_ms", "large job, long", "Late in a 200,000-chunk job, cost per chunk (ms)",
      "The large thread job with 64 chunks in flight, ten times longer; cost per chunk over its last tenth. Median of 3."),
+    ("write_long_ms", "process, writing", "Process executor, results stored as they arrive, cost per chunk (ms)",
+     "The long process job with every result inserted in a SQLite table from the delivery thread, one transaction "
+     "per call of the job's callback. Median of 3. What it costs over the long process job is the writing."),
     ("first_job_ms", "first job", "First job on a fresh engine (ms)",
      "New engine, one-chunk job on the process executor, pool start-up included. Median of 3."),
     ("import_ms", "import", "Import time (ms)",
@@ -95,7 +105,7 @@ METRICS = [
     ("peak_rss_mb", "peak RSS", "Peak memory of the benchmark process (MB)",
      "ru_maxrss of the main process at the end of the run; workers not included."),
 ]
-CHARTED = 9
+CHARTED = 10
 
 # key, name, what it does, task that is meant to make it pass.
 CHECKS = [

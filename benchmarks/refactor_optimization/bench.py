@@ -18,6 +18,7 @@ import os
 import resource
 import shutil
 import statistics
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -78,13 +79,18 @@ class Engine:
         self.eng.register("process", engine.ProcessExecutor(procs))
 
     def run(self, executor: str, payloads, fn=workers.noop, inflight: int | None = None,
-            marks_every: int = 0, timeout: float = 1800.0, key: str | None = None, options: dict | None = None):
-        """Run one job to its end. Returns (seconds, marks, job_snapshot)."""
+            marks_every: int = 0, timeout: float = 1800.0, key: str | None = None, options: dict | None = None,
+            store=None):
+        """Run one job to its end. Returns (seconds, marks, job_snapshot).
+
+        `store(pairs)` gets the results in groups of `(key, result)`, as a job that writes them does.
+        """
         payloads = list(payloads)
         counter = _Counter(marks_every)
         counter.t0 = time.perf_counter()
+        results = {"on_result": counter.handle} if store is None else {"on_results": store}
         job_id = self.eng.submit(executor, fn, iter(payloads), total=len(payloads), window=inflight, journal="project", key=key,
-                                 on_result=counter.handle, on_terminal=counter.on_job_terminal, **(options or {}))
+                                 on_terminal=counter.on_job_terminal, **results, **(options or {}))
         counter.done.wait(timeout)
         seconds = time.perf_counter() - counter.t0
         return seconds, counter.marks, self.eng.status(job_id)
@@ -122,6 +128,30 @@ def measure_per_chunk(executor: str, n: int, repeats: int = 3) -> list[float]:
         return [1000 * eng.run(executor, _items(n))[0] / n for _ in range(repeats)]
     finally:
         eng.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def measure_write(n: int, repeats: int = 3) -> list[float]:
+    """ms per empty chunk of a process job whose results go into a SQLite table as they arrive."""
+    d = _workdir("write")
+    eng = Engine(d)
+    db = sqlite3.connect(d / "results.db", check_same_thread=False)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("CREATE TABLE results (key BLOB)")
+
+    def store(pairs):
+        with db:  # one transaction per call
+            db.executemany("INSERT INTO results VALUES (?)", [(key,) for key, _ in pairs])
+
+    try:
+        eng.run("process", _items(64), store=store)
+        out = [1000 * eng.run("process", _items(n), store=store)[0] / n for _ in range(repeats)]
+        assert db.execute("SELECT count(*) FROM results").fetchone()[0] == 64 + n * repeats
+        return out
+    finally:
+        eng.close()
+        db.close()
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -231,7 +261,8 @@ def _victim(workdir: str) -> None:
 def _long_jobs(n: int) -> None:
     print(json.dumps({"thread_long_ms": measure_per_chunk("thread", n, repeats=5),
                       "process_long_ms": measure_per_chunk("process", n, repeats=5),
-                      "scale_long_last_ms": [measure_scale(n)["scale_last_ms"] for _ in range(3)]}), flush=True)
+                      "scale_long_last_ms": [measure_scale(n)["scale_last_ms"] for _ in range(3)],
+                      "write_long_ms": measure_write(n)}), flush=True)
 
 
 def check_second_engine() -> dict[str, bool]:

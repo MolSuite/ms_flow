@@ -44,6 +44,7 @@ _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a 
 # whose tasks cost far more than a local process's, starts packing.
 _TASK_SECONDS, _PACK_MAX = 0.1, 64
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
+_DELIVER_MAX = 256  # results of a job that reach its callback in one go
 
 
 def content_key(payload) -> bytes:
@@ -78,7 +79,7 @@ class JobSnapshot:
 
 class _Job:
     __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority",
-                 "on_result", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
+                 "on_result", "on_results", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
@@ -178,7 +179,7 @@ class Engine:
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
-               on_result=None, on_error=None, on_terminal=None) -> int:
+               on_result=None, on_results=None, on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
         `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
@@ -192,6 +193,10 @@ class Engine:
         A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
+        `on_results(pairs)` takes its place for whoever writes results somewhere: it gets every
+        `(key, result)` of the job that is waiting, up to `_DELIVER_MAX`, and all of them count as
+        done once it returns. When it raises, each pair is offered again alone and only the ones
+        that raise again fail, so it must leave nothing behind when it raises: one transaction.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
@@ -210,6 +215,8 @@ class Engine:
         slot = self._executors.get(executor)
         if slot is None:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
+        if on_result is not None and on_results is not None:
+            raise ValueError("on_result or on_results, not both")
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
@@ -233,6 +240,7 @@ class Engine:
         job.window = window or 2 * slot.impl.capacity
         job.pace, job.pack, job.elastic = 0.0, 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
+        job.on_results = on_results
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
         job.done = job.failed = job.open = job.seq = job.peak_mem_mb = 0
@@ -411,7 +419,7 @@ class Engine:
 
     def _on_detach(self, journal: Journal, told: threading.Event) -> None:
         self._on_stop_jobs_of(journal, INTERRUPTED)
-        self._deliveries.put((told.set, (), None))  # behind the callbacks of the jobs just stopped
+        self._deliveries.put((told.set, ()))  # behind the callbacks of the jobs just stopped
 
     def _on_close(self) -> None:
         for job in (*self._waiting, *self._active):  # waiting ones first: they are stopped, not failed
@@ -462,10 +470,10 @@ class Engine:
     def _chunk_ended(self, chunk: _Chunk, status: str, result, error) -> None:
         job = chunk.job
         if status == DONE:
-            if job.on_result is None:
+            if job.on_result is None and job.on_results is None:
                 self._settle(job, chunk.key, chunk.attempt, None)
             else:
-                self._deliveries.put((job.on_result, (chunk.key, result), (job, chunk.key, chunk.attempt)))
+                self._deliveries.put((job, chunk.key, chunk.attempt, result))
         elif status == LOST and chunk.doomed:
             self._attempt_failed(chunk, chunk.doomed)
         elif status == LOST and not chunk.alone:
@@ -491,8 +499,13 @@ class Engine:
             job.open -= 1
             job.seq -= 1
 
+    def _on_delivered(self, job: _Job, outcomes: list) -> None:
+        """The delivery thread's confirmation: these results reached the job's callback."""
+        for key, attempt, error in outcomes:
+            self._settle(job, key, attempt, error)
+
     def _settle(self, job: _Job, key, attempt: int, error: str | None) -> None:
-        """A chunk reached its end: count it and forget it. Also the delivery thread's confirmation."""
+        """A chunk reached its end: count it and forget it."""
         if job.status != RUNNING:
             return
         job.open -= 1
@@ -504,7 +517,7 @@ class Engine:
             job.failed += 1
             job.error = job.error or error
             if job.on_error is not None:
-                self._deliveries.put((job.on_error, (key, error), None))
+                self._deliveries.put((job.on_error, (key, error)))
         self._finish_if_over(job)
 
     def _finish_if_over(self, job: _Job) -> None:
@@ -524,7 +537,7 @@ class Engine:
             self._on_dependency_end(other)
         if job.journal is not None:
             job.journal.job_ended(job, forget_done=status not in RESUMABLE)
-        self._deliveries.put((self._announce, (job,), None))
+        self._deliveries.put((self._announce, (job,)))
 
     def _dispatch(self) -> None:
         for slot in self._executors.values():
@@ -660,20 +673,58 @@ class Engine:
     # --- Delivery thread --------------------------------------------------------------
 
     def _deliver(self) -> None:
+        get, get_nowait, held = self._deliveries.get, self._deliveries.get_nowait, []
         while True:
-            item = self._deliveries.get()
+            item = held.pop() if held else get()
             if item is None:
                 return
-            fn, args, confirm = item
-            error = None
+            if type(item[0]) is not _Job:
+                fn, args = item
+                try:
+                    fn(*args)
+                except Exception:
+                    log.exception("job callback %r failed", fn)
+                continue
+            # A result, as (job, key, attempt, result), and the ones of its job waiting right behind
+            # it: one call for the callback, one event for the loop.
+            # ponytail: results of two jobs that arrive interleaved go one at a time; a buffer per
+            # job if two jobs of short chunks writing at once turns out to be a common case.
+            job, batch = item[0], [item]
+            while len(batch) < _DELIVER_MAX:
+                try:
+                    item = get_nowait()
+                except queue.Empty:
+                    break
+                if item is None or item[0] is not job:
+                    held.append(item)
+                    break
+                batch.append(item)
+            self._events.put((self._on_delivered, job, self._hand_over(job, batch)))
+
+    @staticmethod
+    def _hand_over(job: _Job, batch: list) -> list:
+        """Give `batch` to the job's callback. Returns `(key, attempt, error)` for each result."""
+        errors = [None] * len(batch)
+        if job.on_results is None:
+            for i, (_, key, _, result) in enumerate(batch):
+                try:
+                    job.on_result(key, result)
+                except Exception:
+                    errors[i] = traceback.format_exc()
+        else:
+            pairs = [(key, result) for _, key, _, result in batch]
             try:
-                fn(*args)
+                job.on_results(pairs)
             except Exception:
-                error = traceback.format_exc()
-                if confirm is None:
-                    log.error("job callback %r failed\n%s", fn, error)
-            if confirm is not None:
-                self._events.put((self._settle, *confirm, error))
+                if len(pairs) == 1:
+                    errors[0] = traceback.format_exc()
+                else:  # which ones it cannot take shows when each goes alone
+                    for i, pair in enumerate(pairs):
+                        try:
+                            job.on_results([pair])
+                        except Exception:
+                            errors[i] = traceback.format_exc()
+        return [(key, attempt, error) for (_, key, attempt, _), error in zip(batch, errors)]
 
     def _announce(self, job: _Job) -> None:
         try:
