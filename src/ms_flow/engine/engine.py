@@ -76,6 +76,7 @@ class JobSnapshot:
     finished_at: float | None
     key: str | None  # what the job is called in its journal; submitting it again continues it
     chunks_retried: int  # attempts beyond the first, over all its chunks
+    progress: float | None  # 0 to 1, with how far the running chunks are; None while the total is unknown
 
 
 class _Job:
@@ -84,12 +85,18 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source")
+                 "retried", "batch", "batched", "source", "fine")
 
     def snapshot(self) -> JobSnapshot:
-        return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
+        total, progress = self.total, None
+        if total is not None:
+            # ponytail: a task that ended stops counting here a moment before its chunks count
+            # as done (they do once delivered), so this can step back a little. A state to show.
+            running = self.slot.impl.progress(self.id) if self.slot.tells and self.flying else 0
+            progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
+        return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
-                           self.retried)
+                           self.retried, progress)
 
 
 class _Chunk:
@@ -109,11 +116,12 @@ class _Chunk:
 class _Slot:
     """A registered executor and what the loop tracks about it."""
 
-    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing")
+    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
         self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
+        self.tells = hasattr(impl, "progress")
 
 
 class Engine:
@@ -180,7 +188,7 @@ class Engine:
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
-               batch: int | None = None, batched: bool = False,
+               batch: int | None = None, batched: bool = False, progress: bool | None = None,
                on_result=None, on_results=None, on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -207,6 +215,10 @@ class Engine:
         `_RECOUNT` seconds after, exact once the source is read. With `open(state)`, it is called
         before the first read and what it returns (JSON) is kept with the job in its journal and
         passed back as `state` when the job continues; `state` is None the first time.
+        `progress` says whether the tasks of the job are watched, for `JobSnapshot.progress` to
+        count how far the running chunks are and not only the ones that ended (see
+        `executors.report`). By default a task of several chunks is, and a task of one when the
+        job has at most two for each worker.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
@@ -249,7 +261,7 @@ class Engine:
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
                              f"the engine has {self.tokens.total}")
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
-        job.batch, job.batched = batch or 0, batched
+        job.batch, job.batched, job.fine = batch or 0, batched, progress
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
         job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
@@ -643,11 +655,18 @@ class Engine:
         chunk.doomed, chunk.spared = None, False
         job.flying.add(chunk)
         chunk.started = time.perf_counter()
+        # Watched: a task of several chunks, which counts them by itself, and a task of one when
+        # its job has few (or says so), where how far each one is makes the difference.
+        fine = job.fine
+        if fine is None:
+            fine = chunk.pack is not None or (job.total is not None and job.total <= 2 * slot.impl.capacity)
+        watch = {"owner": job.id} if fine and slot.tells else {}
         try:
             if chunk.pack is None:
-                chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk)
+                chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk, **watch)
             else:  # one task, so one worker and one chunk's tokens: they run one after another
-                chunk.handle = slot.impl.submit_many(job.fn, [c.payload for c in chunk.pack], chunk, job.batched)
+                chunk.handle = slot.impl.submit_many(job.fn, [c.payload for c in chunk.pack], chunk, job.batched,
+                                                     **watch)
         except Exception:
             self._on_done(chunk, ERROR, None, "the executor refused the chunk\n" + traceback.format_exc(), 0)
 

@@ -17,14 +17,19 @@ The engine knows an executor only through this contract:
   `whole`, `fn` is called once with the list and returns one result per payload.
 - `kill()`, optional: stop whatever is running, now. Every chunk in flight comes back `LOST`.
   Without it a chunk cannot have a time limit, and one that started runs to its end.
+- `progress(owner) -> float`, optional: how many chunks' worth of work the tasks in flight that
+  were submitted with `owner=` that value have done. With it `submit` and `submit_many` take
+  `owner`, and the engine passes it for the tasks worth watching.
 
 `status` is `DONE`, `ERROR` (the function raised), `LOST` (the worker went away: nobody
 knows whether the chunk ran) or `CANCELED`.
 """
 from __future__ import annotations
 
+import mmap
 import os
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -85,25 +90,35 @@ class ProcessExecutor:
         self._new_pool = partial(ProcessPoolExecutor, max_workers, initializer=_die_with_parent,
                                  initargs=(os.getpid(),))
         self._pool = self._new_pool()
+        self._slots = _Slots()
 
     def bind(self, on_done) -> None:
         self._on_done = on_done
 
-    def submit(self, fn, payload, tag, call=None):
-        call = call or _call
+    def submit(self, fn, payload, tag, call=None, owner=None):
+        index = None if owner is None else self._slots.take(owner)
+        task = (call or _call, fn, payload)
+        if index is not None:
+            task = (_watched, self._slots.path, index, *task)
         try:
-            future = self._pool.submit(call, fn, payload)
+            future = self._pool.submit(*task)
         except self._lost:  # a worker died: loky refuses this pool for good
             self._pool.shutdown(wait=False, kill_workers=True)
             self._pool = self._new_pool()
-            future = self._pool.submit(call, fn, payload)
-        future.add_done_callback(partial(self._finished, tag))
+            future = self._pool.submit(*task)
+        future.add_done_callback(partial(self._finished, tag, index))
         return future
 
-    def submit_many(self, fn, payloads, tag, whole=False):
-        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many)
+    def submit_many(self, fn, payloads, tag, whole=False, owner=None):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner)
 
-    def _finished(self, tag, future) -> None:
+    def progress(self, owner) -> float:
+        done = self._slots.done
+        return sum(done[index] for index, whose in enumerate(self._slots.owners) if whose == owner)
+
+    def _finished(self, tag, index, future) -> None:
+        if index is not None:
+            self._slots.free(index)
         status, value, error = _outcome(future, self._lost)
         result, peak_mb = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, peak_mb)
@@ -122,9 +137,66 @@ class ProcessExecutor:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True, kill_workers=True)  # waiting is what lets loky clean up after itself
+        try:
+            os.unlink(self._slots.path)  # ponytail: stays behind on Windows, where a mapped file cannot go
+        except OSError:
+            pass
+
+
+class _Slots:
+    """One float for each task being watched, in a file the workers map: how many chunks' worth of
+    its work the task has done. The workers write and `progress` reads: nothing queues, nothing
+    wakes anybody up, and only the last value matters.
+    """
+
+    def __init__(self, n: int = 1024):  # ponytail: the tasks watched at once; one more runs unwatched
+        fd, self.path = tempfile.mkstemp(prefix="msflow-progress-")
+        os.ftruncate(fd, 8 * n)
+        self.done = memoryview(mmap.mmap(fd, 8 * n)).cast("d")
+        os.close(fd)
+        self.owners = [None] * n
+        self._free = list(range(n))
+
+    def take(self, owner) -> int | None:
+        try:
+            index = self._free.pop()
+        except IndexError:
+            return None
+        self.done[index], self.owners[index] = 0.0, owner
+        return index
+
+    def free(self, index: int) -> None:
+        self.owners[index] = None
+        self._free.append(index)
 
 
 # --- Worker side --------------------------------------------------------------------
+
+_slots = None  # (path, floats): the executor's progress file as this worker maps it
+_at = None  # [slot, chunks of the task done, chunks `fn` is working on]: set while the task is watched
+
+
+def report(fraction: float) -> None:
+    """From a task: how far the element it is working on is, from 0 to 1.
+
+    Does nothing unless the task is watched: a job of few elements, or one submitted with
+    `progress=True`.
+    """
+    if _at is not None:
+        _slots[1][_at[0]] = _at[1] + fraction * _at[2]
+
+
+def _watched(path, index, call, fn, payload):
+    global _slots, _at
+    if _slots is None or _slots[0] != path:
+        with open(path, "r+b") as file:
+            _slots = (path, memoryview(mmap.mmap(file.fileno(), 0)).cast("d"))
+    _at = [index, 0, 1]
+    try:
+        return call(fn, payload)
+    finally:
+        _at = None
+
 
 def _call(fn, payload):
     return fn(payload), _peak_mb()
@@ -137,10 +209,14 @@ def _call_many(fn, payloads):
             outcomes.append((fn(payload), None))
         except Exception:  # one chunk failing is not the others failing
             outcomes.append((None, traceback.format_exc()))
+        if _at is not None:
+            _at[1] = _slots[1][_at[0]] = len(outcomes)
     return outcomes, _peak_mb()
 
 
 def _call_whole(fn, payloads):
+    if _at is not None:
+        _at[2] = len(payloads)
     results = list(fn(payloads))
     if len(results) != len(payloads):
         raise ValueError(f"{len(results)} results for {len(payloads)} payloads: a batched function returns one for each")

@@ -175,7 +175,7 @@ Hace falta trabajo, ya medido o localizado:
 - **Escritura agrupada (hecho, ver abajo).** Una escritura por elemento cuesta 0,39 ms y con tasks rápidas es todo el tiempo del job (0,31 de 0,32 s en 800 elementos); agrupando 64 baja a 0,06 s. El motor da un elemento por hecho cuando vuelve `on_result`, así que agrupar fuera del motor dejaría elementos registrados como hechos sin estar en disco. Tiene que agrupar el motor y dar el lote por hecho al escribirlo.
 - **Lote forzado y task por lotes (hecho, ver abajo).** El motor solo empaqueta por su medida; faltan `batch=` y `@task(batched=True)`.
 - **Total que cambia (hecho, ver abajo).** `total=` se fija al enviar; falta poder corregirlo durante la ejecución.
-- **Progreso.** El fichero de ranuras está probado suelto (carrera y coste), no unido al motor ni a los workers.
+- **Progreso.** Hecho en el ejecutor de procesos (ver «Hecho: progreso»). Falta el de HPC, por lote.
 - **Monitor.** Lee el `executor.db` del motor viejo; `JobSnapshot` no lleva fase, progreso fino ni ritmo.
 
 Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolución de `FileInputSpec` en el hilo del job, progreso por lote en HPC.
@@ -232,3 +232,19 @@ def docking(params, project):
 - Al reanudar, si la fuente vuelve a traer lo ya hecho en otro orden, el total sale alto hasta el siguiente recuento.
 - Límite conocido: el tope es `max(id)`. Si se borran las últimas filas de una tabla sin `AUTOINCREMENT`, SQLite vuelve a dar esas claves y las filas que las tomen entran.
 - Sin hacer: `source=` en `@job` para no escribir la función; se puede devolver la fuente desde ella, que además deja usar los parámetros en el filtro.
+
+## Hecho: progreso (2026-10-08)
+
+Rama `refactor/job-progress`.
+
+- **`JobSnapshot.progress`**: de 0 a 1, (elementos hechos + fallidos + lo que llevan los que corren) / total. `None` mientras no hay total.
+- **Casillas.** `ProcessExecutor` crea un fichero temporal de 1024 números, uno por task vigilada, y los workers lo mapean. El worker escribe, el motor lee al pedir el estado. Nada pasa por colas. Con las 1024 ocupadas, la task siguiente corre sin vigilar.
+- **Lote de varios elementos**: el worker apunta cada elemento que termina. Siempre vigilado, la función no hace nada.
+- **Lote de uno**: la task llama a `ms_flow.engine.report(fraccion)`. Solo se vigila si el job tiene como mucho dos elementos por worker, o si se envía con `progress=True`. Sin vigilar, `report` no hace nada.
+- **Función que recibe el lote entero** (`batched=True`): `report(fraccion)` es la fracción del lote.
+- **Ejecutor de hilos**: sin fracción, cuenta elementos terminados.
+- Contrato del ejecutor: `progress(owner)` opcional; con él, `submit` y `submit_many` aceptan `owner=`.
+- Comprobado en `tests/test_engine_core.py`: 2 elementos a la mitad dan 0,5; dos lotes de 4 con tres terminados y uno a la mitad dan 0,875 sin ningún elemento entregado; 6 elementos sin vigilar dan 0 y con `progress=True` dan 1/6.
+- Límite conocido: una task que termina deja de contar en su casilla un instante antes de que sus elementos cuenten como hechos (cuentan al entregarse), así que el valor puede retroceder un poco. En Windows el fichero temporal se queda al cerrar.
+- Sin hacer: progreso por lote en HPC (va con el ejecutor remoto), y el monitor, que todavía lee el motor viejo.
+- Registro de coste pendiente, como los anteriores (máquina ocupada). Lo añadido por elemento en un lote es una escritura en memoria (217 ns medidos sueltos).

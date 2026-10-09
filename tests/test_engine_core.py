@@ -10,7 +10,7 @@ from contextlib import closing
 import pytest
 
 from benchmarks.refactor_optimization import workers
-from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key
+from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key, report
 
 
 def _boom_on_3(payload):
@@ -32,6 +32,15 @@ def _sizes(payloads):
     if "fail" in payloads:
         raise ValueError("asked to")
     return [len(payloads)] * len(payloads)
+
+
+def _half_then_held(payload):
+    """Says it is halfway and, if held, stays there until the gate file is there."""
+    report(0.5)
+    open(payload["gate"] + ".said", "w").close()
+    while payload["held"] and not os.path.exists(payload["gate"]):
+        time.sleep(0.01)
+    return payload["idx"]
 
 
 class _Gauge:
@@ -367,3 +376,60 @@ def test_retries_time_limit_and_cancel_that_kills(tmp_path):
         while engine.tokens.free[0] != 4 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert engine.tokens.free[0] == 4
+
+
+def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
+    def held(n, which, gate):
+        return [{"idx": i, "held": which(i), "gate": str(tmp_path / gate)} for i in range(n)]
+
+    def reaches(job_id, progress):
+        deadline = time.monotonic() + 30
+        while (snap := engine.status(job_id)).progress != progress:
+            assert time.monotonic() < deadline, snap
+            time.sleep(0.01)
+        return snap
+
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(2))
+        engine.register("thread", ThreadExecutor(2))
+
+        # few chunks: each one is watched, and what it reports counts
+        few = engine.submit("process", _half_then_held, held(2, lambda i: True, "few"), total=2)
+        assert reaches(few, 0.5).chunks_done == 0
+        (tmp_path / "few").touch()
+        assert engine.wait(few, 30).progress == 1.0
+
+        # chunks sharing a task: the worker counts the ones it ends, whatever they report
+        packed = engine.submit("process", _half_then_held, held(8, lambda i: i % 4 == 3, "packed"), total=8, batch=4)
+        assert reaches(packed, 0.875).chunks_done == 0  # three ended and one halfway, in each of the two tasks
+        (tmp_path / "packed").touch()
+        assert engine.wait(packed, 30).progress == 1.0
+
+        # not watched (many chunks, or an executor that cannot tell): the chunks that ended, no more
+        for executor, n in (("process", 6), ("thread", 2)):
+            job_id = engine.submit(executor, _half_then_held, held(n, lambda i: True, executor), total=n)
+            while not (tmp_path / f"{executor}.said").exists():
+                time.sleep(0.01)
+            assert engine.status(job_id).progress == 0.0
+            (tmp_path / executor).touch()
+            assert engine.wait(job_id, 30).progress == 1.0
+
+        # unless the job asks for it
+        asked = engine.submit("process", _half_then_held, held(6, lambda i: True, "asked"), total=6, progress=True)
+        reaches(asked, 0.5 * 2 / 6)
+        (tmp_path / "asked").touch()
+        assert engine.wait(asked, 30).progress == 1.0
+
+        # no total until the source ends: nothing to be a part of
+        ended = threading.Event()
+
+        def source():
+            yield {}
+            ended.wait(30)
+
+        unknown = engine.submit("thread", _echo, source())
+        while engine.status(unknown).chunks_done != 1:
+            time.sleep(0.01)
+        assert engine.status(unknown).progress is None
+        ended.set()
+        assert engine.wait(unknown, 30).progress == 1.0
