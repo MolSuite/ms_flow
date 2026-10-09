@@ -36,6 +36,7 @@ knows whether the chunk ran) or `CANCELED`.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import mmap
 import os
 import shutil
@@ -168,8 +169,9 @@ class RayExecutor:
     copy in its temporary directory, and what a result names under a `Dir` comes back with it.
     """
 
-    # ponytail: no `kill`, so no time limit for a chunk on Ray, and no `progress`. A forced
-    # `ray.cancel` of each task in flight is the first; the second needs a way back from the nodes.
+    # ponytail: the time limit of a chunk counts from when Ray takes its task, so a job whose
+    # chunks ask for more CPUs than Ray has free spends part of it waiting there. The task
+    # saying when it began, through the tally, is what would count only the run.
     uses_tokens, wants_cost = False, True
 
     def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None, **init):
@@ -179,6 +181,11 @@ class RayExecutor:
         # ponytail: a file stays in the object store until `shutdown`; let go of those of a job
         # when it ends once a library of one file per element fills the store.
         self._carried = {}  # (path, when it changed, size) -> _Carried
+        self._flying, self._killed = set(), set()  # the tasks Ray has, and those of them `kill` stopped
+        # How far each watched task is: the nodes tell an actor, and what it holds is asked for
+        # whenever `progress` is, so that one answers with what the time before brought.
+        self._tally, self._watched, self._said, self._asking = None, {}, {}, False
+        self._ids = itertools.count()
         ray.init(address=address, **{"include_dashboard": False, "log_to_driver": False, **init})
         # How many tasks are handed to Ray at once: it queues those it has no room for.
         self.capacity = capacity or int(ray.cluster_resources().get("CPU", 1))
@@ -191,7 +198,7 @@ class RayExecutor:
     def bind(self, on_done) -> None:
         self._on_done = on_done
 
-    def submit(self, fn, payload, tag, call=None, cost=(1, 0, 0)):
+    def submit(self, fn, payload, tag, call=None, cost=(1, 0, 0), owner=None):
         run = self._sized.get(cost)
         if run is None:
             cpu, gpu, mem_mb = cost
@@ -200,9 +207,35 @@ class RayExecutor:
         dirs = []
         if not self.shared:
             payload = swap(payload, partial(self._mark, dirs))
-        ref = run.remote(call or _call, fn, payload)
-        ref.future().add_done_callback(partial(self._finished, tag, dirs))
+        call, index = call or _call, None
+        if owner is not None:
+            if self._tally is None:
+                self._tally = self._ray.remote(num_cpus=0)(_Tally).remote()
+            index = next(self._ids)
+            self._watched[index] = owner
+            call = partial(_told, self._tally, index, call)
+        ref = run.remote(call, fn, payload)
+        self._flying.add(ref)
+        ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs))
         return ref
+
+    def progress(self, owner) -> float:
+        if self._tally is not None and not self._asking:
+            self._asking = True
+            self._tally.all.remote().future().add_done_callback(self._heard)
+        said = self._said
+        return sum(said.get(index, 0.0) for index, whose in list(self._watched.items()) if whose == owner)
+
+    def _heard(self, future) -> None:
+        self._asking = False
+        if not future.cancelled() and future.exception() is None:
+            self._said = future.result()
+
+    def kill(self) -> None:
+        # Everything Ray has, which is what the engine asks for: it could stop one task alone.
+        for ref in list(self._flying):
+            self._killed.add(ref)
+            self._ray.cancel(ref, force=True)
 
     def _mark(self, dirs: list, mark):
         if isinstance(mark, Dir):
@@ -217,13 +250,19 @@ class RayExecutor:
                                               self._ray.put(file.read()))
         return self._carried[key]
 
-    def submit_many(self, fn, payloads, tag, whole=False, cost=(1, 0, 0)):
-        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, cost)
+    def submit_many(self, fn, payloads, tag, whole=False, cost=(1, 0, 0), owner=None):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, cost, owner)
 
-    def _finished(self, tag, dirs, future) -> None:
+    def _finished(self, tag, ref, index, dirs, future) -> None:
+        self._flying.discard(ref)
+        self._watched.pop(index, None)
         status, value, error = _outcome(future, self._lost)
         if status == ERROR and isinstance(future.exception(), self._ray.exceptions.TaskCancelledError):
             status = CANCELED
+        if ref in self._killed:
+            self._killed.discard(ref)
+            if status != DONE:  # as when a pool is killed: the engine knows which one it was after
+                status, error = LOST, error or "stopped with its worker"
         if status == DONE and not self.shared:
             (result, peak_mb), root, files = value
 
@@ -311,6 +350,44 @@ def _call(fn, payload):
 
 def _apply(call, fn, payload):
     return call(fn, payload)
+
+
+class _Tally:
+    """The actor of a `RayExecutor` that holds how far each of its watched tasks is."""
+
+    def __init__(self):
+        self.done = {}
+
+    def tell(self, index, done):
+        self.done[index] = done
+
+    def drop(self, index):
+        self.done.pop(index, None)
+
+    def all(self):
+        return self.done
+
+
+def _told(tally, index, call, fn, payload):
+    """`_watched` on a node: what the task says goes to the tally, twice a second at most."""
+    global _slots, _at
+    said, over = [0.0], threading.Event()
+
+    def tell():
+        sent = 0.0
+        while not over.wait(0.5):
+            if said[0] != sent:
+                sent = said[0]
+                tally.tell.remote(index, sent)
+
+    threading.Thread(target=tell, daemon=True).start()
+    _slots, _at = (None, said), [0, 0, 1]
+    try:
+        return call(fn, payload)
+    finally:
+        _at = None
+        over.set()
+        tally.drop.remote(index)  # ponytail: a task stopped with its worker leaves its number there
 
 
 class _Carried:

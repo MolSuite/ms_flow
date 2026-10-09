@@ -31,6 +31,16 @@ def leave(payload: dict) -> dict:
     return {"made": path}
 
 
+def half_then_held(payload: dict) -> int:
+    """Says it is halfway and stays there until the gate file is there."""
+    from ms_flow.engine import report
+
+    report(0.5)
+    while not os.path.exists(payload["gate"]):
+        time.sleep(0.01)
+    return payload["idx"]
+
+
 def nap(payload: dict) -> dict:
     time.sleep(float(payload["s"]))
     return {"ok": 1}

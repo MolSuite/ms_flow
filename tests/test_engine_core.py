@@ -506,3 +506,18 @@ def test_the_same_jobs_on_ray(tmp_path):
         dead = engine.wait(engine.submit("ray", workers.die_on_7, [{"idx": i} for i in range(12)]), 120)
         assert (dead.status, dead.chunks_done, dead.chunks_failed) == ("completed_with_errors", 11, 1)
         assert "worker process died" in dead.error
+
+        # a chunk that hangs is cut at the limit; the ones that fell with it are not charged
+        naps = [{"idx": i, "s": 60 if i == 5 else 0.2} for i in range(12)]
+        cut = engine.wait(engine.submit("ray", workers.nap, naps, timeout=2.0), 120)
+        assert (cut.status, cut.chunks_done, cut.chunks_failed, cut.chunks_retried) == ("completed_with_errors", 11, 1, 0)
+        assert "timed out" in cut.error
+
+        # what a running chunk says of itself comes back from the nodes
+        held = engine.submit("ray", workers.half_then_held, [{"idx": i, "gate": str(tmp_path / "gate")} for i in range(2)])
+        deadline = time.monotonic() + 30
+        while (snap := engine.status(held)).progress != 0.5:
+            assert time.monotonic() < deadline, snap
+            time.sleep(0.05)
+        (tmp_path / "gate").touch()
+        assert engine.wait(held, 30).progress == 1.0
