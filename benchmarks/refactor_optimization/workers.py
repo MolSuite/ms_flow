@@ -9,6 +9,10 @@ def noop(payload: dict) -> dict:
     return {"ok": 1}
 
 
+def row(payload: dict) -> dict:
+    return {"idx": payload["idx"], "ok": 1}
+
+
 def die_on_7(payload: dict) -> dict:
     if payload["idx"] == 7:
         os._exit(1)

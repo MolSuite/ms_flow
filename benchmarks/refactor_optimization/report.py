@@ -72,6 +72,7 @@ STEPS = {
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
 TARGETS = {"thread_ms_per_chunk": 0.2, "process_ms_per_chunk": 0.2, "scale_last_ms": 0.2, "scale_first_ms": 0.2,
            "thread_long_ms": 0.2, "process_long_ms": 0.2, "scale_long_last_ms": 0.2, "write_long_ms": 0.2,
+           "api_long_ms": 0.2,
            "scale_growth": 1.1, "state_kb_per_chunk": 0.3}
 
 # key, short name, chart title, how it is measured. The first CHARTED get a chart panel.
@@ -94,6 +95,9 @@ METRICS = [
     ("write_long_ms", "process, writing", "Process executor, results stored as they arrive, cost per chunk (ms)",
      "The long process job with every result inserted in a SQLite table from the delivery thread, one transaction "
      "per call of the job's callback. Median of 3. What it costs over the long process job is the writing."),
+    ("api_long_ms", "task and job, writing", "A job written with @task and @job, cost per element (ms)",
+     "The long process job as a package writes it: a task that returns one row, a source that gives the elements "
+     "and a table_sink into a project table. Median of 3. What it costs over the one above is the project store."),
     ("first_job_ms", "first job", "First job on a fresh engine (ms)",
      "New engine, one-chunk job on the process executor, pool start-up included. Median of 3."),
     ("import_ms", "import", "Import time (ms)",
@@ -105,7 +109,7 @@ METRICS = [
     ("peak_rss_mb", "peak RSS", "Peak memory of the benchmark process (MB)",
      "ru_maxrss of the main process at the end of the run; workers not included."),
 ]
-CHARTED = 10
+CHARTED = 11
 
 # key, name, what it does, task that is meant to make it pass.
 CHECKS = [

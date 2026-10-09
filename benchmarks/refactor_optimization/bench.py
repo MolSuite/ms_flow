@@ -155,6 +155,41 @@ def measure_write(n: int, repeats: int = 3) -> list[float]:
         shutil.rmtree(d, ignore_errors=True)
 
 
+def measure_api(n: int, repeats: int = 3) -> list[float]:
+    """ms per element of a job written with `@task` and `@job`: one row for each into a project table."""
+    from ms_flow import engine
+    from ms_flow.core.database.project import ProjectStore
+    from ms_flow.sinks import table_sink
+
+    d = _workdir("api")
+    with sqlite3.connect(d / "project.db") as db:
+        db.execute("CREATE TABLE results (idx INT, ok INT)")
+    items = _items(n)
+
+    @engine.job(task=engine.task()(workers.row), output=table_sink("results", columns=("idx", "ok")))
+    def rows(count, project):
+        return iter(items[:count])
+
+    eng = Engine(d)
+    flow = engine.Flow(eng.eng, ProjectStore.open_at(d / "project.db"))
+
+    def run(count: int) -> float:
+        t0 = time.perf_counter()
+        job = eng.eng.wait(flow.submit(rows, count, total=count, journal="project"), 1800)
+        assert job.chunks_done == count, job
+        return time.perf_counter() - t0
+
+    try:
+        run(64)
+        out = [1000 * run(n) / n for _ in range(repeats)]
+        with sqlite3.connect(d / "project.db") as db:
+            assert db.execute("SELECT count(*) FROM results").fetchone()[0] == 64 + n * repeats
+        return out
+    finally:
+        eng.close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def measure_first_job(repeats: int = 3) -> list[float]:
     """ms from a fresh engine to the end of a one-chunk process job."""
     out = []
@@ -262,7 +297,7 @@ def _long_jobs(n: int) -> None:
     print(json.dumps({"thread_long_ms": measure_per_chunk("thread", n, repeats=5),
                       "process_long_ms": measure_per_chunk("process", n, repeats=5),
                       "scale_long_last_ms": [measure_scale(n)["scale_last_ms"] for _ in range(3)],
-                      "write_long_ms": measure_write(n)}), flush=True)
+                      "write_long_ms": measure_write(n), "api_long_ms": measure_api(n)}), flush=True)
 
 
 def check_second_engine() -> dict[str, bool]:

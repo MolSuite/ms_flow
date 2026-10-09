@@ -186,3 +186,30 @@ Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolució
 - `refactor/engine-resume-count`: sin aviso al reanudar; lo hecho cuenta aunque la fuente no lo traiga.
 - `refactor/engine-grouped-delivery`: escritura agrupada. `on_results(pares)` recibe de una vez todos los resultados del job que están esperando (hasta 256) y se dan por hechos cuando vuelve. Si falla, se ofrecen de uno en uno y solo fallan los malos, así que tiene que ser todo o nada (una transacción). Guardar una fila por resultado cuesta 0,004 ms por elemento, frente a 0,02-0,03 ms con una transacción por resultado. Límite: resultados de dos jobs que llegan intercalados salen de uno en uno.
 - `refactor/engine-forced-batch`: `batch=N` fija cuántos elementos van por tarea (la tarea espera a tener N; solo la última lleva menos) y `batched=True` hace que la función reciba la lista y devuelva un resultado por elemento. Si una función por lotes falla, falla su lote entero. Solo en ejecutores que agrupan (el de procesos); el de hilos lo rechaza. Medida en el informe pendiente: la máquina estaba ocupada al terminar.
+
+## Hecho en la API (2026-10-08)
+
+Rama `refactor/task-job-api`: `task`, `job` y `Flow` en `ms_flow.engine` (`engine/flow.py`, 112 líneas), junto al motor nuevo. Los nombres `task` y `job` de `ms_flow` siguen siendo los viejos hasta que la fachada cambie de motor.
+
+```python
+from ms_flow.engine import Flow, job, task
+
+flow = Flow(engine, project)   # project: lo que recibe la fuente y donde escriben los sinks
+job_id = flow.submit(docking_job, {"exhaustiveness": 8}, executor="process", batch=None, after=())
+```
+
+Lo que hay:
+
+- `@task(cpu, gpu, mem_mb, retries, batch, batched)` deja la función como estaba, con sus necesidades anotadas: se puede llamar a mano y viaja a los workers por su nombre.
+- La task recibe `params` solo si tiene un parámetro con ese nombre. Viajan con la función, una vez por lote.
+- `params_model` valida al enviar: un parámetro mal puesto falla en `submit`, no en un worker.
+- `output` es `table_sink` (la task devuelve filas) o `graph_sink` (devuelve `{nodo: filas}`). Se escribe en el hilo de entrega, una transacción por grupo de resultados; un elemento que no devuelve nada no escribe.
+- Las referencias (`$ref`) de un `graph_sink` son locales a lo que devuelve un elemento: al escribir varios juntos, cada una lleva delante el puesto de su elemento en el grupo. Excepción: si el campo de la referencia es también una columna de la tabla, es dato y no se toca; ahí tiene que ser única en el job, como hoy.
+- Encontrado al probarlo: `insert_graph` no detecta dos filas con la misma referencia en una escritura (la comprobación mira un mapa que se rellena después de recorrer las filas) y se queda con la última, así que las filas hijas de la primera acaban colgadas de la otra, sin error. Con el motor viejo pasa igual cuando agrupa varios chunks (`flush_every` > 1). No lo he tocado: es la capa de base de datos y los nodos `upsert` repiten referencia a propósito. Pendiente de decidir.
+- Lote: `batch=` del envío, y si no, el de `@task`. Falta el nivel del ejecutor.
+- Dependencias: el job espera a los jobs sin terminar, enviados por el mismo `Flow`, que escriben una tabla de su `reads=`. Si uno de ellos falla o se cancela, el que espera falla (regla de `after=` del motor).
+- Lo demás de `Engine.submit` (`key`, `journal`, `priority`, `total`) pasa tal cual.
+
+Lo que no hay todavía: `file_sink` como destino (ningún job de AMDockVS lo usa), `source=` con objetos de `ms_flow`, `local=True`, pasos `setup` y `finalize`, `report()`, total con tope y recuento.
+
+Medido con la máquina ocupada (200 000 elementos, una fila por elemento): 0,017 ms por elemento con el sink del proyecto frente a 0,0155 ms escribiendo con `sqlite3` a mano. Medida nueva en el informe: `api_long_ms`. Registro pendiente, igual que el del lote forzado.
