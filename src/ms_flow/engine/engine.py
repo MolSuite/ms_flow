@@ -223,7 +223,7 @@ class Engine:
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
-               batch: int | None = None, batched: bool = False, progress: bool | None = None,
+               batch: int | None = None, batched: bool = False, progress: bool | None = None, origin=None,
                on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -261,6 +261,8 @@ class Engine:
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
         not run again. `discard` is how such a job is given up instead.
+        `origin` is whatever whoever submits wants kept with the job there (JSON): `recorded`
+        gives it back in `spec`.
         `after` is the ids of the jobs that must end first; `chunks` is not read until they do,
         and the job fails if one of them fails, is canceled or is interrupted.
         A chunk that fails runs again up to `retries` times, `retry_wait` seconds after the first
@@ -294,7 +296,7 @@ class Engine:
             job.spec = json.dumps({
                 "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
-                "retries": retries, "retry_wait": retry_wait, "timeout": timeout, "batch": batch})
+                "retries": retries, "retry_wait": retry_wait, "timeout": timeout, "batch": batch, "origin": origin})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
         job.needs = (cpu, gpu, mem_mb)
         if job.cost is not None and not self.tokens.ever_fits(job.cost):

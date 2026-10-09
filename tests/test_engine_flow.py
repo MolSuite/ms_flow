@@ -255,6 +255,38 @@ def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(proj
         assert sql("SELECT max(ligand_id) FROM docking_results") == [(410,)]
 
 
+def test_a_recorded_job_is_submitted_again_with_what_it_was_submitted_with(project, tmp_path):
+    with closing(sqlite3.connect(str(project.db_path))) as conn, conn:
+        conn.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) "
+                     "INSERT INTO ligands (smiles) SELECT 'C' FROM n")
+
+    def flow_of(engine):
+        engine.attach("project", tmp_path / "executor.db")
+        engine.register("thread", ThreadExecutor(4))
+        return Flow(engine, project)
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        flow = flow_of(engine)
+        done = flow.submit(docking, {"ligands": 5, "poses": 2}, executor="thread", journal="project", priority=3)
+        assert engine.wait(done, 30).status == "completed"
+        assert flow.origin(engine.status(done).key, "project") == {
+            "job": f"{docking.__module__}:docking", "params": {"ligands": 5, "poses": 2, "interactions": False},
+            "options": {"executor": "thread", "priority": 3}}
+        with pytest.raises(ValueError, match="already ended as completed"):
+            flow.resume(engine.status(done).key, journal="project")
+        cut = flow.submit(every_ligand, executor="thread", journal="project")
+        _until(lambda: engine.status(cut).chunks_done >= 20)
+        key = engine.status(cut).key
+    assert engine.status(cut).status == "interrupted"
+
+    with Engine(cpus=4, mem_mb=0) as engine:  # another run: all it has is the key
+        again = engine.wait(flow_of(engine).resume(key, journal="project"), 60)
+        assert (again.status, again.chunks_done, again.key) == ("completed", 400, key)
+    with closing(sqlite3.connect(str(project.db_path))) as conn:
+        assert conn.execute("SELECT count(*), count(DISTINCT ligand_id) FROM docking_results "
+                            "WHERE pose_rank = 0 AND ligand_id > 4").fetchall() == [(396, 396)]
+
+
 def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path, monkeypatch):
     from ms_flow.api import Workspace
 
@@ -299,7 +331,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         assert [(job.id, job.status) for job in past] == [(None, "completed"), (None, "interrupted")]
         assert (past[0].chunks_done, past[0].progress, past[1].key) == (300, 1.0, "again")
         assert [job.key for job in ms.jobs(limit=1)] == ["again"]
-        again = ms.engine.wait(ms.submit(every_ligand, executor="thread", key="again"), 120)
+        again = ms.engine.wait(ms.resume("again"), 120)  # on threads, as it was submitted
         assert (again.status, again.chunks_done) == ("completed", 300)
         assert sql(db, "SELECT count(*) FROM docking_results") == [(600,)]
         assert ms.get_project_activity()["jobs_active"] == 0

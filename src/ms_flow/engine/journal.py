@@ -30,7 +30,7 @@ CREATE TABLE jobs (
     job_id TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
     status TEXT NOT NULL,
-    spec TEXT NOT NULL,           -- JSON: executor, function, options
+    spec TEXT NOT NULL,           -- JSON: executor, function, options, and `origin` (see `Engine.submit`)
     total INTEGER, done INTEGER NOT NULL, failed INTEGER NOT NULL,
     error TEXT, started_at REAL, finished_at REAL,
     source TEXT                   -- JSON: what its source asked to keep, given back when it continues

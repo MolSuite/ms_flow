@@ -20,9 +20,11 @@ returns its writer.
         def finish(self): ...               # optional: once every element has ended; if it raises, the job fails
 """
 import functools
+import importlib
 import inspect
 import json
 import threading
+import uuid
 from pathlib import Path
 
 
@@ -151,6 +153,25 @@ def _merged(output, results: list):
     return merged
 
 
+def named(where: str):
+    """What `module:qualname` names."""
+    module, _, name = where.partition(":")
+    return functools.reduce(getattr, name.split("."), importlib.import_module(module))
+
+
+def _origin(job, params, options: dict):
+    """What it takes to submit `job` again, or None when it cannot be written down."""
+    where = f"{job.__module__}:{job.__qualname__}"
+    try:
+        if named(where) is not job:
+            return None
+        params = params.model_dump(mode="json") if hasattr(params, "model_dump") else params
+        kept = {name: value for name, value in options.items() if isinstance(value, (bool, int, float, str))}
+        return json.loads(json.dumps({"job": where, "params": params, "options": kept}))
+    except Exception:
+        return None
+
+
 class Flow:
     """Submits jobs for one project: `project` is what a source receives and where the sinks write."""
 
@@ -166,6 +187,8 @@ class Flow:
         What else `Engine.submit` takes (`key`, `journal`, `priority`, `total`...) passes through.
         The sink is written on the engine's delivery thread, one transaction for each group of
         results, and an element is done once its rows are in.
+        A job that goes to a journal always has a key, its own or one made here, and is recorded
+        with what it was submitted with: see `resume`.
         """
         spec = job.__job__
         fn, output = spec["task"], spec["output"]
@@ -175,6 +198,10 @@ class Flow:
         needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"]}
         if spec["params_model"] is not None:
             params = spec["params_model"].model_validate(params or {})
+        if engine.get("journal") is not None:
+            engine["key"] = engine.get("key") or uuid.uuid4().hex
+            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, **{
+                name: value for name, value in engine.items() if name not in ("journal", "key")}})
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
 
@@ -205,3 +232,21 @@ class Flow:
                                         **needs, **engine)
             self._writing[job_id] = frozenset(getattr(writer, "tables", ()))
         return job_id
+
+    def origin(self, key: str, journal: str) -> dict:
+        """What the job recorded as `key` in `journal` was submitted with: `job` (as `named` reads
+        it), `params` and `options`."""
+        spec = next((row["spec"] for row in self.engine.recorded(journal) if row["job_id"] == key), None)
+        origin = json.loads(spec or "{}").get("origin")
+        if origin is None:
+            raise ValueError(f"job {key!r} is not on record with what it takes to submit it again: "
+                             "its function has to be importable and its params JSON")
+        return origin
+
+    def resume(self, key: str, *, journal: str, **options) -> int:
+        """Submit again the job recorded as `key` in `journal`, with what it was submitted with:
+        one that was interrupted or canceled continues. `options` say otherwise for this run,
+        and bring what a record cannot keep (`on_terminal`, `after`)."""
+        origin = self.origin(key, journal)
+        return self.submit(named(origin["job"]), origin["params"], key=key, journal=journal,
+                           **{**origin["options"], **options})

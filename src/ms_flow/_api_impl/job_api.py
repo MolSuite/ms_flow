@@ -93,6 +93,16 @@ class WorkspaceJobApiMixin:
                                "nothing is registered as `process`: see `reload_executors`") from None
         return flow.submit(job, params, journal="project", **options)
 
+    def resume(self, key: str, **options) -> int:
+        """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
+        with the params and options it was submitted with: one that was interrupted (the project
+        or the application was closed) or canceled continues where it was. `options` say
+        otherwise for this run, and bring what the record cannot keep (`on_terminal`)."""
+        from ms_flow.engine.flow import named
+
+        origin = self._project_flow().origin(key, journal="project")
+        return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
+
     def jobs(self, limit: int | None = None) -> list:
         """The jobs of the active project, oldest first; with `limit`, the last ones.
 
