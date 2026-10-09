@@ -25,6 +25,15 @@ def _echo(payload):
     return payload
 
 
+def _sizes(payloads):
+    """A batched function: every payload learns how many travelled with it."""
+    if "short" in payloads:
+        return []
+    if "fail" in payloads:
+        raise ValueError("asked to")
+    return [len(payloads)] * len(payloads)
+
+
 class _Gauge:
     """A chunk function that records how many of itself ran at once."""
 
@@ -288,6 +297,37 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
 
 
 @pytest.mark.slow
+def test_a_batch_of_a_set_size_and_a_function_that_takes_it_whole():
+    sizes, errors = {}, {}
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(4))
+        engine.register("thread", ThreadExecutor(4))
+        with pytest.raises(ValueError, match="one chunk to a task"):
+            engine.submit("thread", _echo, [1], batch=2)
+
+        def slowly():  # the source trickles in: a task still waits for its ten
+            for i in range(95):
+                time.sleep(0.001)
+                yield i
+
+        snap = engine.wait(engine.submit("process", _sizes, slowly(), batch=10, batched=True,
+                                         on_result=sizes.__setitem__), 60)
+        assert (snap.status, snap.chunks_done) == ("completed", 95)
+        assert sorted(sizes.values()) == [5] * 5 + [10] * 90
+        # left to the engine a batched function still gets a list, of one to begin with
+        sizes.clear()
+        assert engine.wait(engine.submit("process", _sizes, ["a"], batched=True, on_result=sizes.__setitem__), 60).chunks_done == 1
+        assert list(sizes.values()) == [1]
+        # set size, one payload at a time
+        assert engine.wait(engine.submit("process", _echo, [f"p{i}" for i in range(25)], batch=10), 60).chunks_done == 25
+        # raising, or answering short, fails the batch it happened in and no other
+        payloads = [f"p{i}" for i in range(8)] + ["fail", "p9"] + ["short"] + [f"q{i}" for i in range(9)]
+        snap = engine.wait(engine.submit("process", _sizes, payloads + [f"r{i}" for i in range(10)], batch=10, batched=True,
+                                         on_error=errors.__setitem__), 60)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 10, 20)
+        assert "asked to" in errors[content_key("p9")] and "0 results for 10 payloads" in errors[content_key("q0")]
+
+
 def test_retries_time_limit_and_cancel_that_kills(tmp_path):
     with Engine(cpus=4, mem_mb=0) as engine:
         engine.register("process", ProcessExecutor(4))

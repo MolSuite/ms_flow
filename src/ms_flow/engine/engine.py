@@ -83,7 +83,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried")
+                 "retried", "batch", "batched")
 
     def snapshot(self) -> JobSnapshot:
         return JobSnapshot(self.id, self.name, self.status, self.total, self.done, self.failed, self.open,
@@ -179,6 +179,7 @@ class Engine:
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
+               batch: int | None = None, batched: bool = False,
                on_result=None, on_results=None, on_error=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -190,6 +191,9 @@ class Engine:
         Chunks that take well under a task's worth of time travel several to a task where the
         executor allows it; each still succeeds, fails and is recorded on its own. Left to
         itself the window grows with them, since such chunks are small by construction.
+        `batch` settles it instead: that many chunks to a task, fewer only in the last one and
+        where chunks with different needs meet. With `batched`, `fn` takes the list of payloads
+        of a task and returns one result for each, in order; if it raises, all of them failed.
         A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
@@ -217,6 +221,8 @@ class Engine:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         if on_result is not None and on_results is not None:
             raise ValueError("on_result or on_results, not both")
+        if (batch or batched) and not slot.packs:
+            raise ValueError(f"executor {executor!r} takes one chunk to a task")
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
@@ -231,14 +237,15 @@ class Engine:
             job.spec = json.dumps({
                 "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
-                "retries": retries, "retry_wait": retry_wait, "timeout": timeout})
+                "retries": retries, "retry_wait": retry_wait, "timeout": timeout, "batch": batch})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
         if job.cost is not None and not self.tokens.ever_fits(job.cost):
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
                              f"the engine has {self.tokens.total}")
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
-        job.window = window or 2 * slot.impl.capacity
-        job.pace, job.pack, job.elastic = 0.0, 1, window is None
+        job.batch, job.batched = batch or 0, batched
+        job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
+        job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
         job.on_results = on_results
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
@@ -451,9 +458,10 @@ class Engine:
             # payload that is expensive to send is never mistaken for a short chunk.
             took = max(time.perf_counter() - chunk.started, 1e-6) / (len(pack) if pack else 1)
             job.pace = took if took > job.pace else (job.pace + took) / 2  # slow down at once, speed up warily
-            job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
-            if job.elastic:
-                job.window = 2 * slot.impl.capacity * job.pack
+            if not job.batch:
+                job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
+                if job.elastic:
+                    job.window = 2 * slot.impl.capacity * job.pack
         if status == LOST and chunk.spared:  # it fell with a chunk the engine stopped
             for member in reversed(pack or (chunk,)):
                 self._requeue(member)
@@ -558,9 +566,10 @@ class Engine:
                 or slot.killing):
             return False
         ready = job.ready
-        if not ready:
-            job.hungry = True  # the feeder wakes the loop after its next chunk...
-            if not ready:  # ...unless that chunk arrived in between
+        need = 1 if job.fed_all else job.batch or 1  # a batch of a set size waits until it is whole
+        if len(ready) < need:
+            job.hungry = True  # the feeder wakes the loop once that many are there...
+            if len(ready) < need:  # ...unless they arrived in between
                 return False
         chunk = ready[0]
         cost = chunk.cost
@@ -572,15 +581,15 @@ class Engine:
         job.seq += 1
         job.open += 1
         if cost is None or self.tokens.ever_fits(cost):
-            if job.pack > 1:  # short chunks: the ones behind it with the same needs share its task
+            if job.pack > 1 or job.batched:  # the ones behind it with the same needs share its task
                 pack, size = [chunk], job.pack
-                if job.fed_all:  # the tail is shared out, or the last tasks take it all and workers idle
+                if job.fed_all and not job.batch:  # the tail is shared out, or the last tasks take it all and workers idle
                     size = min(size, -(-(len(ready) + 1) // slot.impl.capacity))
                 while len(pack) < size and job.open < job.window and ready and ready[0].cost == cost:
                     pack.append(ready.popleft())
                     job.seq += 1
                     job.open += 1
-                if len(pack) > 1:
+                if len(pack) > 1 or job.batched:
                     chunk.pack = pack
             self._launch(chunk, alone=False)
         else:
@@ -611,6 +620,8 @@ class Engine:
                 if chunk.cost is not None and not self.tokens.fits(chunk.cost):
                     return
                 slot.suspects.popleft()
+                if job.batched:
+                    chunk.pack = [chunk]
                 self._launch(chunk, alone=True)
             else:
                 slot.suspects.popleft()
@@ -630,7 +641,7 @@ class Engine:
             if chunk.pack is None:
                 chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk)
             else:  # one task, so one worker and one chunk's tokens: they run one after another
-                chunk.handle = slot.impl.submit_many(job.fn, [c.payload for c in chunk.pack], chunk)
+                chunk.handle = slot.impl.submit_many(job.fn, [c.payload for c in chunk.pack], chunk, job.batched)
         except Exception:
             self._on_done(chunk, ERROR, None, "the executor refused the chunk\n" + traceback.format_exc(), 0)
 
@@ -660,7 +671,7 @@ class Engine:
                 if seen is not None and seen(key):  # done before the job was interrupted
                     continue
                 ready.append(_Chunk(job, key, payload, cost))
-                if job.hungry:
+                if job.hungry and len(ready) >= job.batch:
                     job.hungry = False
                     self._events.put((self._on_fed,))
         except Exception:

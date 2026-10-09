@@ -11,9 +11,10 @@ The engine knows an executor only through this contract:
 - `submit(fn, payload, tag) -> handle`: `tag` is opaque and comes back in `on_done`.
 - `cancel(handle)`: best effort; a chunk that already started runs to its end.
 - `shutdown()`.
-- `submit_many(fn, payloads, tag) -> handle`, optional: several chunks as one task, for the
-  executors where a task costs more than a short chunk. Its `DONE` result is one
-  `(result, error)` per payload, in order; any other status speaks for all of them.
+- `submit_many(fn, payloads, tag, whole) -> handle`, optional: several chunks as one task, for
+  the executors where a task costs more than a short chunk. Its `DONE` result is one
+  `(result, error)` per payload, in order; any other status speaks for all of them. With
+  `whole`, `fn` is called once with the list and returns one result per payload.
 - `kill()`, optional: stop whatever is running, now. Every chunk in flight comes back `LOST`.
   Without it a chunk cannot have a time limit, and one that started runs to its end.
 
@@ -99,8 +100,8 @@ class ProcessExecutor:
         future.add_done_callback(partial(self._finished, tag))
         return future
 
-    def submit_many(self, fn, payloads, tag):
-        return self.submit(fn, payloads, tag, _call_many)
+    def submit_many(self, fn, payloads, tag, whole=False):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many)
 
     def _finished(self, tag, future) -> None:
         status, value, error = _outcome(future, self._lost)
@@ -137,6 +138,13 @@ def _call_many(fn, payloads):
         except Exception:  # one chunk failing is not the others failing
             outcomes.append((None, traceback.format_exc()))
     return outcomes, _peak_mb()
+
+
+def _call_whole(fn, payloads):
+    results = list(fn(payloads))
+    if len(results) != len(payloads):
+        raise ValueError(f"{len(results)} results for {len(payloads)} payloads: a batched function returns one for each")
+    return [(result, None) for result in results], _peak_mb()
 
 
 def _peak_mb() -> int:
