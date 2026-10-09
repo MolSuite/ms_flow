@@ -19,21 +19,11 @@ from ms_flow.core.settings.models import Settings
 _MISSING = object()
 
 
-_MB = 1024 * 1024
 # Renamed/removed settings, see ``reconcile_overrides``. Add an entry whenever one changes.
 _LEGACY_KEYS: dict[str, Any] = {
     "data_dir": None,
     "executor_db": None,
-    **{
-        f"operational_limits.{name}_bytes": (f"operational_limits.{name}_mb", lambda value: value / _MB)
-        for name in (
-            "max_inline_chunk_payload",
-            "max_spool_payload",
-            "output_sink_max_buffer",
-            "output_sink_max_payload",
-            "output_sink_max_pending",
-        )
-    },
+    "operational_limits": None,  # the knobs of the engine before `ms_flow.engine`
 }
 
 

@@ -218,10 +218,6 @@ class DatabaseConfig(BaseModel):
     connection_timeout: int = 30
 
 
-def mb_to_bytes(value: float) -> int:
-    return max(1024, int(float(value) * 1024 * 1024))
-
-
 class GeneralConfig(BaseModel):
     poll_interval: float = 0.1
     log_level: LogLevel = "INFO"
@@ -235,33 +231,6 @@ class GeneralConfig(BaseModel):
     def normalize_level_name(cls, v: str) -> str:
         level_name = str(v).upper().strip()
         return _LEVEL_ALIASES.get(level_name, level_name)
-
-
-class OperationalLimitsConfig(BaseModel):
-    # Sizes are configured in MB (humans read 16, not 16777216); the runtime
-    # converts them to bytes with `mb_to_bytes`.
-    operational_profile: Literal["strict", "balanced", "throughput"] = "balanced"
-    max_inline_chunk_payload_mb: float = Field(default=0.5, ge=0.001)
-    max_spool_payload_mb: float = Field(default=64.0, ge=0.001)
-    staging_max_workers: int = Field(default=8, ge=1)
-    default_max_inflight_tasks: int = Field(default=16, ge=1)
-    default_max_inflight_items: int = Field(default=256, ge=1)
-    progress_flush_interval_s: float = Field(default=2.0, gt=0.0)
-    output_sink_flush_retries: int = Field(default=3, ge=0)
-    output_sink_retry_backoff_s: float = Field(default=0.05, ge=0.0)
-    output_sink_max_buffer_factor: int = Field(default=10, ge=1)
-    output_sink_max_buffer_mb: float = Field(default=16.0, ge=0.001)
-    output_sink_max_payload_mb: float = Field(default=4.0, ge=0.001)
-    output_sink_max_pending_chunks: int = Field(default=1024, ge=1)
-    output_sink_max_pending_mb: float = Field(default=256.0, ge=0.001)
-
-    @field_validator("operational_profile", mode="before")
-    @classmethod
-    def validate_operational_profile(cls, v: str) -> str:
-        profile = str(v or "balanced").strip().lower()
-        if profile not in {"strict", "balanced", "throughput"}:
-            raise ValueError("operational_profile must be one of: strict, balanced, throughput")
-        return profile
 
 
 class LoggingConfig(BaseModel):
@@ -294,7 +263,6 @@ class Settings(BaseModel):
         json_schema_extra={"settings_hidden": True},
     )
     general: GeneralConfig = Field(default_factory=GeneralConfig)
-    operational_limits: OperationalLimitsConfig = Field(default_factory=OperationalLimitsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     resources: ResourcesConfig = Field(default_factory=ResourcesConfig)

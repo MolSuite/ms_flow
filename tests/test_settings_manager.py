@@ -227,19 +227,20 @@ def test_legacy_keys_are_migrated_and_rewritten(tmp_path, monkeypatch, caplog):
             {
                 "data_dir": "data",
                 "executor_db": "/old/executor.db",
-                "operational_limits": {"max_spool_payload_bytes": 128 * 1024 * 1024, "typo": 1},
+                "operational_limits": {"max_spool_payload_mb": 128.0},
+                "logging": {"backup_count": 3, "typo": 1},
             },
             f,
         )
 
     sm = SettingsManager()
-    assert sm.settings.operational_limits.max_spool_payload_mb == 128.0
-    assert toml.load(config_path) == {"operational_limits": {"max_spool_payload_mb": 128.0}}
+    assert sm.settings.logging.backup_count == 3
+    assert toml.load(config_path) == {"logging": {"backup_count": 3}}
 
     notices = "\n".join(caplog.messages)
-    assert "'operational_limits.max_spool_payload_bytes' is now 'operational_limits.max_spool_payload_mb'" in notices
+    assert "'operational_limits' no longer exists" in notices
     assert "'executor_db' no longer exists" in notices
-    assert "unknown setting 'operational_limits.typo'" in notices
+    assert "unknown setting 'logging.typo'" in notices
     caplog.clear()
     SettingsManager()
     assert not caplog.messages  # the file was rewritten: said once

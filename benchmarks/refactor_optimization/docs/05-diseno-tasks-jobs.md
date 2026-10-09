@@ -295,5 +295,15 @@ Se fue con el motor viejo. Estas piezas no eran inútiles: vivían dentro del ha
 5. **`watch_job` y `watch_jobs`: hechos** (`ms_flow.progress`, una barra de `tqdm` por job sobre `engine.status`). **Log por job: pendiente**, se diseña con el ejecutor remoto (documento 06), que es quien necesita traerlo de otra máquina.
 6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen. Lo que lee ahora: `MolSuite.jobs(limit)` (los jobs del proyecto, del diario; cada uno como lo tiene el motor en memoria si lo corrió en esta sesión) y `MolSuite.job_failures(key)` (intento y traza de los chunks fallados). El estado vivo sale de la memoria del motor; el fichero solo da el historial y los errores, y se lee sin tomar su cerrojo, así que también sirve para mirar un proyecto que corre otro proceso. El diario no guarda el payload; de un chunk que falla guarda una etiqueta corta de su entrada (`reprlib`, 80 caracteres por valor), que `job_failures` devuelve en `input` y el monitor muestra junto a la traza. No la hay cuando el chunk corrió y lo que falló fue escribir su resultado.
 
-Sin tocar, a decidir: la tabla `project_job_index` de `projects.db` (nadie la escribe), los ajustes `operational_limits` y `workers` (nadie los lee en `ms_flow`), los benchmarks sueltos de `benchmarks/*.py` que importan el manager (no están en git) y la documentación de usuario de `docs/` (describe la API vieja; solo se actualizó el README).
+Restos, revisados el 2026-10-09 (rama `refactor/settings-follow-the-engine`), buscando quién lee cada ajuste en `ms_flow`, `ms_components` y AMDockVS:
+
+| Resto | Qué se hizo |
+|---|---|
+| Ajustes `operational_limits` (14 opciones del motor viejo: spool, payload en línea, buffers del sink) | **Borrados.** Nadie los leía. Un `config.toml` que los tenga los pierde con un aviso (`_LEGACY_KEYS`) |
+| `resources.local.max_processes`, `max_threads`, `memory_gb` | **Conectados.** Solo se mostraban en la UI; ahora son el tamaño del pool de procesos, el del de hilos y el presupuesto de memoria del motor (sin valor: RAM física menos una reserva) |
+| `resources.workers` (definiciones `process_pool`, `thread`, `ray`, `hpc`) y su editor en `ms_components` | **Se queda sin leer.** Es donde se definirán los ejecutores remotos (documento 06); se rehace entonces con los campos que ese diseño fije |
+| `general.poll_interval`, `database.connection_timeout` | **Pendiente de borrar.** Nadie los lee (el motor no sondea); `poll_interval` tiene un control en el navegador de proyectos, así que se quita junto con la revisión de `ms_components` |
+| Tabla `project_job_index` de `projects.db` | **Se queda de momento.** Nadie la escribe ni la lee, pero `~/.molsuite/projects.db` es el mismo fichero que usa `main`: borrarla pide subir la versión del esquema, y eso se hace al integrar, no en una rama local |
+| Benchmarks sueltos de `benchmarks/*.py` | Importan el manager viejo y no están en git. Son ficheros de Mario: no se tocan |
+| Documentación de usuario de `docs/` | Describe la API vieja (incluida `reference/operational_profiles.md`, de algo que ya no existe). Se reescribe cuando todo funcione, según lo acordado; solo el README está al día |
 

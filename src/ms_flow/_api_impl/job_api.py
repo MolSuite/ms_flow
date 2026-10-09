@@ -12,9 +12,10 @@ class MolSuiteJobApiMixin:
             from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor
 
             local = self.settings_manager.settings.resources.local
-            engine = Engine(cpus=local.cpus, gpus=local.gpus, state_dir=self._master_db_path.parent)
-            engine.register("process", ProcessExecutor(local.cpus))
-            engine.register("thread", ThreadExecutor(local.cpus))
+            engine = Engine(cpus=local.cpus, gpus=local.gpus, state_dir=self._master_db_path.parent,
+                            mem_mb=local.memory_gb * 1024 if local.memory_gb else None)
+            engine.register("process", ProcessExecutor(local.max_processes))
+            engine.register("thread", ThreadExecutor(local.max_threads))
             self._engine = engine
         return self._engine
 
