@@ -16,6 +16,7 @@ import logging
 import os
 import pickle
 import queue
+import reprlib
 import threading
 import time
 import traceback
@@ -46,6 +47,11 @@ _TASK_SECONDS, _PACK_MAX = 0.1, 64
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
 _RECOUNT = 30.0  # seconds between two counts of what a source has left
+
+
+_brief = reprlib.Repr()  # a payload as a failed chunk is told apart: short whatever its size
+_brief.maxstring = _brief.maxother = 80
+_brief.maxdict = 8
 
 
 def content_key(payload) -> bytes:
@@ -519,7 +525,7 @@ class Engine:
     def _attempt_failed(self, chunk: _Chunk, error: str) -> None:
         job = chunk.job
         if chunk.attempt > job.retries:
-            return self._settle(job, chunk.key, chunk.attempt, error)
+            return self._settle(job, chunk.key, chunk.attempt, error, _brief.repr(chunk.payload))
         job.retried += 1
         self._later(job.retry_wait * 2 ** (chunk.attempt - 1), self._requeue, chunk)
         chunk.attempt += 1
@@ -537,8 +543,9 @@ class Engine:
         for key, attempt, error in outcomes:
             self._settle(job, key, attempt, error)
 
-    def _settle(self, job: _Job, key, attempt: int, error: str | None) -> None:
-        """A chunk reached its end: count it and forget it."""
+    def _settle(self, job: _Job, key, attempt: int, error: str | None, label: str | None = None) -> None:
+        """A chunk reached its end: count it and forget it. `label` tells a failed one apart in
+        the journal; there is none when its result is what could not be delivered."""
         if job.status != RUNNING:
             # Stopped with this result on its way to the callback. It got there: the job that
             # continues this one must not run it again.
@@ -548,7 +555,7 @@ class Engine:
             return
         job.open -= 1
         if job.journal is not None:
-            job.journal.chunk_finished(job, key, attempt, error)
+            job.journal.chunk_finished(job, key, attempt, error, label)
         if error is None:
             job.done += 1
         else:

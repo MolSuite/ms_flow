@@ -19,7 +19,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-VERSION = 2
+VERSION = 3
 CHUNK_DONE, CHUNK_FAILED = 1, 2
 INTERRUPTED = "interrupted"
 RESUMABLE = (INTERRUPTED, "canceled")  # the job statuses that keep their done chunks: these continue
@@ -38,6 +38,7 @@ CREATE TABLE jobs (
 CREATE TABLE chunks (
     job INTEGER NOT NULL, key BLOB NOT NULL,
     status INTEGER NOT NULL, attempt INTEGER NOT NULL, error TEXT,
+    input TEXT,                   -- of a failed one: a short repr of its payload, to tell which it was
     PRIMARY KEY (job, key)
 ) WITHOUT ROWID;
 """
@@ -104,12 +105,12 @@ def recorded(path, limit: int | None = None) -> list[dict]:
 
 
 def failures(path, job_id: str, limit: int = 200) -> list[dict]:
-    """`attempt` and `error` of the chunks of a recorded job that failed, at most `limit`.
+    """`attempt`, `error` and `input` of the chunks of a recorded job that failed, at most `limit`.
 
-    ponytail: the journal keeps the key of a chunk, never its payload, so which input failed
-    is only known if the error says it.
+    `input` is a short repr of the payload (the journal never keeps the payload itself), None
+    when the chunk ran and what failed was writing its result.
     """
-    return _read(path, "SELECT attempt, error FROM chunks WHERE job = (SELECT n FROM jobs WHERE job_id = ?) "
+    return _read(path, "SELECT attempt, error, input FROM chunks WHERE job = (SELECT n FROM jobs WHERE job_id = ?) "
                        "AND status = ? LIMIT ?", (job_id, CHUNK_FAILED, limit))
 
 
@@ -150,8 +151,8 @@ class Journal:
             self._next += 1
         self._records.append((job,))
 
-    def chunk_finished(self, job, key, attempt: int, error: str | None) -> None:
-        self._records.append((job.n, key, CHUNK_FAILED if error else CHUNK_DONE, attempt, error))
+    def chunk_finished(self, job, key, attempt: int, error: str | None, label: str | None = None) -> None:
+        self._records.append((job.n, key, CHUNK_FAILED if error else CHUNK_DONE, attempt, error, label))
 
     def job_ended(self, job, forget_done: bool) -> None:
         """`forget_done` drops the rows of the chunks that went well: the job will not resume."""
@@ -251,10 +252,10 @@ class Journal:
                         shrink = True
                     elif type(record) is not tuple:
                         waiting.append(record)  # a flush()
-                    elif len(record) == 5:
+                    elif len(record) == 6:
                         chunks.append(record)
                     else:  # a job: started `(job,)` or ended `(job, forget_done)`
-                        db.executemany("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?)", chunks)
+                        db.executemany("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?, ?)", chunks)
                         chunks.clear()
                         job = record[0]
                         if len(record) == 1:
@@ -270,7 +271,7 @@ class Journal:
                             if record[1]:
                                 db.execute("DELETE FROM chunks WHERE job = ? AND status = ?", (job.n, CHUNK_DONE))
                                 shrink = True
-                db.executemany("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?)", chunks)
+                db.executemany("INSERT OR REPLACE INTO chunks VALUES (?, ?, ?, ?, ?, ?)", chunks)
                 db.executemany(_JOB_COUNTERS, [_counters(job) for job in live.values()])  # for whoever watches
                 db.execute("COMMIT")
                 if shrink:  # hand the freed pages back: a finished job leaves one row and its failures

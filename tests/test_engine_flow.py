@@ -238,6 +238,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         assert (broken.status, broken.chunks_failed) == ("completed_with_errors", 2)
         failed = ms.job_failures(broken.key)
         assert len(failed) == 2 and all("ValueError: odd" in row["error"] for row in failed)
+        assert sorted(row["input"] for row in failed) == ["1", "3"]  # which elements they were
         assert ms.job_failures(again.key) == []
         assert (tmp_path / "one" / "executor.db").exists()
     finally:

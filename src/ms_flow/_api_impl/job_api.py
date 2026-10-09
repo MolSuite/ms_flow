@@ -63,8 +63,9 @@ class MolSuiteJobApiMixin:
         return listed + [job for job in live.values() if job.finished_at is None]
 
     def job_failures(self, key: str, limit: int = 200) -> list[dict]:
-        """`attempt` and `error` (the traceback) of the chunks that failed in the job recorded
-        under `key` (`JobSnapshot.key`) in the active project, at most `limit`."""
+        """`attempt`, `error` (the traceback) and `input` (a short repr of the element) of the
+        chunks that failed in the job recorded under `key` (`JobSnapshot.key`) in the active
+        project, at most `limit`."""
         from ms_flow.engine.journal import failures
 
         return failures(self._require_active_project_runtime().context.path / "executor.db", key, limit)
