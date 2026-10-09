@@ -81,6 +81,7 @@ def test_advanced_module_is_explicit_and_not_mixed_into_simple_api_surface():
 def test_query_module_exports_query_surface():
     assert public_query.__all__ == [
         "QuerySpec",
+        "Rows",
         "db_input_for",
         "db_count",
         "db_pages",
