@@ -161,3 +161,40 @@ def test_a_continued_job_counts_what_it_had_done_when_the_source_leaves_it_out(t
         after = engine.wait(engine.submit("thread", workers.nap, left, journal="project", key="dock-1"), 60)
         assert before.chunks_done == len(done) and len(left) == 200 - len(done)
         assert (after.status, after.chunks_done, after.chunks_total) == ("completed", 200, 200)
+
+
+@pytest.mark.parametrize("stop", ["cancel", "detach", "close"])
+def test_a_result_taken_after_the_job_stopped_is_not_run_again(tmp_path, stop):
+    import threading
+
+    taken, first, go = [], threading.Event(), threading.Event()
+
+    def take(pairs):
+        first.set()
+        go.wait(30)  # the first group holds the delivery thread: the rest of the results queue behind it
+        taken.extend(key for key, _ in pairs)
+
+    def submit(engine):
+        return engine.submit("thread", lambda payload: payload["i"], [{"_key": str(i), "i": i} for i in range(40)],
+                             journal="project", key="job", on_results=take)
+
+    engine = _engine(tmp_path)
+    job_id = submit(engine)
+    assert first.wait(30)
+    time.sleep(0.2)  # every chunk has run by now, and waits to be taken
+    stopping = threading.Thread(target={"cancel": lambda: engine.cancel(job_id),
+                                        "detach": lambda: engine.detach("project"), "close": engine.close}[stop])
+    stopping.start()
+    while engine.status(job_id).status == "running":
+        time.sleep(0.005)
+    go.set()
+    stopping.join(30)
+    if stop == "close":
+        engine = _engine(tmp_path)
+    elif stop == "detach":
+        engine.attach("project", tmp_path / "executor.db")
+    else:
+        engine.wait(job_id, 30)
+    with engine:
+        assert engine.wait(submit(engine), 30).status == "completed"
+    assert sorted(taken, key=int) == [str(i) for i in range(40)]  # each one once, over the two runs

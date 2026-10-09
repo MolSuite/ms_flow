@@ -182,6 +182,9 @@ class Engine:
         told = threading.Event()
         self._events.put((self._on_detach, journal, told))
         told.wait()
+        told.clear()
+        self._events.put((told.set,))  # behind the loop taking note of what those callbacks took
+        told.wait()
         journal.close()
 
     def submit(self, executor: str, fn, chunks, *, cpu: float = 1, gpu: float = 0, mem_mb: float = 0,
@@ -327,6 +330,10 @@ class Engine:
         self._threads[0].join()
         self._deliveries.put(None)
         self._threads[1].join()
+        while not self._events.empty():  # what the last callbacks took, with the loop gone
+            event = self._events.get()
+            if event is not None and event[0] == self._on_delivered:
+                event[0](*event[1:])
         for slot in self._executors.values():
             slot.impl.shutdown()
         for journal in self._journals.values():
@@ -533,6 +540,11 @@ class Engine:
     def _settle(self, job: _Job, key, attempt: int, error: str | None) -> None:
         """A chunk reached its end: count it and forget it."""
         if job.status != RUNNING:
+            # Stopped with this result on its way to the callback. It got there: the job that
+            # continues this one must not run it again.
+            if error is None and job.journal is not None and job.status in RESUMABLE:
+                job.done += 1
+                job.journal.chunk_finished(job, key, attempt, None)
             return
         job.open -= 1
         if job.journal is not None:
