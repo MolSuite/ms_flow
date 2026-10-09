@@ -110,3 +110,46 @@ def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
         ended = engine.wait(engine.submit("far", workers.nap, [{"s": 0, "n": i} for i in range(3)]), 60)
     assert ended.status in ("failed", "completed_with_errors") and ended.chunks_done == 0
     assert len(list((tmp_path / "far").iterdir())) == 1  # kept, to look at its runner.log
+
+
+def _napping(engine, tmp_path, got, **options):
+    engine.register("far", _far(tmp_path, runner="--cpus 1", **options))
+    engine.attach("journal", tmp_path / "journal.db")
+    return engine.submit("far", workers.nap, [{"s": 0.3, "n": i} for i in range(12)], journal="journal", key="naps",
+                         on_results=got.extend)
+
+
+def test_closing_leaves_a_job_with_a_key_running_and_it_is_taken_up_again(tmp_path):
+    got = []
+    with Engine(cpus=2) as engine:
+        job = _napping(engine, tmp_path, got)
+        assert _until(lambda: engine.status(job).chunks_done)
+    before = len(got)
+    (home,) = (tmp_path / "far").iterdir()
+    assert 0 < before < 12 and _inside(home), "still running there, with the engine gone"
+
+    with Engine(cpus=2) as engine:  # in other tasks than before: each waits for what is already there
+        job = _napping(engine, tmp_path, got, elements_per_job=4, max_jobs=1)
+        there = set()
+        while engine.status(job).status == "running":
+            there.update(tmp_path.glob("far/*-*"))
+            time.sleep(0.02)
+        assert there == {home}, "nothing was sent again"
+        ended = engine.wait(job, 120)
+        assert (ended.status, ended.chunks_done) == ("completed", 12)
+        assert len({key for key, result in got}) == len(got) == 12
+        assert _until(lambda: not home.exists())  # the engine said it ended
+
+
+def test_canceling_stops_what_an_earlier_run_left_there(tmp_path):
+    with Engine(cpus=2) as engine:
+        job = _napping(engine, tmp_path, [])
+        assert _until(lambda: engine.status(job).chunks_done)
+    (home,) = (tmp_path / "far").iterdir()
+    assert _inside(home)
+    with Engine(cpus=2) as engine:
+        job = _napping(engine, tmp_path, [])
+        assert _until(lambda: engine.status(job).status == "running")
+        engine.cancel(job)
+        assert engine.wait(job, 60).status == "canceled"
+        assert _until(lambda: not _inside(home) and not home.exists())
