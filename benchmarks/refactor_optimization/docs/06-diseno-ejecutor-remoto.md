@@ -170,12 +170,12 @@ Una ruta en un elemento solo vale donde existe el fichero. AMDockVS ya lo declar
 | Marca | Qué declara | Donde el disco no es el mismo |
 |---|---|---|
 | `File(ruta)` | un fichero que la task lee | el ejecutor lo lleva, una vez aunque lo compartan muchos elementos, y la task recibe la ruta que tiene allí |
-| `Dir(ruta)` | un directorio donde la task deja ficheros | la task recibe un directorio de allí; lo que deja en él vuelve a `ruta`, y las rutas de allí que aparezcan en el resultado se cambian por las de aquí |
+| `Dir(ruta)` | un directorio donde la task deja ficheros | la task recibe un directorio de allí; **vuelve a `ruta` lo que su resultado nombra** (un fichero, o un directorio entero), y esas rutas llegan cambiadas por las de aquí. Lo que deja y no nombra se queda allí y se borra |
 
 | Ejecutor | Entradas (`File`) | Salidas (`Dir`) |
 |---|---|---|
 | loky, `thread` | la ruta tal cual | la ruta tal cual |
-| Ray o cola con disco compartido (`shared=True`; por defecto en la cola sin máquina) | la ruta tal cual | la ruta tal cual |
+| Ray o cola con disco compartido (`shared=True`; por defecto en la cola sin máquina y en el Ray que arranca el propio ejecutor) | la ruta tal cual | la ruta tal cual |
 | Ray sin disco compartido | los bytes van una vez al almacén de objetos; cada nodo los deja en un temporal la primera vez que los necesita | los bytes vuelven con el resultado |
 | Cola por `ssh` | van en el `tar` del job, bajo `files/` | vuelven en el `tar` del sondeo, antes que los resultados que los nombran |
 
@@ -200,12 +200,19 @@ Añadido el 2026-10-09, antes de R6 y en este orden:
 
 | Paso | Qué | Cómo se comprueba |
 |---|---|---|
-| F1 | Las marcas `File` y `Dir` | tests: en local son rutas |
-| F2 | `File` en la cola por `ssh` y en el runner | test de R4 con un fichero que solo existe "aquí" |
-| F3 | `File` en Ray sin disco compartido | Ray local, con el fichero borrado antes de que corra la task |
-| F4 | `Dir` en los dos | lo que la task deja aparece en la ruta de aquí |
+| F1 ✔ | Las marcas `File` y `Dir` | tests: en local son rutas |
+| F2 ✔ | `File` en la cola por `ssh` y en el runner | test de R4 con un fichero que solo existe "aquí" |
+| F3 ✔ | `File` en Ray sin disco compartido | Ray local con `shared=False`: la task lee una copia fuera de la carpeta de aquí |
+| F4 ✔ | `Dir` en los dos | lo que la task deja aparece en la ruta de aquí |
 | S1 | El ajuste de quién hace de `process`, el cambio sin jobs activos y el bloqueo de loky en el nodo de login | tests del workspace |
 | S2 | Límite de tiempo y progreso por elemento en Ray | los tests que ya pasan con loky |
+
+F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExecutor`; tests en `tests/test_files.py` y `tests/test_remote.py`), con estos techos, anotados en el código:
+
+- Los ficheros viajan en memoria: el `tar` del job y el del sondeo en la cola, los bytes con el resultado en Ray. Sirve para receptores y poses; una librería de GB pide un fichero por pieza.
+- En Ray un fichero queda en el almacén de objetos hasta cerrar el ejecutor, y la copia de cada nodo en su temporal hasta que lo limpie el sistema.
+- Las marcas se buscan en diccionarios, listas y tuplas del elemento; dentro de otros objetos no se miran.
+- Sin cluster, "otro disco" se ha probado como otra carpeta de esta máquina.
 
 ### Estado (2026-10-09)
 
