@@ -138,7 +138,7 @@ amdock_docking_job  preparing 1/2   cluster   —         0/12000
 
 ## Abierto
 
-1. Tamaño de lote en HPC: Mario tiene detalles que contar cuando se configure.
+1. Tamaño de lote en HPC: Mario dio los detalles el 2026-10-09 (Ray dentro del job del HPC, runner que es parte de `ms_flow`). La propuesta y sus decisiones abiertas están en [06-diseno-ejecutor-remoto.md](06-diseno-ejecutor-remoto.md).
 2. La capa de workflows (`workflow()`, `WorkflowSpec`) queda fuera de este documento.
 
 ## Para más adelante: parar por tiempo
