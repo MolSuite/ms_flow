@@ -29,6 +29,13 @@ The engine knows an executor only through this contract:
   do not say.
 - `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
   `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the job says each of its chunks needs.
+- `outlives`, optional: an executor whose tasks go on without this process sets it. `submit` and
+  `submit_many` then take `key`, the key of the job in its journal (`None` for a job without
+  one), and `keys`, the key of each chunk of the task. A job with a key is one the executor is
+  asked for again: the same chunks, in tasks that need not be the same. `cancel` on a task of
+  such a job stops nothing by itself; the engine says how the job ended with
+  `ended(key, kept)`, and only with `kept` (the job was interrupted and may be submitted again)
+  is what the executor has of it to go on.
 
 `status` is `DONE`, `ERROR` (the function raised), `LOST` (the worker went away: nobody
 knows whether the chunk ran) or `CANCELED`.

@@ -91,7 +91,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine", "needs")
+                 "retried", "batch", "batched", "source", "fine", "needs", "key")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -122,12 +122,14 @@ class _Chunk:
 class _Slot:
     """A registered executor and what the loop tracks about it."""
 
-    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs")
+    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
+                 "outlives")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
         self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
+        self.outlives = getattr(impl, "outlives", False)
 
 
 class Engine:
@@ -281,14 +283,14 @@ class Engine:
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
-        job.journal = job.n = job.uid = job.spec = job.skip = job.source = None
+        job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
         if journal is not None:
             job.journal = self._journals.get(journal)
             if job.journal is None or job.journal.failed:
                 raise ValueError(f"no usable journal {journal!r}; attached: {sorted(self._journals)}")
-            job.uid = key or uuid.uuid4().hex
+            job.uid, job.key = key or uuid.uuid4().hex, key  # `key`: what another run can ask for it by
             job.spec = json.dumps({
                 "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
@@ -650,6 +652,9 @@ class Engine:
             self._on_dependency_end(other)
         if job.journal is not None:
             job.journal.job_ended(job, forget_done=status not in RESUMABLE)
+        if job.key is not None and job.slot.outlives:
+            # Interrupted, it is to go on where the executor has it, for the run that asks for it again.
+            job.slot.impl.ended(job.key, status == INTERRUPTED)
         self._deliveries.put((self._announce, (job,)))
 
     def _dispatch(self) -> None:
@@ -752,6 +757,8 @@ class Engine:
             # ponytail: what the job says, not what one chunk says of itself (`cpu` in its payload):
             # that is read only where the engine does the accounting.
             watch["cost"] = job.needs
+        if slot.outlives:
+            watch["key"], watch["keys"] = job.key, [member.key for member in chunk.pack or (chunk,)]
         try:
             if chunk.pack is None:
                 chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk, **watch)
