@@ -86,7 +86,7 @@ class JobSnapshot:
 
 
 class _Job:
-    __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority",
+    __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority", "on_finish", "finishing",
                  "on_result", "on_results", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
@@ -198,7 +198,7 @@ class Engine:
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
                batch: int | None = None, batched: bool = False, progress: bool | None = None,
-               on_result=None, on_results=None, on_error=None, on_terminal=None) -> int:
+               on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
         `cpu`, `gpu` and `mem_mb` are what one chunk needs; a dict payload may say otherwise
@@ -219,6 +219,9 @@ class Engine:
         `(key, result)` of the job that is waiting, up to `_DELIVER_MAX`, and all of them count as
         done once it returns. When it raises, each pair is offered again alone and only the ones
         that raise again fail, so it must leave nothing behind when it raises: one transaction.
+        `on_finish()` is the job's last word: called once every chunk has ended, on the delivery
+        thread, before the job counts as completed and the jobs after it start. If it raises, the
+        job fails with that error. A job that failed, was canceled or interrupted never gets there.
         `chunks` may know more than how to be read. With `remaining()`, how many chunks it has yet
         to give, the job has a total while it runs: counted at its first chunk and every
         `_RECOUNT` seconds after, exact once the source is read. With `open(state)`, it is called
@@ -274,7 +277,7 @@ class Engine:
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
         job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
-        job.on_results = on_results
+        job.on_results, job.on_finish, job.finishing = on_results, on_finish, False
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
         job.done = job.failed = job.open = job.seq = job.peak_mem_mb = 0
@@ -566,9 +569,30 @@ class Engine:
         self._finish_if_over(job)
 
     def _finish_if_over(self, job: _Job) -> None:
-        if job.fed_all and not job.ready and not job.open:
+        if job.fed_all and not job.ready and not job.open and not job.finishing:
             nothing_worked = job.fatal or (job.failed and not job.done)
-            self._finish(job, FAILED if nothing_worked else COMPLETED_WITH_ERRORS if job.failed else COMPLETED)
+            status = FAILED if nothing_worked else COMPLETED_WITH_ERRORS if job.failed else COMPLETED
+            if status == FAILED or job.on_finish is None:
+                self._finish(job, status)
+            else:
+                job.finishing = True
+                self._deliveries.put((self._run_finish, (job, status)))
+
+    def _run_finish(self, job: _Job, status: str) -> None:
+        """On the delivery thread, behind every result of the job: its `on_finish`."""
+        try:
+            job.on_finish()
+            error = None
+        except Exception:
+            error = traceback.format_exc()
+        self._events.put((self._on_finished, job, status, error))
+
+    def _on_finished(self, job: _Job, status: str, error: str | None) -> None:
+        # ponytail: a job stopped while its `on_finish` runs keeps the status it was stopped
+        # with, whatever `on_finish` got to do.
+        if job.status == RUNNING:
+            job.fatal = error
+            self._finish(job, FAILED if error else status)
 
     def _finish(self, job: _Job, status: str) -> None:
         job.status, job.finished_at, job.chunks, job.skip = status, time.time(), None, None

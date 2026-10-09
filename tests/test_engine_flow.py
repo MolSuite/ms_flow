@@ -1,4 +1,5 @@
 """`@task`, `@job` and `Flow.submit` on the new engine: params, sinks, batch levels, table dependencies."""
+import json
 import sqlite3
 import time
 from contextlib import closing
@@ -9,7 +10,8 @@ from pydantic import BaseModel
 from ms_flow.core.database.project import ProjectStore
 from ms_flow.engine import Engine, Flow, ProcessExecutor, ThreadExecutor, job, task
 from ms_flow.query import QuerySpec, Rows
-from ms_flow.sinks import graph_sink, table_sink
+from ms_flow.progress import watch_job
+from ms_flow.sinks import file_sink, graph_sink, table_sink
 
 SEEN = {}
 
@@ -86,6 +88,52 @@ def odd_ones_fail(params, project):
     return range(4)
 
 
+@task()
+def line(n: int) -> str:
+    return f"{n}\n"
+
+
+@job(task=line, output=file_sink("out/lines.txt", fmt="text", append=True))
+def appended(params, project):
+    return range(params["n"])
+
+
+@job(task=halve, output=file_sink("out/halves.json"))
+def whole_file(params, project):
+    return range(0, 8, 2)
+
+
+class Lines:
+    """A job's own writer: keeps what arrives and stores it, or refuses to, at the end."""
+    tables = ("sizes",)
+
+    def __init__(self, params, project):
+        self.params, self.kept = params, []
+
+    def write(self, results):
+        self.kept.extend(results)
+
+    def finish(self):
+        if self.params.get("refuse"):
+            raise RuntimeError("nothing worth keeping")
+        SEEN["lines"] = sorted(self.kept)
+
+
+def tidy_up(params, project, snapshot):
+    SEEN["ended"] = snapshot.status
+
+
+@job(task=line, output=Lines, finalize=tidy_up)
+def kept_by_its_writer(params, project):
+    return range(params["n"])
+
+
+@job(task=line, reads=("sizes",))
+def after_the_writer(params, project):
+    SEEN["stored_when_read"] = "lines" in SEEN
+    yield from range(1)  # a generator: its body runs when the engine reads it, not at submit
+
+
 @pytest.fixture
 def project(tmp_path):
     with closing(sqlite3.connect(tmp_path / "project.db")) as conn, conn:
@@ -145,6 +193,32 @@ def test_a_job_writes_its_tables_and_the_job_that_reads_them_waits(project):
     with pytest.raises(Exception, match="duplicate ref 'best'"):
         project.persist_output_spec(POSES, twice)
     assert rows("SELECT COUNT(*) FROM docking_results WHERE ligand_id >= 7000")[0][0] == 0
+
+
+def test_a_job_writes_files_or_through_its_own_writer_which_has_the_last_word(project, tmp_path):
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(2))
+        flow = Flow(engine, project)
+        submit = lambda job, params=None: engine.wait(flow.submit(job, params, executor="thread"), 60)
+
+        assert submit(appended, {"n": 50}).status == "completed"
+        assert sorted((tmp_path / "out/lines.txt").read_text().split(), key=int) == [str(n) for n in range(50)]
+        assert submit(whole_file).status == "completed"  # one file, written when the job completes
+        assert sorted(row["half"] for row in json.loads((tmp_path / "out/halves.json").read_text())) == [0, 1, 2, 3]
+
+        SEEN.pop("lines", None)
+        kept = flow.submit(kept_by_its_writer, {"n": 5}, executor="thread")
+        reader = flow.submit(after_the_writer, executor="thread")  # the writer says it writes `sizes`
+        assert watch_job(engine, kept, poll_s=0.01).status == "completed"
+        assert SEEN["lines"] == [f"{n}\n" for n in range(5)] and SEEN["ended"] == "completed"
+        assert engine.wait(reader, 60).status == "completed" and SEEN["stored_when_read"]  # not before `finish`
+
+        refused = submit(kept_by_its_writer, {"n": 5, "refuse": True})  # every element ran; the writer said no
+        assert refused.status == "failed" and refused.chunks_done == 5 and "nothing worth keeping" in refused.error
+        assert SEEN["ended"] == "failed"
+
+    with pytest.raises(TypeError, match="file_sink"):
+        job(task=line, output="lines.txt")
 
 
 def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(project, tmp_path, monkeypatch):
