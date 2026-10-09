@@ -39,6 +39,8 @@ dependencies = [
 [project.optional-dependencies]
 # Test + development tooling.
 dev = ["pytest>=7.0"]
+# `ms_flow.engine.RayExecutor`: the machines of a network, or the nodes of an HPC job.
+ray = ["ray>=2.9"]
 
 [project.urls]
 Homepage = "https://github.com/MolSuite/ms_flow"

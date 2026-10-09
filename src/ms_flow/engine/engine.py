@@ -91,7 +91,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine")
+                 "retried", "batch", "batched", "source", "fine", "needs")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -122,12 +122,12 @@ class _Chunk:
 class _Slot:
     """A registered executor and what the loop tracks about it."""
 
-    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells")
+    __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
         self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
-        self.tells = hasattr(impl, "progress")
+        self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
 
 
 class Engine:
@@ -271,6 +271,7 @@ class Engine:
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
                 "retries": retries, "retry_wait": retry_wait, "timeout": timeout, "batch": batch})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None
+        job.needs = (cpu, gpu, mem_mb)
         if job.cost is not None and not self.tokens.ever_fits(job.cost):
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
                              f"the engine has {self.tokens.total}")
@@ -724,6 +725,10 @@ class Engine:
         if fine is None:
             fine = chunk.pack is not None or (job.total is not None and job.total <= 2 * slot.impl.capacity)
         watch = {"owner": job.id} if fine and slot.tells else {}
+        if slot.costs:
+            # ponytail: what the job says, not what one chunk says of itself (`cpu` in its payload):
+            # that is read only where the engine does the accounting.
+            watch["cost"] = job.needs
         try:
             if chunk.pack is None:
                 chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk, **watch)

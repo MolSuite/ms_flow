@@ -483,3 +483,26 @@ def test_the_chunks_of_a_task_can_end_ahead_of_it():
         end = engine.wait(job, timeout=5)
     assert (end.status, end.chunks_done, end.chunks_failed, end.chunks_retried) == ("completed", 3, 0, 1)
     assert sorted(got) == ["A", "B", "C"]
+
+
+@pytest.mark.slow
+def test_the_same_jobs_on_ray(tmp_path):
+    pytest.importorskip("ray")
+    from ms_flow.engine import RayExecutor
+
+    # Ray's workers import what they run: nothing from this module, which only pytest can find.
+    with Engine(cpus=1) as engine:  # a job on Ray spends none of the engine's own CPUs
+        engine.register("ray", RayExecutor(num_cpus=4))
+        got = []
+        job = engine.submit("ray", workers.row, [{"idx": i} for i in range(6)], cpu=2,
+                            on_result=lambda key, result: got.append(result["idx"]))
+        end = engine.wait(job, 120)
+        assert (end.status, end.chunks_done, sorted(got)) == ("completed", 6, list(range(6)))
+        once = {"path": str(tmp_path / "tries"), "fails": 1}
+        failed = engine.wait(engine.submit("ray", workers.flaky, [once]), 60)
+        assert failed.status == "failed" and "not yet" in failed.error
+        shared = engine.wait(engine.submit("ray", list, ["a", "b", "c", "d"], batch=2, batched=True), 60)
+        assert (shared.status, shared.chunks_done) == ("completed", 4)
+        dead = engine.wait(engine.submit("ray", workers.die_on_7, [{"idx": i} for i in range(12)]), 120)
+        assert (dead.status, dead.chunks_done, dead.chunks_failed) == ("completed_with_errors", 11, 1)
+        assert "worker process died" in dead.error

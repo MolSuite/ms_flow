@@ -25,6 +25,8 @@ The engine knows an executor only through this contract:
 - `progress(owner) -> float`, optional: how many chunks' worth of work the tasks in flight that
   were submitted with `owner=` that value have done. With it `submit` and `submit_many` take
   `owner`, and the engine passes it for the tasks worth watching.
+- `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
+  `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the job says each of its chunks needs.
 
 `status` is `DONE`, `ERROR` (the function raised), `LOST` (the worker went away: nobody
 knows whether the chunk ran) or `CANCELED`.
@@ -148,6 +150,60 @@ class ProcessExecutor:
             pass
 
 
+class RayExecutor:
+    """Tasks on a Ray cluster, which shares out its own CPUs, GPUs and memory.
+
+    `address=None` starts a cluster on this machine and stops it at `shutdown`; `"auto"` or
+    `host:port` joins one that is running, on this machine or on others. What `ray.init` takes
+    goes through. The functions and what they import have to be installed on every node.
+    """
+
+    # ponytail: no `kill`, so no time limit for a chunk on Ray, and no `progress`. A forced
+    # `ray.cancel` of each task in flight is the first; the second needs a way back from the nodes.
+    uses_tokens, wants_cost = False, True
+
+    def __init__(self, address: str | None = None, capacity: int | None = None, **init):
+        import ray
+
+        self._ray = ray
+        ray.init(address=address, **{"include_dashboard": False, "log_to_driver": False, **init})
+        # How many tasks are handed to Ray at once: it queues those it has no room for.
+        self.capacity = capacity or int(ray.cluster_resources().get("CPU", 1))
+        self._lost = (ray.exceptions.WorkerCrashedError, ray.exceptions.NodeDiedError,
+                      ray.exceptions.ObjectLostError, ray.exceptions.OutOfMemoryError)
+        self._run = ray.remote(max_retries=0)(_apply)  # the engine is the one that runs a chunk again
+        self._sized = {}  # cost -> `_run` asking Ray for that much
+
+    def bind(self, on_done) -> None:
+        self._on_done = on_done
+
+    def submit(self, fn, payload, tag, call=None, cost=(1, 0, 0)):
+        run = self._sized.get(cost)
+        if run is None:
+            cpu, gpu, mem_mb = cost
+            run = self._sized[cost] = self._run.options(num_cpus=cpu, num_gpus=gpu,
+                                                        memory=int(mem_mb * 2 ** 20) or None)
+        ref = run.remote(call or _call, fn, payload)
+        ref.future().add_done_callback(partial(self._finished, tag))
+        return ref
+
+    def submit_many(self, fn, payloads, tag, whole=False, cost=(1, 0, 0)):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, cost)
+
+    def _finished(self, tag, future) -> None:
+        status, value, error = _outcome(future, self._lost)
+        if status == ERROR and isinstance(future.exception(), self._ray.exceptions.TaskCancelledError):
+            status = CANCELED
+        result, peak_mb = value if status == DONE else (None, 0)
+        self._on_done(tag, status, result, error, peak_mb)
+
+    def cancel(self, handle) -> None:
+        self._ray.cancel(handle)
+
+    def shutdown(self) -> None:
+        self._ray.shutdown()
+
+
 class _Slots:
     """One float for each task being watched, in a file the workers map: how many chunks' worth of
     its work the task has done. The workers write and `progress` reads: nothing queues, nothing
@@ -205,6 +261,10 @@ def _watched(path, index, call, fn, payload):
 
 def _call(fn, payload):
     return fn(payload), _peak_mb()
+
+
+def _apply(call, fn, payload):
+    return call(fn, payload)
 
 
 def _call_many(fn, payloads):
