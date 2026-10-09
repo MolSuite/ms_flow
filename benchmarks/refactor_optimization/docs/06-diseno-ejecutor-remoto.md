@@ -204,7 +204,7 @@ Añadido el 2026-10-09, antes de R6 y en este orden:
 | F2 ✔ | `File` en la cola por `ssh` y en el runner | test de R4 con un fichero que solo existe "aquí" |
 | F3 ✔ | `File` en Ray sin disco compartido | Ray local con `shared=False`: la task lee una copia fuera de la carpeta de aquí |
 | F4 ✔ | `Dir` en los dos | lo que la task deja aparece en la ruta de aquí |
-| S1 | El ajuste de quién hace de `process`, el cambio sin jobs activos y el bloqueo de loky en el nodo de login | tests del workspace |
+| S1 ✔ | El ajuste de quién hace de `process`, el cambio sin jobs activos y el bloqueo de loky en el nodo de login | tests del workspace |
 | S2 | Límite de tiempo y progreso por elemento en Ray | los tests que ya pasan con loky |
 
 F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExecutor`; tests en `tests/test_files.py` y `tests/test_remote.py`), con estos techos, anotados en el código:
@@ -213,6 +213,14 @@ F1 a F4 están construidos (`engine/files.py`, `remote.py`, `runner.py`, `RayExe
 - En Ray un fichero queda en el almacén de objetos hasta cerrar el ejecutor, y la copia de cada nodo en su temporal hasta que lo limpie el sistema.
 - Las marcas se buscan en diccionarios, listas y tuplas del elemento; dentro de otros objetos no se miran.
 - Sin cluster, "otro disco" se ha probado como otra carpeta de esta máquina.
+
+S1 está construido (`tests/test_process_role.py`):
+
+- El ajuste es `resources.process`: `kind` (`process` \| `ray` \| `queue`), `on_login_node`, y dentro `ray` (`address`, `shared_disk`) y `queue` (`host`, `scheduler`, `workdir`, `python`, `setup`, `runner`, `template`, `elements_per_job`, `max_jobs`, `poll_seconds`, `shared_disk`).
+- El workspace lo lee al construir el motor. Tras cambiarlo se llama a `ms.reload_executors()`, que falla con `ValueError` mientras un job de `process` no haya terminado. En el motor es `Engine.unregister(nombre)`, y `register` sobre un nombre ocupado sustituye con la misma regla.
+- En un nodo de login (`sbatch` en el `PATH` y sin `SLURM_JOB_ID`) no se registra `process`; `ms.submit` lo dice y nombra los dos ajustes. `thread` sigue disponible.
+- El motor, el runner y los ajustes cuentan los núcleos con `sched_getaffinity`: dentro de un job de la cola son los que dio la cola.
+- Sin construir: que la interfaz de ajustes llame a `reload_executors()` al guardar. Y un resto que estorba aquí: `_HARDCODED_LOCAL_CPU_LIMIT = 14` en los ajustes limita `resources.local.cpus` a 14 en cualquier máquina.
 
 ### Estado (2026-10-09)
 
