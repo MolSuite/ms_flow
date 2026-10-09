@@ -25,6 +25,8 @@ The engine knows an executor only through this contract:
 - `progress(owner) -> float`, optional: how many chunks' worth of work the tasks in flight that
   were submitted with `owner=` that value have done. With it `submit` and `submit_many` take
   `owner`, and the engine passes it for the tasks worth watching.
+- `batch`, optional: how many chunks the executor wants in each of its tasks, for the jobs that
+  do not say.
 - `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
   `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the job says each of its chunks needs.
 

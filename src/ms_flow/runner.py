@@ -2,8 +2,8 @@
 
     python -m ms_flow.runner <dir> [--ray ADDRESS] [--cpus N]
 
-`<dir>` is what `stage` wrote: `spec.json` (which function, what an element needs) and
-`elements.bin` (the payloads, one pickle after another). The runner leaves in it:
+`<dir>` is what `stage` wrote: `fn.bin` (the function, pickled: it has to be importable here),
+`spec.json` (what an element needs) and `elements.bin` (the payloads, one pickle after another). The runner leaves in it:
 
 - `results/part-00001.bin`...: `(index, result)` pickles, `index` being the place of the element
   in `elements.bin`. A part that is there is whole and never changes.
@@ -26,8 +26,6 @@ import sys
 import threading
 import time
 import traceback
-from functools import reduce
-from importlib import import_module
 from pathlib import Path
 
 from ms_flow.engine import Engine, ProcessExecutor, RayExecutor, content_key
@@ -49,8 +47,9 @@ def stage(home, fn, payloads, *, batched: bool = False, part_seconds: float = 30
         for payload in payloads:
             pickle.dump(payload, file)
             total += 1
-    spec = {"fn": f"{fn.__module__}:{fn.__qualname__}", "total": total, "batched": batched, "python": _PYTHON,
-            "part_seconds": part_seconds, "submit": needs}
+    (home / "fn.bin").write_bytes(pickle.dumps(fn))
+    spec = {"fn": repr(fn), "total": total, "batched": batched, "python": _PYTHON, "part_seconds": part_seconds,
+            "submit": needs}
     (home / "spec.json").write_text(json.dumps(spec))
     return total
 
@@ -108,8 +107,7 @@ def run(home, ray: str | None = None, cpus: int | None = None) -> str:
     if spec["python"] != _PYTHON:
         raise RuntimeError(f"staged with Python {spec['python']} and this is {_PYTHON}: what one pickles the "
                            "other may not read")
-    module, _, name = spec["fn"].partition(":")
-    fn = reduce(getattr, name.split("."), import_module(module))
+    fn = pickle.loads((home / "fn.bin").read_bytes())
     index_of, parts = {}, _Parts(home / "results", spec["part_seconds"])
 
     def elements():

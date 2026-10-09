@@ -169,7 +169,10 @@ class Flow:
         """
         spec = job.__job__
         fn, output = spec["task"], spec["output"]
-        needs = {**fn.__task__, "batch": batch or fn.__task__["batch"]}
+        # How many elements to a task: whoever submits, then the executor (a job in a queue takes
+        # what its settings say), then the author of the task.
+        own = getattr(self.engine.executor(executor), "batch", None)
+        needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"]}
         if spec["params_model"] is not None:
             params = spec["params_model"].model_validate(params or {})
         if "params" in inspect.signature(fn).parameters:

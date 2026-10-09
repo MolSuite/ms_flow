@@ -172,6 +172,10 @@ class Engine:
             executor.bind_parts(self._part_done)
         self._executors = {**self._executors, name: _Slot(executor)}  # the loop iterates the old one
 
+    def executor(self, name: str):
+        """The executor registered as `name`."""
+        return self._executors[name].impl
+
     def attach(self, name: str, path) -> None:
         """Open the journal at `path`; jobs submitted with `journal=name` are recorded in it.
 
@@ -253,6 +257,7 @@ class Engine:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         if on_result is not None and on_results is not None:
             raise ValueError("on_result or on_results, not both")
+        batch = batch or getattr(slot.impl, "batch", None)
         if (batch or batched) and not slot.packs:
             raise ValueError(f"executor {executor!r} takes one chunk to a task")
         if timeout is not None and not slot.kills:
