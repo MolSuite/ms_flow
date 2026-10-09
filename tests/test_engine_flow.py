@@ -74,6 +74,18 @@ def every_ligand(params, project):
     return Rows(project, QuerySpec(table="ligands", fields=("id",)), page_size=7)
 
 
+@task()
+def halve(n: int) -> dict:
+    if n % 2:
+        raise ValueError("odd")
+    return {"half": n / 2}
+
+
+@job(task=halve, output=table_sink("halves", columns=("half",)))
+def odd_ones_fail(params, project):
+    return range(4)
+
+
 @pytest.fixture
 def project(tmp_path):
     with closing(sqlite3.connect(tmp_path / "project.db")) as conn, conn:
@@ -181,6 +193,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
 
     ms = MolSuite(app_id="facade")
     try:
+        assert ms.jobs() == []
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
         db = ms.project_db.db_path
         sql(db, "CREATE TABLE ligands (id INTEGER PRIMARY KEY, smiles TEXT)")
@@ -205,12 +218,26 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         written = sql(db, "SELECT count(*) FROM docking_results")[0][0]
         assert 320 <= written < 600
 
+        # reopened: its jobs are read from the journal, before anything builds on the engine again
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
+        past = ms.jobs()
+        assert [(job.id, job.status) for job in past] == [(None, "completed"), (None, "interrupted")]
+        assert (past[0].chunks_done, past[0].progress, past[1].key) == (300, 1.0, "again")
+        assert [job.key for job in ms.jobs(limit=1)] == ["again"]
         again = ms.engine.wait(ms.submit(every_ligand, executor="thread", key="again"), 120)
         assert (again.status, again.chunks_done) == ("completed", 300)
         assert sql(db, "SELECT count(*) FROM docking_results") == [(600,)]
         assert ms.get_project_activity()["jobs_active"] == 0
         assert [row["status"] for row in ms.engine.recorded("project")] == ["completed"] * 2
+        # once the journal is open again, the engine answers for the ones it ran, the first included
+        assert [(job.id, job.status) for job in ms.jobs()] == [(done.id, "completed"), (again.id, "completed")]
+
+        sql(db, "CREATE TABLE halves (id INTEGER PRIMARY KEY, half REAL)")
+        broken = ms.engine.wait(ms.submit(odd_ones_fail, executor="thread"), 60)
+        assert (broken.status, broken.chunks_failed) == ("completed_with_errors", 2)
+        failed = ms.job_failures(broken.key)
+        assert len(failed) == 2 and all("ValueError: odd" in row["error"] for row in failed)
+        assert ms.job_failures(again.key) == []
         assert (tmp_path / "one" / "executor.db").exists()
     finally:
         ms.shutdown()

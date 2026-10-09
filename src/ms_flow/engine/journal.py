@@ -83,6 +83,36 @@ def _connect(path) -> sqlite3.Connection:
     return db
 
 
+def _read(path, query: str, args=()) -> list[dict]:
+    """Rows for whoever watches: read without owning the file, so another process may be writing
+    it. Nothing when no journal of this version is there."""
+    if not Path(path).exists():
+        return []
+    with closing(sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)) as db:
+        if db.execute("PRAGMA user_version").fetchone()[0] != VERSION:
+            return []
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute(query, args)]
+
+
+def recorded(path, limit: int | None = None) -> list[dict]:
+    """The jobs on record in the journal at `path`, oldest first; with `limit`, the last ones.
+
+    The counters of a job that is running are at most one write interval old.
+    """
+    return _read(path, "SELECT * FROM jobs ORDER BY n DESC LIMIT ?", (-1 if limit is None else limit,))[::-1]
+
+
+def failures(path, job_id: str, limit: int = 200) -> list[dict]:
+    """`attempt` and `error` of the chunks of a recorded job that failed, at most `limit`.
+
+    ponytail: the journal keeps the key of a chunk, never its payload, so which input failed
+    is only known if the error says it.
+    """
+    return _read(path, "SELECT attempt, error FROM chunks WHERE job = (SELECT n FROM jobs WHERE job_id = ?) "
+                       "AND status = ? LIMIT ?", (job_id, CHUNK_FAILED, limit))
+
+
 class Journal:
     def __init__(self, path, interval: float = 0.05, backlog: int = 200_000):
         self.path = Path(path)
@@ -190,9 +220,7 @@ class Journal:
     def jobs(self) -> list[dict]:
         """Every job on record, oldest first."""
         self.flush()
-        with closing(sqlite3.connect(self.path)) as db:
-            db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY n")]
+        return recorded(self.path)
 
     def close(self) -> None:
         self._records.append(None)

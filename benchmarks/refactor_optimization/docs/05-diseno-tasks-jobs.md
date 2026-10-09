@@ -293,7 +293,7 @@ Se fue con el motor viejo y el nuevo no lo tiene todavía:
 3. **Ejecutores remotos** (HPC, Ray) y su registro desde los ajustes. Van con el ejecutor remoto (paso 6).
 4. **`finalize` y `setup`**, `workflow()` y las entradas declaradas (`InputSource`, `FileInputSpec`): `specs/input.py`, `specs/output.py` y `core/data` siguen en el paquete, sin nadie del motor que los use.
 5. **Log por job** y `watch_job` (barra de `tqdm`).
-6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen.
+6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen. Lo que lee ahora: `MolSuite.jobs(limit)` (los jobs del proyecto, del diario; cada uno como lo tiene el motor en memoria si lo corrió en esta sesión) y `MolSuite.job_failures(key)` (intento y traza de los chunks fallados). El estado vivo sale de la memoria del motor; el fichero solo da el historial y los errores, y se lee sin tomar su cerrojo, así que también sirve para mirar un proyecto que corre otro proceso. El diario no guarda el payload: qué entrada falló solo se sabe si la traza lo dice.
 
 Sin tocar, a decidir: la tabla `project_job_index` de `projects.db` (nadie la escribe), los ajustes `operational_limits` y `workers` (nadie los lee en `ms_flow`), los benchmarks sueltos de `benchmarks/*.py` que importan el manager (no están en git) y la documentación de usuario de `docs/` (describe la API vieja; solo se actualizó el README).
 

@@ -63,7 +63,7 @@ def content_key(payload) -> bytes:
 
 @dataclass(frozen=True, slots=True)
 class JobSnapshot:
-    id: int
+    id: int | None  # None for one read from a journal that this engine did not run
     name: str
     status: str
     chunks_total: int | None  # unknown until the source of chunks is exhausted

@@ -37,6 +37,35 @@ class MolSuiteJobApiMixin:
         """
         return self._project_flow().submit(job, params, journal="project", **options)
 
+    def jobs(self, limit: int | None = None) -> list:
+        """The jobs of the active project, oldest first; with `limit`, the last ones.
+
+        What a monitor shows: every job on record in the project's journal, the ones of earlier
+        sessions too, each as the engine has it now when it ran it in this session. Reads the
+        journal without owning it and never builds the engine, so it is safe to poll.
+        """
+        project = self._runtime_state.active_project
+        if project is None:
+            return []
+        from ms_flow.engine import JobSnapshot
+        from ms_flow.engine.journal import recorded
+
+        live = {(job.key, job.started_at): job for job in (self._engine.jobs() if self._flow is not None else ())}
+        # ponytail: a job of a process that died reads as running until this session's first
+        # submit opens the journal, which is what marks it interrupted.
+        return [live.get((row["job_id"], row["started_at"]))
+                or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
+                               row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
+                               min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None)
+                for row in recorded(project.context.path / "executor.db", limit)]
+
+    def job_failures(self, key: str, limit: int = 200) -> list[dict]:
+        """`attempt` and `error` (the traceback) of the chunks that failed in the job recorded
+        under `key` (`JobSnapshot.key`) in the active project, at most `limit`."""
+        from ms_flow.engine.journal import failures
+
+        return failures(self._require_active_project_runtime().context.path / "executor.db", key, limit)
+
     def get_project_store(self):
         return self.advanced.project_store
 
