@@ -127,6 +127,13 @@ def test_a_job_writes_its_tables_and_the_job_that_reads_them_waits(project):
         assert engine.wait(flow.submit(clashing), 120).chunks_done == 50
         assert rows(well_tied)[0][0] == 950
 
+    # the store itself refuses two rows under one ref, and writes none of them
+    twice = {"docking_results": [{"$ref": "best", "ligand_id": 7000 + i, "pose_rank": 0} for i in range(2)],
+             "interaction_results": [{"pose_ref": "best", "residue": "7000-0"}]}
+    with pytest.raises(Exception, match="duplicate ref 'best'"):
+        project.persist_output_spec(POSES, twice)
+    assert rows("SELECT COUNT(*) FROM docking_results WHERE ligand_id >= 7000")[0][0] == 0
+
 
 def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(project, tmp_path, monkeypatch):
     def sql(text, *args):

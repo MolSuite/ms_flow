@@ -777,15 +777,22 @@ class _ProjectStoreSqliteOps:
                     resolved_rows: list[dict[str, Any]] = []
                     row_refs: list[str | None] = []
                     ref_field = str(node.get("ref_field") or "$ref")
+                    # A ref some relation resolves must name one row: two rows under it and the
+                    # last one would silently take the children of both. An upsert node repeats
+                    # refs on purpose (same key, same row).
+                    refs_resolved = node_name in fk_target_nodes and node_write_mode != "upsert"
+                    seen_refs: set[str] = set()
 
                     for raw_row in rows:
                         row_payload = dict(raw_row)
                         row_ref = row_payload.get(ref_field)
                         row_refs.append(None if row_ref is None else str(row_ref))
-                        if row_ref is not None and str(row_ref) in ref_maps[node_name]:
-                            raise DataContractError(
-                                f"Graph node '{node_name}' contains duplicate ref '{row_ref}'."
-                            )
+                        if refs_resolved and row_ref is not None:
+                            if str(row_ref) in seen_refs:
+                                raise DataContractError(
+                                    f"Graph node '{node_name}' contains duplicate ref '{row_ref}'."
+                                )
+                            seen_refs.add(str(row_ref))
 
                         for relation in relations_by_source[node_name]:
                             fk_field = str(relation["fk_field"])
