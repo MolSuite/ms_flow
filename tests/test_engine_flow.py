@@ -207,6 +207,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
 
         # closing the project interrupts its job, with what it delivered written; the same key continues it
         cut = ms.submit(every_ligand, executor="thread", key="again")
+        assert ms.jobs()[-1].id == cut  # seen at once, before the journal has it on disk
         _until(lambda: ms.engine.status(cut).chunks_done >= 20)
         activity = ms.get_project_activity()
         assert (activity["active"], activity["can_switch_project"], activity["job_ids"]) == (True, False, [cut])

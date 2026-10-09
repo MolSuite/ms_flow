@@ -53,11 +53,14 @@ class MolSuiteJobApiMixin:
         live = {(job.key, job.started_at): job for job in (self._engine.jobs() if self._flow is not None else ())}
         # ponytail: a job of a process that died reads as running until this session's first
         # submit opens the journal, which is what marks it interrupted.
-        return [live.get((row["job_id"], row["started_at"]))
-                or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
-                               row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
-                               min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None)
-                for row in recorded(project.context.path / "executor.db", limit)]
+        listed = [live.pop((row["job_id"], row["started_at"]), None)
+                  or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
+                                 row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
+                                 min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None)
+                  for row in recorded(project.context.path / "executor.db", limit)]
+        # One just submitted is not in the file until the journal's next write. Only the active
+        # project has jobs that have not ended: closing a project interrupts its own.
+        return listed + [job for job in live.values() if job.finished_at is None]
 
     def job_failures(self, key: str, limit: int = 200) -> list[dict]:
         """`attempt` and `error` (the traceback) of the chunks that failed in the job recorded
