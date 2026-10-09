@@ -185,7 +185,7 @@ Sin probar por decisión (van con el ejecutor remoto): pasos `setup`, resolució
 - `refactor/engine-pack-target`: objetivo del lote automático de 100 ms y reparto del final del job.
 - `refactor/engine-resume-count`: sin aviso al reanudar; lo hecho cuenta aunque la fuente no lo traiga.
 - `refactor/engine-grouped-delivery`: escritura agrupada. `on_results(pares)` recibe de una vez todos los resultados del job que están esperando (hasta 256) y se dan por hechos cuando vuelve. Si falla, se ofrecen de uno en uno y solo fallan los malos, así que tiene que ser todo o nada (una transacción). Guardar una fila por resultado cuesta 0,004 ms por elemento, frente a 0,02-0,03 ms con una transacción por resultado. Límite: resultados de dos jobs que llegan intercalados salen de uno en uno.
-- `refactor/engine-forced-batch`: `batch=N` fija cuántos elementos van por tarea (la tarea espera a tener N; solo la última lleva menos) y `batched=True` hace que la función reciba la lista y devuelva un resultado por elemento. Si una función por lotes falla, falla su lote entero. Solo en ejecutores que agrupan (el de procesos); el de hilos lo rechaza. Medida en el informe pendiente: la máquina estaba ocupada al terminar.
+- `refactor/engine-forced-batch`: `batch=N` fija cuántos elementos van por tarea (la tarea espera a tener N; solo la última lleva menos) y `batched=True` hace que la función reciba la lista y devuelva un resultado por elemento. Si una función por lotes falla, falla su lote entero. Solo en ejecutores que agrupan (el de procesos); el de hilos lo rechaza. Registrado en el informe el 2026-10-09 (paso "forced batch"): sin cambio en las medidas largas.
 - `refactor/engine-stopped-results`: un resultado que ya iba camino del callback cuando el job se paró (cancelar, cerrar el proyecto, cerrar el motor) se escribía pero no quedaba registrado como hecho, y al reanudar se repetía. Ahora queda registrado; `detach` y `close` esperan a esa anotación antes de cerrar el diario. Salió al probar la fachada: de 14 a 23 filas duplicadas al cerrar un proyecto con 14 hilos. Tras un `kill -9` se sigue repitiendo lo último sin registrar.
 
 ## Hecho en la API (2026-10-08)
@@ -213,7 +213,7 @@ Lo que hay:
 
 Lo que no hay todavía: `file_sink` como destino (ningún job de AMDockVS lo usa), `source=` con objetos de `ms_flow`, `local=True`, pasos `setup` y `finalize`, `report()`.
 
-Medido con la máquina ocupada (200 000 elementos, una fila por elemento): 0,017 ms por elemento con el sink del proyecto frente a 0,0155 ms escribiendo con `sqlite3` a mano. Medida nueva en el informe: `api_long_ms`. Registro pendiente, igual que el del lote forzado.
+Medido con la máquina ocupada (200 000 elementos, una fila por elemento): 0,017 ms por elemento con el sink del proyecto frente a 0,0155 ms escribiendo con `sqlite3` a mano. Medida nueva en el informe: `api_long_ms`. Registrado el 2026-10-09 con la máquina libre (paso "task api"): 0,021 ms por elemento, frente a 0,017 ms de `write_long_ms`.
 
 ## Hecho: total y tope (2026-10-08)
 
@@ -248,7 +248,7 @@ Rama `refactor/job-progress`.
 - Comprobado en `tests/test_engine_core.py`: 2 elementos a la mitad dan 0,5; dos lotes de 4 con tres terminados y uno a la mitad dan 0,875 sin ningún elemento entregado; 6 elementos sin vigilar dan 0 y con `progress=True` dan 1/6.
 - Límite conocido: una task que termina deja de contar en su casilla un instante antes de que sus elementos cuenten como hechos (cuentan al entregarse), así que el valor puede retroceder un poco. En Windows el fichero temporal se queda al cerrar.
 - Sin hacer: progreso por lote en HPC (va con el ejecutor remoto), y el monitor, que todavía lee el motor viejo.
-- Registro de coste pendiente, como los anteriores (máquina ocupada). Lo añadido por elemento en un lote es una escritura en memoria (217 ns medidos sueltos).
+- Coste registrado el 2026-10-09 (paso "table sources"): igual que el paso anterior. Lo añadido por elemento en un lote es una escritura en memoria (217 ns medidos sueltos).
 
 ## Hecho: relevo, primer corte (2026-10-08)
 
@@ -281,7 +281,7 @@ Borrado (unas 14.000 líneas de `src` y 33 ficheros de test):
 Lo que hay ahora:
 
 - `MolSuite.submit(job, params, **opciones)` y `MolSuite.engine` son la única forma de ejecutar. `status`, `wait`, `cancel`, `jobs` y `recorded` son del motor.
-- El diario es `<proyecto>/executor.db`, abierto al primer `submit`. Un fichero de formato viejo da error con el mensaje «is not a version 2 journal: move it away to start a new one». No se migra (decisión cerrada en el documento 02).
+- El diario es `<proyecto>/executor.db`, abierto al primer `submit`. Un fichero de otra versión da error con el mensaje «is not a version 3 journal: move it away to start a new one». No se migra (decisión cerrada en el documento 02).
 - `close_project` interrumpe los jobs del proyecto (no los cancela); con `cancel_running_tasks=False` falla si queda alguno. `get_project_activity` sale de `engine.jobs()`.
 - `from ms_flow import MolSuite, job, report, task, table_sink, graph_sink, file_sink`, cargados al primer uso. `ms_flow.api` exporta también `JobSnapshot`.
 - `core/executor` queda con `tools.py` y `provisioning.py`, que no son del motor. Su sitio final es `ms_env`.
@@ -293,7 +293,7 @@ Se fue con el motor viejo y el nuevo no lo tiene todavía:
 3. **Ejecutores remotos** (HPC, Ray) y su registro desde los ajustes. Van con el ejecutor remoto (paso 6).
 4. **`finalize` y `setup`**, `workflow()` y las entradas declaradas (`InputSource`, `FileInputSpec`): `specs/input.py`, `specs/output.py` y `core/data` siguen en el paquete, sin nadie del motor que los use.
 5. **Log por job** y `watch_job` (barra de `tqdm`).
-6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen. Lo que lee ahora: `MolSuite.jobs(limit)` (los jobs del proyecto, del diario; cada uno como lo tiene el motor en memoria si lo corrió en esta sesión) y `MolSuite.job_failures(key)` (intento y traza de los chunks fallados). El estado vivo sale de la memoria del motor; el fichero solo da el historial y los errores, y se lee sin tomar su cerrojo, así que también sirve para mirar un proyecto que corre otro proceso. El diario no guarda el payload: qué entrada falló solo se sabe si la traza lo dice.
+6. **Monitor** (`ms_components`): llamaba a 14 métodos de la fachada que ya no existen. Lo que lee ahora: `MolSuite.jobs(limit)` (los jobs del proyecto, del diario; cada uno como lo tiene el motor en memoria si lo corrió en esta sesión) y `MolSuite.job_failures(key)` (intento y traza de los chunks fallados). El estado vivo sale de la memoria del motor; el fichero solo da el historial y los errores, y se lee sin tomar su cerrojo, así que también sirve para mirar un proyecto que corre otro proceso. El diario no guarda el payload; de un chunk que falla guarda una etiqueta corta de su entrada (`reprlib`, 80 caracteres por valor), que `job_failures` devuelve en `input` y el monitor muestra junto a la traza. No la hay cuando el chunk corrió y lo que falló fue escribir su resultado.
 
 Sin tocar, a decidir: la tabla `project_job_index` de `projects.db` (nadie la escribe), los ajustes `operational_limits` y `workers` (nadie los lee en `ms_flow`), los benchmarks sueltos de `benchmarks/*.py` que importan el manager (no están en git) y la documentación de usuario de `docs/` (describe la API vieja; solo se actualizó el README).
 

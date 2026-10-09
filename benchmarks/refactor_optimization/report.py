@@ -66,7 +66,25 @@ STEPS = {
                                "each result is offered again alone and only the bad ones fail. Storing a row per "
                                "result costs 0.004 ms per chunk this way against 0.02 to 0.03 ms with one "
                                "transaction per result. Jobs that take results one at a time cost the same as "
-                               "before, run side by side with the previous step.", True),
+                               "before, run side by side with the previous step.", False),
+    "forced batch": (None, "A job may set how many chunks go to a task (batch=N: the task waits to have N) and its "
+                           "function may take the whole task (batched=True) and return one result per chunk. "
+                           "Nothing changes for a job that sets neither: the long measures stay where they were. "
+                           "This step and the three after it were recorded on 2026-10-09, each from its own "
+                           "commit.", False),
+    "task api": (None, "Jobs are written with @task and @job and submitted through Flow: the source gives the "
+                       "elements, the task runs on one, the results go to a table or graph sink in one "
+                       "transaction per group. New measure, api_long_ms: a job written this way that stores a row "
+                       "per element costs 0.021 ms per element, against 0.017 ms for the engine alone writing "
+                       "with sqlite3 by hand (write_long_ms).", False),
+    "table sources": (None, "A source that reads a table (ms_flow.query.Rows) gives its job the total and the table "
+                            "it reads, so the job waits for whoever is writing it. A job reports how far its "
+                            "running chunks are, and a stopped job records the results its callback still took. "
+                            "Same cost per chunk.", False),
+    "new engine only": (None, "The old engine is gone: tasking, the handler, the executor adapters and their tables "
+                              "in executor.db. The MolSuite facade submits on the new engine (ms.submit) and a "
+                              "monitor reads ms.jobs() and ms.job_failures(). Importing the package costs 300 ms "
+                              "instead of 365 ms; a chunk costs the same.", True),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
