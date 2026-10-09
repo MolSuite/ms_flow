@@ -13,6 +13,8 @@ from uuid import UUID
 import toml
 from pydantic import BaseModel, Field, IPvAnyAddress, field_serializer, field_validator, model_validator
 
+from ms_flow.engine.tokens import usable_cpus
+
 _HARDCODED_LOCAL_CPU_LIMIT = 14
 
 # Categorical values are declared, not just validated: the settings UI turns any
@@ -40,7 +42,7 @@ class LocalResourcesConfig(BaseModel):
     @classmethod
     def set_default_cpus(cls, v: Optional[int]) -> int:
         if v is None or v == -1:
-            return min(os.cpu_count() or 1, _HARDCODED_LOCAL_CPU_LIMIT)
+            return min(usable_cpus(), _HARDCODED_LOCAL_CPU_LIMIT)
         return min(int(v), _HARDCODED_LOCAL_CPU_LIMIT)
 
     @field_validator("gpus", mode="before")
@@ -61,7 +63,7 @@ class LocalResourcesConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_resources(self) -> "LocalResourcesConfig":
-        cpu_count = self.cpus if self.cpus and self.cpus > 0 else (os.cpu_count() or 1)
+        cpu_count = self.cpus if self.cpus and self.cpus > 0 else usable_cpus()
         cpu_count = max(1, min(int(cpu_count), _HARDCODED_LOCAL_CPU_LIMIT))
         self.cpus = cpu_count
 
@@ -177,10 +179,43 @@ class HPCWorkerConfig(WorkerConfig):
     tools_home: str = ""
 
 
+class RayRoleConfig(BaseModel):
+    address: str = Field(default="", description="Empty starts a cluster on this machine; `auto` or `host:port` joins one that is running.")
+    shared_disk: Optional[bool] = Field(
+        default=None, description="Whether every node sees the disk of this machine. Unset: only the cluster started here does.")
+
+
+class QueueRoleConfig(BaseModel):
+    host: str = Field(default="", description="The login node, as `ssh` names it. Empty is the queue of the machine this runs on.")
+    scheduler: Literal["slurm", "none"] = "slurm"
+    workdir: str = Field(default="ms_flow_jobs", description="Where the jobs live over there; a relative one is under the home of the account.")
+    python: str = "python"
+    setup: str = Field(default="", description="The shell lines that prepare the environment before the runner starts.")
+    runner: str = Field(default="", description="Arguments for the runner, like `--ray auto` or `--cpus 16`.")
+    template: str = Field(default="", description="A file with the script the queue runs. Empty is the one built in.")
+    elements_per_job: int = Field(default=0, ge=0, description="How many elements go in each job of the queue. 0 is all of them.")
+    max_jobs: int = Field(default=0, ge=0, description="How many jobs it has in the queue at once. 0 is any number.")
+    poll_seconds: float = Field(default=30, gt=0)
+    shared_disk: Optional[bool] = Field(
+        default=None, description="Whether the other side sees the disk of this machine. Unset: only without a host.")
+
+
+class ProcessRoleConfig(BaseModel):
+    """Who runs what is submitted to `process`: one of them, never two that share this machine."""
+
+    kind: Literal["process", "ray", "queue"] = Field(
+        default="process", description="`process` is the pool of this machine, `ray` a Ray cluster, `queue` the queue of an HPC.")
+    on_login_node: bool = Field(
+        default=False, description="Let the pool of this machine run on the login node of a cluster.")
+    ray: RayRoleConfig = Field(default_factory=RayRoleConfig)
+    queue: QueueRoleConfig = Field(default_factory=QueueRoleConfig)
+
+
 class ResourcesConfig(BaseModel):
     """Local machine resources configuration."""
 
     local: LocalResourcesConfig = Field(default_factory=LocalResourcesConfig)
+    process: ProcessRoleConfig = Field(default_factory=ProcessRoleConfig)
 
 
 class WorkersConfig(BaseModel):

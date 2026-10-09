@@ -5,6 +5,11 @@ import os
 import sys
 
 
+def usable_cpus() -> int:
+    """The CPUs this process may use: in a job of a queue, the ones it was given and not the node's."""
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+
+
 def physical_memory_mb() -> int:
     if sys.platform == "win32":
         import ctypes

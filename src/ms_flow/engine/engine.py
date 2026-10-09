@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .executors import DONE, ERROR, LOST
 from .journal import INTERRUPTED, RESUMABLE, Journal, own
-from .tokens import Tokens, memory_budget_mb
+from .tokens import Tokens, memory_budget_mb, usable_cpus
 
 log = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ class Engine:
         `engine.lock` there, and a second process gets `Busy` instead of the same CPUs.
         """
         self._lock = own(Path(state_dir) / "engine.lock") if state_dir is not None else None
-        self.tokens = Tokens(cpus or os.cpu_count() or 1, gpus,
+        self.tokens = Tokens(cpus or usable_cpus(), gpus,
                              memory_budget_mb() if mem_mb is None else mem_mb)
         self._executors: dict[str, _Slot] = {}
         self._journals: dict[str, Journal] = {}
@@ -166,11 +166,29 @@ class Engine:
     # --- Callers ----------------------------------------------------------------------
 
     def register(self, name: str, executor) -> None:
-        """Add an executor (see `executors` for the contract)."""
+        """Add an executor (see `executors` for the contract), in the place of the one that had
+        the name: see `unregister`."""
+        self.unregister(name)
         executor.bind(self._chunk_done)
         if hasattr(executor, "bind_parts"):
             executor.bind_parts(self._part_done)
         self._executors = {**self._executors, name: _Slot(executor)}  # the loop iterates the old one
+
+    def unregister(self, name: str) -> None:
+        """Shut down the executor registered as `name`, if there is one.
+
+        Raises `ValueError` while a job submitted to it has not ended: an executor changes
+        between jobs, never under one.
+        """
+        slot = self._executors.get(name)
+        if slot is None:
+            return
+        # ponytail: whoever changes executors is whoever submits; a submit from another thread
+        # at this very moment could still land on the one going away.
+        if any(job.slot is slot for job in list(self._jobs.values())):
+            raise ValueError(f"executor {name!r} has jobs that have not ended")
+        self._executors = {key: kept for key, kept in self._executors.items() if key != name}
+        slot.impl.shutdown()
 
     def executor(self, name: str):
         """The executor registered as `name`."""

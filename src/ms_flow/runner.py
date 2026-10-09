@@ -33,6 +33,7 @@ from pathlib import Path
 
 from ms_flow.engine import Engine, ProcessExecutor, RayExecutor, content_key
 from ms_flow.engine.files import Dir, swap
+from ms_flow.engine.tokens import usable_cpus
 
 _PYTHON = "%d.%d" % sys.version_info[:2]
 _GOING = ("waiting", "running")
@@ -131,7 +132,7 @@ def run(home, ray: str | None = None, cpus: int | None = None) -> str:
         with open(home / "errors.jsonl", "a") as file:
             file.write(json.dumps({"index": index_of[key], "error": error}) + "\n")
 
-    cpus = cpus or (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())
+    cpus = cpus or usable_cpus()
     with Engine(cpus=cpus) as engine:
         engine.register("run", ProcessExecutor(cpus) if ray is None else RayExecutor(ray))
         engine.attach("journal", home / "journal.db")

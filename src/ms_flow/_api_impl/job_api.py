@@ -1,5 +1,40 @@
 from __future__ import annotations
 
+import os
+import shutil
+from pathlib import Path
+
+_LOGIN_NODE = ("this is the login node of a cluster, where the pool of processes does not run: set "
+               "`resources.process.kind` to `queue` or `ray`, or `resources.process.on_login_node` to force it")
+
+
+def _login_node() -> bool:
+    # ponytail: Slurm is the one told apart; the commands of another scheduler when a cluster has one.
+    return shutil.which("sbatch") is not None and "SLURM_JOB_ID" not in os.environ
+
+
+def _process_executor(resources):
+    """The executor `resources.process` names, or None for the pool of a login node."""
+    role = resources.process
+    if role.kind == "ray":
+        from ms_flow.engine import RayExecutor
+
+        return RayExecutor(role.ray.address or None, shared=role.ray.shared_disk)
+    if role.kind == "queue":
+        from ms_flow.remote import JOB_SH, RemoteExecutor
+
+        queue = role.queue
+        return RemoteExecutor(queue.host or None, workdir=queue.workdir, scheduler=queue.scheduler,
+                              template=Path(queue.template).read_text() if queue.template else JOB_SH,
+                              python=queue.python, setup=queue.setup, runner=queue.runner,
+                              elements_per_job=queue.elements_per_job or None, max_jobs=queue.max_jobs or None,
+                              poll_s=queue.poll_seconds, shared=queue.shared_disk)
+    if _login_node() and not role.on_login_node:
+        return None
+    from ms_flow.engine import ProcessExecutor
+
+    return ProcessExecutor(resources.local.max_processes)
+
 
 class WorkspaceJobApiMixin:
     @property
@@ -9,15 +44,27 @@ class WorkspaceJobApiMixin:
         Raises `ms_flow.engine.Busy` when another process of this user already runs one.
         """
         if self._engine is None:
-            from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor
+            from ms_flow.engine import Engine, ThreadExecutor
 
             local = self.settings_manager.settings.resources.local
             engine = Engine(cpus=local.cpus, gpus=local.gpus, state_dir=self._master_db_path.parent,
                             mem_mb=local.memory_gb * 1024 if local.memory_gb else None)
-            engine.register("process", ProcessExecutor(local.max_processes))
             engine.register("thread", ThreadExecutor(local.max_threads))
             self._engine = engine
+            self.reload_executors()
         return self._engine
+
+    def reload_executors(self) -> None:
+        """Put in `process` whoever `resources.process` names now. Call it after changing that setting.
+
+        Raises `ValueError` while a job submitted to `process` has not ended, and leaves it as it was.
+        """
+        if self._engine is None:
+            return  # built from the settings at first use
+        self._engine.unregister("process")
+        executor = _process_executor(self.settings_manager.settings.resources)
+        if executor is not None:
+            self._engine.register("process", executor)
 
     def _project_flow(self):
         project = self._require_active_project_runtime()
@@ -36,7 +83,15 @@ class WorkspaceJobApiMixin:
         `executor.db`: closing the project interrupts it, and submitting it again with the same
         `key=` continues it. `options` are those of `ms_flow.engine.Flow.submit`.
         """
-        return self._project_flow().submit(job, params, journal="project", **options)
+        flow = self._project_flow()
+        try:
+            self._engine.executor(options.get("executor", "process"))
+        except KeyError:
+            if options.get("executor", "process") != "process":
+                raise
+            raise RuntimeError(_LOGIN_NODE if _login_node() else
+                               "nothing is registered as `process`: see `reload_executors`") from None
+        return flow.submit(job, params, journal="project", **options)
 
     def jobs(self, limit: int | None = None) -> list:
         """The jobs of the active project, oldest first; with `limit`, the last ones.
