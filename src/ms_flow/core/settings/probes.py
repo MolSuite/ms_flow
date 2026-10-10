@@ -4,7 +4,7 @@
   a subprocess with an explicit timeout.
 * ``ray.init`` is NOT a reachability test: against a dead GCS it retries for
   ~60s, so reachability is checked with a plain TCP connect first.
-* No credential is handled: remote commands go through ``ms_env.Target``, the
+* No credential is handled: remote commands go through ``ms_env.Host``, the
   system ``ssh`` with ``BatchMode=yes``.
 
 ponytail: what is left of the provisioning of the engine before this one. It tests
@@ -17,7 +17,7 @@ import shlex
 import socket
 from typing import Any
 
-from ms_env import Step, StepFailed, Target
+from ms_env import Host, Step, StepFailed
 
 CONNECT_TIMEOUT = 2.0
 RAY_GCS_PORT = 6379
@@ -63,9 +63,9 @@ def probe_tcp(host: str, port: int, timeout: float = CONNECT_TIMEOUT) -> str:
 
 
 def _ssh_argv(host: str, remote_command: str, *, user: str = "") -> list[str]:
-    # A test must answer soon, and of a host nobody logged in to before: the two options `Target` leaves out.
+    # A test must answer soon, and of a host nobody logged in to before: the two options `Host` leaves out.
     ssh = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=accept-new")
-    return Target(f"{user}@{host}" if user else host, ssh=ssh).argv(remote_command)
+    return Host(f"{user}@{host}" if user else host, ssh=ssh).argv(remote_command)
 
 
 def in_env(command: str, env_name: str = "") -> str:

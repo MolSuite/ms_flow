@@ -27,7 +27,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from ms_env import Target, TargetError
+from ms_env import Host, HostError
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
 from ms_flow.engine.files import Dir, File, swap
@@ -129,7 +129,7 @@ class RemoteExecutor:
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None):
-        self.remote, self.workdir, self.queue = Target(host), shlex.quote(workdir), SCHEDULERS[scheduler]
+        self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
@@ -231,14 +231,14 @@ class RemoteExecutor:
                     else:
                         self._accept(what)
                 except Exception:
-                    log.warning("could not reach %s", self.remote.host or "this machine", exc_info=True)
+                    log.warning("could not reach %s", self.remote.address or "this machine", exc_info=True)
             live = [queued for queued in self._jobs if not queued.over]
             if live and not closed and (time.monotonic() >= due or (woken and any(q.ending for q in live))):
                 due = time.monotonic() + self.poll_s
                 try:
                     self._poll(live)
                 except Exception:  # the network, most likely: the next round asks again
-                    log.warning("could not ask %s about its jobs", self.remote.host or "this machine", exc_info=True)
+                    log.warning("could not ask %s about its jobs", self.remote.address or "this machine", exc_info=True)
             if closed:  # what only waited for its job to leave the queue by itself waits no longer
                 for group in {queued.group for queued in self._jobs if queued.group.done}:
                     self._stop(group, now=True)
@@ -387,7 +387,7 @@ class RemoteExecutor:
                 self.remote.run(f"cd {self.workdir} || exit 1; " + " ".join(orders) + " :")
             except Exception:  # ponytail: tried again at the end of the next round, whenever that is
                 self._orders = orders + self._orders
-                log.warning("could not tidy up on %s", self.remote.host or "this machine", exc_info=True)
+                log.warning("could not tidy up on %s", self.remote.address or "this machine", exc_info=True)
 
     def _poll(self, jobs: list) -> None:
         # One command: who is in the queue, and a tar of every progress file, list of errors and
@@ -437,7 +437,7 @@ class RemoteExecutor:
             queued.id = self._queue(f"cd {self.workdir}/{queued.dir}")
         else:
             why = told.get("error") or "the job left the queue before its end, no further than when it was sent"
-            why += (f"\nits directory is kept: {self.workdir}/{queued.dir} on {self.remote.host or 'this machine'} "
+            why += (f"\nits directory is kept: {self.workdir}/{queued.dir} on {self.remote.address or 'this machine'} "
                     "(see runner.log)")
             queued.over = queued.kept = True
             self._orders.append(f"touch {queued.dir}/failed;")  # so that no later run waits for it
@@ -463,7 +463,7 @@ class RemoteExecutor:
             for name, data in _untar(packed).items():
                 n, _, rest = name[len(queued.dir) + 5:].partition("/")
                 if ".." in rest.split("/"):
-                    raise TargetError(f"a file that would land outside its directory: {name}")
+                    raise HostError(f"a file that would land outside its directory: {name}")
                 target = Path(queued.dirs[f"out/{n}"], rest)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
