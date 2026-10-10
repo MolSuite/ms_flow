@@ -85,6 +85,17 @@ class JobSnapshot:
     progress: float | None  # 0 to 1, with how far the running chunks are; None while the total is unknown
 
 
+@dataclass(frozen=True, slots=True)
+class TaskSnapshot:
+    """A task that is with its executor: one chunk, or the several that share it."""
+
+    input: str  # a short repr of its chunk; of the first one when it carries several
+    chunks: int
+    attempt: int
+    seconds: float  # since it was handed to the executor
+    progress: float | None  # 0 to 1; None for a task that is not watched
+
+
 class _Job:
     __slots__ = ("id", "name", "slot", "fn", "cost", "window", "max_cpu", "priority", "on_finish", "finishing",
                  "on_result", "on_results", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
@@ -98,7 +109,7 @@ class _Job:
         if total is not None:
             # ponytail: a task that ended stops counting here a moment before its chunks count
             # as done (they do once delivered), so this can step back a little. A state to show.
-            running = self.slot.impl.progress(self.id) if self.slot.tells and self.flying else 0
+            running = sum(self.slot.impl.progress(self.id).values()) if self.slot.tells and self.flying else 0
             progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
@@ -339,6 +350,20 @@ class Engine:
         what a journal recorded of it stays in `recorded()`."""
         job = self._jobs.get(job_id)
         return self._ended[job_id] if job is None else job.snapshot()
+
+    def tasks(self, job_id: int) -> list[TaskSnapshot]:
+        """The tasks of the job that are with its executor now, the oldest first: what a monitor
+        unfolds under a running job. At most a window of them, and none once the job ended."""
+        job = self._jobs.get(job_id)
+        flying = sorted(tuple(job.flying), key=lambda chunk: chunk.started) if job is not None else ()
+        told = job.slot.impl.progress(job.id) if flying and job.slot.tells else {}
+        now, tasks = time.perf_counter(), []
+        for chunk in flying:
+            pack, said = chunk.pack, told.get(chunk)  # `pack` once: the loop empties it as the task ends
+            n = len(pack) if pack else 1
+            tasks.append(TaskSnapshot(_brief.repr(chunk.payload), n, chunk.attempt, now - chunk.started,
+                                      None if said is None else min(1.0, said / n)))
+        return tasks
 
     def jobs(self) -> list[JobSnapshot]:
         ended = list(self._ended.values())  # first: a job ending right now shows twice, never zero times
@@ -747,8 +772,8 @@ class Engine:
         slot.inflight += 1
         slot.isolating = chunk.alone = alone
         chunk.doomed, chunk.spared = None, False
+        chunk.started = time.perf_counter()  # before it is in `flying`, which `tasks` reads from any thread
         job.flying.add(chunk)
-        chunk.started = time.perf_counter()
         # Watched: a task of several chunks, which counts them by itself, and a task of one when
         # its job has few (or says so), where how far each one is makes the difference.
         fine = job.fine

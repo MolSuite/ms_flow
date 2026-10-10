@@ -22,9 +22,9 @@ The engine knows an executor only through this contract:
   is ignored.
 - `kill()`, optional: stop whatever is running, now. Every chunk in flight comes back `LOST`.
   Without it a chunk cannot have a time limit, and one that started runs to its end.
-- `progress(owner) -> float`, optional: how many chunks' worth of work the tasks in flight that
-  were submitted with `owner=` that value have done. With it `submit` and `submit_many` take
-  `owner`, and the engine passes it for the tasks worth watching.
+- `progress(owner) -> dict`, optional: how many chunks' worth of work each task in flight that
+  was submitted with `owner=` that value has done, by its `tag`. With it `submit` and
+  `submit_many` take `owner`, and the engine passes it for the tasks worth watching.
 - `batch`, optional: how many chunks the executor wants in each of its tasks, for the jobs that
   do not say.
 - `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
@@ -118,7 +118,7 @@ class ProcessExecutor:
         self._on_done = on_done
 
     def submit(self, fn, payload, tag, call=None, owner=None):
-        index = None if owner is None else self._slots.take(owner)
+        index = None if owner is None else self._slots.take(owner, tag)
         task = (call or _call, fn, payload)
         if index is not None:
             task = (_watched, self._slots.path, index, *task)
@@ -134,9 +134,9 @@ class ProcessExecutor:
     def submit_many(self, fn, payloads, tag, whole=False, owner=None):
         return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner)
 
-    def progress(self, owner) -> float:
-        done = self._slots.done
-        return sum(done[index] for index, whose in enumerate(self._slots.owners) if whose == owner)
+    def progress(self, owner) -> dict:
+        slots = self._slots
+        return {slots.tags[index]: slots.done[index] for index, whose in enumerate(slots.owners) if whose == owner}
 
     def _finished(self, tag, index, future) -> None:
         if index is not None:
@@ -220,19 +220,19 @@ class RayExecutor:
             if self._tally is None:
                 self._tally = self._ray.remote(num_cpus=0)(_Tally).remote()
             index = next(self._ids)
-            self._watched[index] = owner
+            self._watched[index] = owner, tag
             call = partial(_told, self._tally, index, call)
         ref = run.remote(call, fn, payload)
         self._flying.add(ref)
         ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
         return ref
 
-    def progress(self, owner) -> float:
+    def progress(self, owner) -> dict:
         if self._tally is not None and not self._asking:
             self._asking = True
             self._tally.all.remote().future().add_done_callback(self._heard)
         said = self._said
-        return sum(said.get(index, 0.0) for index, whose in list(self._watched.items()) if whose == owner)
+        return {tag: said.get(index, 0.0) for index, (whose, tag) in list(self._watched.items()) if whose == owner}
 
     def _heard(self, future) -> None:
         self._asking = False
@@ -311,19 +311,19 @@ class _Slots:
         os.ftruncate(fd, 8 * n)
         self.done = memoryview(mmap.mmap(fd, 8 * n)).cast("d")
         os.close(fd)
-        self.owners = [None] * n
+        self.owners, self.tags = [None] * n, [None] * n
         self._free = list(range(n))
 
-    def take(self, owner) -> int | None:
+    def take(self, owner, tag) -> int | None:
         try:
             index = self._free.pop()
         except IndexError:
             return None
-        self.done[index], self.owners[index] = 0.0, owner
+        self.done[index], self.tags[index], self.owners[index] = 0.0, tag, owner
         return index
 
     def free(self, index: int) -> None:
-        self.owners[index] = None
+        self.owners[index] = self.tags[index] = None
         self._free.append(index)
 
 

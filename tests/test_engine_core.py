@@ -424,12 +424,17 @@ def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
         # few chunks: each one is watched, and what it reports counts
         few = engine.submit("process", _half_then_held, held(2, lambda i: True, "few"), total=2)
         assert reaches(few, 0.5).chunks_done == 0
+        tasks = engine.tasks(few)  # and each one is told apart: what it runs and how far it is
+        assert sorted((task.input[-9:], task.chunks, task.attempt, task.progress) for task in tasks) == \
+            [(f"'idx': {i}}}", 1, 1, 0.5) for i in range(2)]
+        assert all(0 < task.seconds < 30 for task in tasks)
         (tmp_path / "few").touch()
-        assert engine.wait(few, 30).progress == 1.0
+        assert engine.wait(few, 30).progress == 1.0 and engine.tasks(few) == []
 
         # chunks sharing a task: the worker counts the ones it ends, whatever they report
         packed = engine.submit("process", _half_then_held, held(8, lambda i: i % 4 == 3, "packed"), total=8, batch=4)
         assert reaches(packed, 0.875).chunks_done == 0  # three ended and one halfway, in each of the two tasks
+        assert [(task.chunks, task.progress) for task in engine.tasks(packed)] == [(4, 0.875)] * 2
         (tmp_path / "packed").touch()
         assert engine.wait(packed, 30).progress == 1.0
 
@@ -439,6 +444,7 @@ def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
             while not (tmp_path / f"{executor}.said").exists():
                 time.sleep(0.01)
             assert engine.status(job_id).progress == 0.0
+            assert [task.progress for task in engine.tasks(job_id)] == [None] * 2  # in flight, how far unknown
             (tmp_path / executor).touch()
             assert engine.wait(job_id, 30).progress == 1.0
 
@@ -519,5 +525,6 @@ def test_the_same_jobs_on_ray(tmp_path):
         while (snap := engine.status(held)).progress != 0.5:
             assert time.monotonic() < deadline, snap
             time.sleep(0.05)
+        assert [task.progress for task in engine.tasks(held)] == [0.5] * 2  # and task by task
         (tmp_path / "gate").touch()
         assert engine.wait(held, 30).progress == 1.0

@@ -141,6 +141,11 @@ class WorkspaceJobApiMixin:
         # project has jobs that have not ended: closing a project interrupts its own.
         return listed + [job for job in live.values() if job.finished_at is None]
 
+    def job_tasks(self, job_id: int | None) -> list:
+        """The tasks in flight of a job this session runs, by its `JobSnapshot.id`: see
+        `Engine.tasks`. Nothing for a job of another session. Never builds the engine."""
+        return self._engine.tasks(job_id) if self._engine is not None and job_id is not None else []
+
     def job_failures(self, key: str, limit: int = 200) -> list[dict]:
         """`attempt`, `error` (the traceback) and `input` (a short repr of the element) of the
         chunks that failed in the job recorded under `key` (`JobSnapshot.key`) in the active
