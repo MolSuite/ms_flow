@@ -18,7 +18,6 @@ import os
 import queue
 import re
 import shlex
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -27,6 +26,8 @@ import time
 import traceback
 import uuid
 from pathlib import Path
+
+from ms_env import Target, TargetError
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
 from ms_flow.engine.files import Dir, File, swap
@@ -50,30 +51,6 @@ SCHEDULERS = {
 # What the queue runs, in the directory of the job. A cluster's own asks the queue for what it
 # needs (`#SBATCH` lines) and starts Ray on its nodes before the last line.
 JOB_SH = "#!/bin/sh\n@setup@\nexec @python@ -m ms_flow.runner . @runner@\n"
-
-
-class RemoteError(RuntimeError):
-    pass
-
-
-class Remote:
-    """A machine, known by what running a command on it gives back: `host` as `ssh` knows it (its
-    keys, users and jumps are in `~/.ssh/config`), or None for this one."""
-
-    def __init__(self, host: str | None = None, ssh=("ssh", "-o", "BatchMode=yes")):
-        self.host, self.ssh = host, tuple(ssh)
-
-    def run(self, command: str, data=b"", timeout: float = 600) -> bytes:
-        """What `command` printed there, given `data` (bytes, or an open file) to read."""
-        argv = ["sh", "-c", command] if self.host is None else [*self.ssh, self.host, command]
-        feed = {"input": data} if isinstance(data, bytes) else {"stdin": data}
-        done = subprocess.run(argv, **feed, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-        if done.returncode:
-            said = done.stderr.decode(errors="replace").strip()
-            if "Permission denied" in said:  # BatchMode: ssh does not ask, and here nobody could answer
-                said += f"\nssh has to log in to {self.host} with a key, without asking: see ssh-copy-id"
-            raise RemoteError(f"`{command[:200]}` on {self.host or 'this machine'}: {said or done.returncode}")
-        return done.stdout
 
 
 class _Task:
@@ -152,7 +129,7 @@ class RemoteExecutor:
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None):
-        self.remote, self.workdir, self.queue = Remote(host), shlex.quote(workdir), SCHEDULERS[scheduler]
+        self.remote, self.workdir, self.queue = Target(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
@@ -486,7 +463,7 @@ class RemoteExecutor:
             for name, data in _untar(packed).items():
                 n, _, rest = name[len(queued.dir) + 5:].partition("/")
                 if ".." in rest.split("/"):
-                    raise RemoteError(f"a file that would land outside its directory: {name}")
+                    raise TargetError(f"a file that would land outside its directory: {name}")
                 target = Path(queued.dirs[f"out/{n}"], rest)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)

@@ -1,4 +1,4 @@
-"""In-memory job engine. Built next to `ms_flow.core.executor` until it replaces it."""
+"""In-memory job engine."""
 from .engine import Engine, JobSnapshot, TaskSnapshot, content_key
 from .executors import ProcessExecutor, RayExecutor, ThreadExecutor, report
 from .files import Dir, File
