@@ -307,3 +307,23 @@ Restos, revisados el 2026-10-09 (rama `refactor/settings-follow-the-engine`), bu
 | Benchmarks sueltos de `benchmarks/*.py` | Importan el manager viejo y no están en git. Son ficheros de Mario: no se tocan |
 | Documentación de usuario de `docs/` | Describe la API vieja (incluida `reference/operational_profiles.md`, de algo que ya no existe). Se reescribe cuando todo funcione, según lo acordado; solo el README está al día |
 
+
+## Hecho: nombre de una task en el monitor (2026-10-10)
+
+Una task en vuelo se mostraba con el `repr` recortado de su payload: ilegible en cuanto el
+payload es un dict grande (`{'box_center': []…`). Ahora la task declara cómo se llama cada
+elemento:
+
+    @task(cpu=1, label="vina-R{receptor_id}-L{ligand_id}")     # plantilla: la rellenan las claves del elemento
+    @task(cpu=1, label=lambda pair: f"vina-{pair['name']}")    # o una función (elemento) -> texto
+
+- Va en `@task` y llega a `Engine.submit(label=...)`. Lo usan `Engine.tasks` (lo que despliega
+  el monitor) y el `input` de un chunk fallido en el journal; `TaskSnapshot.input` no cambia de nombre.
+- Se evalúa en el proceso del motor y solo para lo que se muestra: no viaja al worker ni
+  cuesta nada a un job que nadie mira.
+- Una etiqueta que no encaja con su payload (clave que falta, función que lanza) no rompe
+  nada: se cae al `repr` corto de antes. Sin `label`, igual que antes.
+- Una task de varios chunks se llama como el primero; el monitor ya antepone `×n`.
+
+Límite: la plantilla es `str.format`, así que alcanza claves e índices (`{pairs[0][ligand_id]}`)
+pero no cuenta ni condiciona; para eso, la función.

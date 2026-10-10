@@ -29,15 +29,17 @@ from pathlib import Path
 
 
 def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0, batch: int | None = None,
-         batched: bool = False):
+         batched: bool = False, label=None):
     """Mark a function as a task: what runs on one element, and what it needs to run.
 
     `batch` is how many elements the author wants to travel together; `batched` says the
     function takes the list of them and returns one result for each.
+    `label` is what an element goes by in the monitor and in a failure: a template its keys
+    fill (`"dock-R{receptor}-L{ligand}"`) or a function `(element)` that returns the text.
     """
     def mark(fn):
         fn.__task__ = {"cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "retries": retries, "batch": batch,
-                       "batched": batched}
+                       "batched": batched, "label": label}
         return fn
     return mark
 

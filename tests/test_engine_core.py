@@ -528,3 +528,25 @@ def test_the_same_jobs_on_ray(tmp_path):
         assert [task.progress for task in engine.tasks(held)] == [0.5] * 2  # and task by task
         (tmp_path / "gate").touch()
         assert engine.wait(held, 30).progress == 1.0
+
+
+def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
+    gate = threading.Event()
+
+    def names(label, payloads=({"engine": "vina", "pairs": [{"receptor": 1, "ligand": 2}]},)):
+        job_id = engine.submit("thread", lambda payload: gate.wait(30), list(payloads), label=label)
+        deadline = time.monotonic() + 30
+        while not (tasks := engine.tasks(job_id)):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        return [task.input for task in tasks]
+
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(8))
+        try:
+            assert names("{engine}-R{pairs[0][receptor]}-L{pairs[0][ligand]}") == ["vina-R1-L2"]  # a template
+            assert names(lambda payload: f"{len(payload['pairs'])} pairs") == ["1 pairs"]  # or a function
+            assert names("chunk {}", [7]) == ["chunk 7"]  # a payload that is not a dict fills the template whole
+            assert names("{nothing}") == names(None)  # one that does not fit: the short repr, as without it
+        finally:
+            gate.set()

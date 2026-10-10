@@ -54,6 +54,19 @@ _brief.maxstring = _brief.maxother = 80
 _brief.maxdict = 8
 
 
+def _called(job, payload) -> str:
+    """What a chunk goes by where it is shown: the `label` of its job, or a short repr of it."""
+    label = job.label
+    if label is not None:
+        try:
+            if callable(label):
+                return str(label(payload))
+            return label.format_map(payload) if isinstance(payload, dict) else label.format(payload)
+        except Exception:  # a label that does not fit a payload must not hide the chunk, or stop the job
+            pass
+    return _brief.repr(payload)
+
+
 def content_key(payload) -> bytes:
     """16 bytes that identify a chunk by what it carries, the same in every run.
 
@@ -89,7 +102,7 @@ class JobSnapshot:
 class TaskSnapshot:
     """A task that is with its executor: one chunk, or the several that share it."""
 
-    input: str  # a short repr of its chunk; of the first one when it carries several
+    input: str  # the label of its chunk, or a short repr of it; of the first one when it carries several
     chunks: int
     attempt: int
     seconds: float  # since it was handed to the executor
@@ -102,7 +115,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine", "needs", "key")
+                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -235,6 +248,7 @@ class Engine:
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
                batch: int | None = None, batched: bool = False, progress: bool | None = None, origin=None,
+               label=None,
                on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -268,6 +282,10 @@ class Engine:
         count how far the running chunks are and not only the ones that ended (see
         `executors.report`). By default a task of several chunks is, and a task of one when the
         job has at most two for each worker.
+        `label` is what a chunk goes by in `tasks` and in a failure, in place of a short repr of
+        its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
+        dict payload) or a function `(payload)` that returns the text. It runs here, never in a
+        worker, and only for a chunk that is shown.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
@@ -314,7 +332,7 @@ class Engine:
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
                              f"the engine has {self.tokens.total}")
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
-        job.batch, job.batched, job.fine = batch or 0, batched, progress
+        job.batch, job.batched, job.fine, job.label = batch or 0, batched, progress, label
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
         job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
@@ -361,7 +379,7 @@ class Engine:
         for chunk in flying:
             pack, said = chunk.pack, told.get(chunk)  # `pack` once: the loop empties it as the task ends
             n = len(pack) if pack else 1
-            tasks.append(TaskSnapshot(_brief.repr(chunk.payload), n, chunk.attempt, now - chunk.started,
+            tasks.append(TaskSnapshot(_called(job, chunk.payload), n, chunk.attempt, now - chunk.started,
                                       None if said is None else min(1.0, said / n)))
         return tasks
 
@@ -601,7 +619,7 @@ class Engine:
     def _attempt_failed(self, chunk: _Chunk, error: str) -> None:
         job = chunk.job
         if chunk.attempt > job.retries:
-            return self._settle(job, chunk.key, chunk.attempt, error, _brief.repr(chunk.payload))
+            return self._settle(job, chunk.key, chunk.attempt, error, _called(job, chunk.payload))
         job.retried += 1
         self._later(job.retry_wait * 2 ** (chunk.attempt - 1), self._requeue, chunk)
         chunk.attempt += 1
