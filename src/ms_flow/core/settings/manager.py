@@ -14,7 +14,7 @@ from ms_flow.core.configuration import (
     set_path_value,
 )
 from ms_flow.core.events import setting_changed
-from ms_flow.core.settings.models import Settings
+from ms_flow.core.settings.models import Settings, molsuite_home
 
 _MISSING = object()
 
@@ -34,7 +34,7 @@ class SettingsManager:
     icon_name = None
 
     def __init__(self):
-        self.global_dir = Path.home() / ".molsuite"
+        self.global_dir = molsuite_home()
         self.global_path = self.global_dir / "config.toml"
         self.project_path: Optional[Path] = None
         self.default_path = Path(__file__).with_name("defaults.toml")

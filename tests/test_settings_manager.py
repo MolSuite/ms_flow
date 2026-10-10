@@ -244,3 +244,10 @@ def test_legacy_keys_are_migrated_and_rewritten(tmp_path, monkeypatch, caplog):
     caplog.clear()
     SettingsManager()
     assert not caplog.messages  # the file was rewritten: said once
+
+
+def test_molsuite_home_moves_everything_the_packages_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOLSUITE_HOME", str(tmp_path / "elsewhere"))
+    sm = SettingsManager()
+    assert sm.global_path == tmp_path / "elsewhere" / "config.toml"
+    assert sm.settings.projects_db == tmp_path / "elsewhere" / "projects.db"

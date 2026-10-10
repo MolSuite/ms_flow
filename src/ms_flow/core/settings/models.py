@@ -17,6 +17,16 @@ from ms_flow.engine.tokens import usable_cpus
 
 _HARDCODED_LOCAL_CPU_LIMIT = 14
 
+
+def molsuite_home() -> Path:
+    """The one per-user folder of the ``ms_*`` packages: registry, settings, logs, engine lock.
+
+    ``$MOLSUITE_HOME`` moves it (a cluster whose home is small, a test); an app keeps what
+    is its own in its own folder, never here.
+    """
+    configured = str(os.environ.get("MOLSUITE_HOME") or "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".molsuite"
+
 # Categorical values are declared, not just validated: the settings UI turns any
 # Literal into a combo box instead of a free-text field.
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -26,7 +36,7 @@ _LEVEL_ALIASES = {"WARN": "WARNING", "FATAL": "CRITICAL", "NOTSET": "DEBUG"}
 class SSHHost(BaseModel):
     address: Union[IPvAnyAddress, str]
     port: int = Field(default=22, ge=1, le=65535)
-    wdir: Path = Field(default="~/.molsuite_temp")
+    wdir: Path = Field(default="~/.molsuite/tmp")
 
 
 class LocalResourcesConfig(BaseModel):
@@ -294,7 +304,7 @@ class Settings(BaseModel):
     # The MolSuite home: moving it orphans every registered project, so it is not a UI
     # setting. Each project carries its own executor.db.
     projects_db: Path = Field(
-        default_factory=lambda: Path.home().joinpath(".molsuite", "projects.db"),
+        default_factory=lambda: molsuite_home() / "projects.db",
         json_schema_extra={"settings_hidden": True},
     )
     general: GeneralConfig = Field(default_factory=GeneralConfig)
@@ -330,14 +340,14 @@ class Settings(BaseModel):
     def _find_config(cls) -> Path:
         search_paths = [
             Path.cwd() / "molsuite.toml",
-            Path.home() / ".config" / "molsuite" / "config.toml",
+            molsuite_home() / "config.toml",
         ]
 
         for path in search_paths:
             if path.exists():
                 return path
 
-        return Path.home() / ".config" / "molsuite" / "config.toml"
+        return molsuite_home() / "config.toml"
 
     def ensure_dirs(self) -> None:
         if self._config_path:
@@ -393,7 +403,7 @@ class Settings(BaseModel):
             if local:
                 path = Path.cwd() / "molsuite.toml"
             else:
-                path = Path.home() / ".config" / "molsuite" / "config.toml"
+                path = molsuite_home() / "config.toml"
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
