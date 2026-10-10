@@ -93,8 +93,55 @@ def test_the_workspace_puts_in_process_whoever_the_settings_name(tmp_path, monke
         assert (done.status, done.chunks_done) == ("completed", 3)
         assert _until(lambda: ms.remote_jobs() == [])  # asked of that machine: what ended well leaves nothing
 
-        choose(kind="process", on_login_node=True)  # said in so many words
+        ms.run_process_on(on_login_node=True)  # said in so many words, and in one call
         assert isinstance(ms.engine.executor("process"), ProcessExecutor)
         assert ms.remote_jobs() == []  # nothing is anywhere else
+
+        def unprepared(address, busy):
+            raise OSError(f"{address} is not reached")
+
+        ms.host_env = unprepared
+        with pytest.raises(OSError, match="pc2 is not reached"):
+            ms.run_process_on("ray", hosts=["pc2"])
+        assert ms.settings_manager.settings.resources.process.kind == "process"  # as it was, and in place
+        assert isinstance(ms.engine.executor("process"), ProcessExecutor)
+        with pytest.raises(ValueError, match="scheduler"):
+            ms.run_process_on("queue", scheduler="none of them")
+        assert isinstance(ms.engine.executor("process"), ProcessExecutor)
     finally:
         ms.shutdown()
+
+
+def test_a_host_with_no_env_named_gets_it_from_the_app_before_anything_runs(monkeypatch):
+    from ms_flow import ray_hosts, remote
+    from ms_flow._api_impl.job_api import _process_executor
+    from ms_flow.core.settings.models import ResourcesConfig
+
+    class Far:
+        def __init__(self, host=None, **said):
+            self.host, self.said = host, said
+
+        def jobs_there(self):
+            return [{"in_queue": True}, {"in_queue": False}]
+
+        def shutdown(self):
+            pass
+
+    asked = []
+
+    def host_env(address, busy):
+        asked.append((address, busy() if busy else None))
+        return f"/envs/{address}"
+
+    monkeypatch.setattr(remote, "RemoteExecutor", Far)
+    monkeypatch.setattr(ray_hosts, "RayOverHosts", lambda hosts, env: (hosts, env))
+    queue = ResourcesConfig(process={"kind": "queue", "queue": {"host": "hpc"}})
+    assert _process_executor(queue, host_env).said["env"] == "/envs/hpc"
+    assert _process_executor(queue).said["env"] == ""  # no app behind: the `python` of that account
+    named = ResourcesConfig(process={"kind": "queue", "queue": {"host": "hpc", "env": "/mine"}})
+    assert _process_executor(named, host_env).said["env"] == "/mine"
+    ray = ResourcesConfig(process={"kind": "ray", "ray": {"hosts": ["pc2", "pc3"]}})
+    assert _process_executor(ray, host_env) == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"])
+    with pytest.raises(ValueError, match="nothing prepares the hosts"):
+        _process_executor(ray)
+    assert asked == [("hpc", "1 of its jobs are in the queue there"), ("pc2", None), ("pc3", None)]

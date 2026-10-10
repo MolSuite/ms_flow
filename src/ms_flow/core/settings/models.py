@@ -193,7 +193,7 @@ class RayRoleConfig(BaseModel):
     address: str = Field(default="", description="Empty starts a cluster on this machine; `auto` or `host:port` joins one that is running.")
     hosts: List[str] = Field(
         default_factory=list, description="Other machines, as `ssh` names them, that join the cluster started on this one.")
-    env: str = Field(default="", description="The environment on those machines that holds Ray and the app, the same path on each.")
+    env: str = Field(default="", description="The environment on those machines that holds Ray and the app, the same path on each. Empty: the app prepares one on each.")
     shared_disk: Optional[bool] = Field(
         default=None, description="Whether every node sees the disk of this machine. Unset: only the cluster started here does.")
 
@@ -202,7 +202,7 @@ class QueueRoleConfig(BaseModel):
     host: str = Field(default="", description="The login node, as `ssh` names it. Empty is the queue of the machine this runs on.")
     scheduler: Literal["slurm", "none"] = "slurm"
     workdir: str = Field(default=".molsuite/jobs", description="Where the jobs live over there; a relative one is under the home of the account.")
-    env: str = Field(default="", description="The environment over there that holds the app. With it, `python` is not asked for.")
+    env: str = Field(default="", description="The environment over there that holds the app. With it, `python` is not asked for. Empty with a host: the app prepares it.")
     python: str = "python"
     setup: str = Field(default="", description="The shell lines that prepare the environment before the runner starts.")
     runner: str = Field(default="", description="Arguments for the runner, like `--ray auto` or `--cpus 16`.")

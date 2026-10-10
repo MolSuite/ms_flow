@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _LOGIN_NODE = ("this is the login node of a cluster, where the pool of processes does not run: set "
                "`resources.process.kind` to `queue` or `ray`, or `resources.process.on_login_node` to force it")
@@ -13,26 +16,46 @@ def _login_node() -> bool:
     return shutil.which("sbatch") is not None and "SLURM_JOB_ID" not in os.environ
 
 
-def _process_executor(resources):
-    """The executor `resources.process` names, or None for the pool of a login node."""
+def _jobs_in_queue(queue) -> str:
+    """Why the environment on the host of `queue` is not to be changed now, or nothing."""
+    from ms_flow.remote import RemoteExecutor
+
+    there = RemoteExecutor(queue.host, workdir=queue.workdir, scheduler=queue.scheduler)
+    try:
+        alive = sum(row["in_queue"] for row in there.jobs_there())
+    finally:
+        there.shutdown()
+    return f"{alive} of its jobs are in the queue there" if alive else ""
+
+
+def _process_executor(resources, host_env=None):
+    """The executor `resources.process` names, or None for the pool of a login node.
+
+    A host with no environment named gets it from `host_env` (see `Workspace.host_env`).
+    """
     role = resources.process
     if role.kind == "ray":
         if role.ray.hosts and not role.ray.address:
             from ms_flow.ray_hosts import RayOverHosts
 
-            return RayOverHosts(role.ray.hosts, role.ray.env)
+            if not role.ray.env and host_env is None:
+                raise ValueError("`resources.process.ray.env` is empty and nothing prepares the hosts: see `Workspace.host_env`")
+            # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
+            return RayOverHosts(role.ray.hosts, role.ray.env or [host_env(host, None) for host in role.ray.hosts])
         from ms_flow.engine import RayExecutor
 
         return RayExecutor(role.ray.address or None, shared=role.ray.shared_disk)
     if role.kind == "queue":
         from ms_flow.remote import JOB_SH, RemoteExecutor
 
-        queue = role.queue
+        queue, env = role.queue, role.queue.env
+        if queue.host and not env and queue.python == "python" and host_env is not None:
+            env = host_env(queue.host, lambda: _jobs_in_queue(queue))
         return RemoteExecutor(queue.host or None, workdir=queue.workdir, scheduler=queue.scheduler,
                               template=Path(queue.template).read_text() if queue.template else JOB_SH,
                               python=queue.python, setup=queue.setup, runner=queue.runner,
                               elements_per_job=queue.elements_per_job or None, max_jobs=queue.max_jobs or None,
-                              poll_s=queue.poll_seconds, shared=queue.shared_disk, env=queue.env)
+                              poll_s=queue.poll_seconds, shared=queue.shared_disk, env=env)
     if _login_node() and not role.on_login_node:
         return None
     from ms_flow.engine import ProcessExecutor
@@ -41,6 +64,12 @@ def _process_executor(resources):
 
 
 class WorkspaceJobApiMixin:
+    #: Set by the app: `host_env(address, busy) -> path` makes sure the host has the environment
+    #: that runs its jobs and says where. It is called when `process` is given to a host with no
+    #: environment named, so before any job runs there. `busy`, when given, returns why that
+    #: environment is not to be changed now (see `ms_env.ensure`).
+    host_env = None
+
     @property
     def engine(self):
         """The engine behind `submit`, built at first use: the one that shares out this machine.
@@ -66,9 +95,37 @@ class WorkspaceJobApiMixin:
         if self._engine is None:
             return  # built from the settings at first use
         self._engine.unregister("process")
-        executor = _process_executor(self.settings_manager.settings.resources)
+        executor = _process_executor(self.settings_manager.settings.resources, self.host_env)
         if executor is not None:
             self._engine.register("process", executor)
+
+    def run_process_on(self, kind: str = "process", **fields) -> None:
+        """Say who runs what is submitted to `process`, keep it for this user and put it in place.
+
+        `fields` are those of that kind in `resources.process`, the rest of them as they come:
+        `run_process_on("ray", hosts=["pc2"])`, `run_process_on("queue", host="hpc")`,
+        `run_process_on()` for the pool of this machine. A value that is not valid, a host that
+        is not reached or not prepared, and a job on `process` that has not ended raise, and
+        leave the setting and the executor as they were.
+        """
+        manager, path = self.settings_manager, "resources.process"
+        before = manager.get_global_value(path).model_dump(mode="json")
+        # ponytail: going back writes the whole section as it was, defaults included.
+        manager.set_global_value(path, {**before, **fields, "kind": kind} if kind == "process"
+                                 else {**before, "kind": kind, kind: fields})
+        try:
+            if self._engine is None:
+                self.engine
+            else:
+                self.reload_executors()
+        except BaseException:
+            manager.set_global_value(path, before)
+            if "process" not in self._engine._executors:
+                try:
+                    self.reload_executors()
+                except Exception:  # the one that was there does not come back either: said, not raised over the cause
+                    log.exception("`process` was left with no executor")
+            raise
 
     def _project_flow(self):
         project = self._require_active_project_runtime()
