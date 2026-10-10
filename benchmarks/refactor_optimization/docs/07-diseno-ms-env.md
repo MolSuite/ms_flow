@@ -1,6 +1,6 @@
 # 07 — Diseño de `ms_env`
 
-Estado: **aprobado por Mario, 2026-10-09**. Nada construido. Se empieza por E1 cuando exista el repo.
+Estado: **aprobado por Mario, 2026-10-09**. E1 construida en ramas locales (`ms_env`: `feat/e1-target-recipes`; `ms_flow`, ms_components y AMDockVS: `refactor/ms-env`), salvo `remove`, que pasa a E2.
 
 ## Lo que dijo Mario
 
@@ -92,7 +92,7 @@ Se construye cuando aparezca el primer host sin internet, no antes.
 | `core/executor/tools.py` | `ms_env`, menos `tool_dependency` / `dependency_state` |
 | `provisioning.Step`, `run_step`, `run_steps`, `find_environment_manager` | `ms_env` |
 | `remote.Remote` | `ms_env.Target`; `remote.py` lo importa |
-| `provisioning.test_steps` | Se queda en `ms_flow` (prueba workers, no envs) hasta que el editor de workers se rehaga |
+| `provisioning.test_steps` | Se queda en `ms_flow`, en `core/settings/probes.py` (prueba workers, no envs), hasta que el editor de workers se rehaga |
 | El resto de `provisioning.py` | Se borra |
 
 `core/executor/` desaparece de `ms_flow`. ms_components y AMDockVS cambian sus imports.
@@ -101,10 +101,12 @@ Se construye cuando aparezca el primer host sin internet, no antes.
 
 Una rama local por fase.
 
+`remove` no entró en E1: el prefijo de una receta puede ser uno que registró el usuario (su propio OpenBabel), y sin el sello no hay forma de saber si lo instaló `ms_env`. Borrar solo lo que lleva sello.
+
 | Fase | Qué | Cómo se sabe que está |
 |---|---|---|
 | E1 | Repo `ms_env`: destino, recetas, `status` / `ensure` / `remove`. Mover, no reescribir. Borrar lo muerto | Las 4 recetas de AMDockVS instalan igual que hoy; la suite de `ms_flow` pasa |
-| E2 | Sello, cerrojo, `installed(destino)` | Un segundo `ensure` no hace nada; dos a la vez no se pisan |
+| E2 | Sello, cerrojo, `installed(destino)`, `remove` | Un segundo `ensure` no hace nada; dos a la vez no se pisan; `remove` solo borra un prefijo con sello |
 | E3 | Env de la app: receta derivada del env local, wheel en desarrollo, `env=` en el ejecutor remoto, regla de jobs vivos | Un job remoto contra el laptop de Mario sin preparar nada a mano |
 | E4 | Espera en el motor: un job dice qué herramientas necesita y no arranca hasta que están en el destino | Sustituye a `tool:<nombre>@<destino>` |
 | E5 | UI en ms_components: envs y herramientas por destino | — |
