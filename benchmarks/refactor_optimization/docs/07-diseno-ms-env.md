@@ -1,6 +1,6 @@
 # 07 — Diseño de `ms_env`
 
-Estado: **aprobado por Mario, 2026-10-09**. E1 construida en ramas locales (`ms_env`: `feat/e1-target-recipes`; `ms_flow`, ms_components y AMDockVS: `refactor/ms-env`), salvo `remove`, que pasa a E2.
+Estado: **aprobado por Mario, 2026-10-09**. E1 construida en ramas locales (`ms_env`: `feat/e1-target-recipes`; `ms_flow`, ms_components y AMDockVS: `refactor/ms-env`), salvo `remove`, que pasa a E2. E2 construida en la rama local `feat/e2-stamp-verify-remove` de `ms_env`, salvo el cerrojo e `installed(destino)`.
 
 ## Lo que dijo Mario
 
@@ -50,9 +50,29 @@ flowchart LR
 
 - **Destino.** `Target(host=None)`: `run(orden, datos)` y el envío y la recogida de ficheros como flujos `tar`. Sale de `remote.Remote`, y `provisioning.ssh_argv` desaparece. Las reglas no cambian: el `ssh` del sistema con `BatchMode=yes`, solo llaves, ninguna credencial gestionada, nada escuchando del otro lado.
 - **Receta.** El formato TOML de hoy, sin cambios.
-- **Tres verbos.** `status(receta, destino)`, `ensure(receta, destino)` (no hace nada si ya está) y `remove(receta, destino)`. Más `installed(destino)` para listar lo que hay.
-- **Sello.** Cada prefijo instalado lleva un fichero con lo que se instaló (nombre, versión, hash de la receta). `status` lo lee con una sola orden; es lo que permite decir «está al día» sin volver a resolver nada.
+- **Cuatro verbos.** `status(receta, destino)`, `ensure(receta, destino)` (crea, actualiza o no hace nada), `verify(receta, destino)` (qué le falta a un env para cumplir la receta) y `remove(receta, destino)`. Más `installed(destino)` para listar lo que hay.
+- **Sello.** Cada prefijo instalado lleva un fichero con lo que se instaló (nombre y hash de la receta). Dice dos cosas: que el prefijo es de `ms_env` y si está al día, sin volver a resolver nada.
 - **Cerrojo.** Un `mkdir` en el destino mientras dura una instalación, para que dos apps o dos PC no instalen a la vez en el mismo prefijo.
+
+## De quién es un env
+
+Pedido por Mario (2026-10-09): si el usuario da la ruta de su env para un programa, no se instala desde cero: se comprueba que cumple lo que pide la receta. Y `ms_env` crea, actualiza y elimina envs, con micromamba.
+
+El sello decide de quién es un prefijo, y de eso sale qué se le puede hacer:
+
+| Qué hay en el prefijo | De quién | `ensure` | `remove` |
+|---|---|---|---|
+| Nada | De nadie | Lo crea y lo sella | Nada que borrar |
+| Sello igual al de la receta | `ms_env` | Nada | Lo borra |
+| Sello distinto, o instalación a medias | `ms_env` | Lo rehace: eso es actualizar | Lo borra |
+| Algo sin sello | Usuario | Lo comprueba. Nunca lo cambia | No lo toca |
+
+- **Comprobar.** `verify` devuelve la lista de lo que no cumple, vacía si cumple: cada paquete de conda fijado en `[env]` (se mira en `conda-meta` del prefijo), cada paquete de pip fijado (se pregunta al Python del prefijo) y la orden `check` contra los ejecutables de ese prefijo. Si la lista no está vacía, `ensure` falla y la enseña; no instala nada encima.
+- **Un ejecutable suelto** que registra el usuario (no un env) solo pasa por su `check`, como hasta ahora.
+- **Actualizar es rehacer.** Se borra el prefijo y se crea de nuevo. Con versiones fijadas y la caché de paquetes de micromamba, rehacer es enlazar ficheros otra vez. Actualizar en sitio es cosa del env de la app (E3), que es grande y cambia poco.
+- **Instalación a medias.** micromamba no crea sobre una carpeta que no sea suya, así que el sello se escribe al final. Mientras dura la instalación hay una marca junto al prefijo (`{prefijo}.installing`); si la instalación se corta, la marca dice que lo que quedó es de `ms_env` y se puede rehacer.
+- **micromamba.** Los envs se crean con micromamba: el que haya en el `PATH`, y si no hay, uno que `ms_env` descarga en `{tools_home}/micromamba`. Otro gestor (conda, mamba) solo si la app lo nombra.
+- Lo que instaló una versión sin sello (E1) cuenta como del usuario: se comprueba y se usa, pero `ms_env` no lo borra.
 
 ## El env de la app en el remoto
 
@@ -106,7 +126,7 @@ Una rama local por fase.
 | Fase | Qué | Cómo se sabe que está |
 |---|---|---|
 | E1 | Repo `ms_env`: destino, recetas, `status` / `ensure` / `remove`. Mover, no reescribir. Borrar lo muerto | Las 4 recetas de AMDockVS instalan igual que hoy; la suite de `ms_flow` pasa |
-| E2 | Sello, cerrojo, `installed(destino)`, `remove` | Un segundo `ensure` no hace nada; dos a la vez no se pisan; `remove` solo borra un prefijo con sello |
+| E2 | Sello, `verify`, actualizar, `remove`, micromamba primero. Después: cerrojo, `installed(destino)` | Un segundo `ensure` no hace nada; una receta que cambia rehace el env; el env del usuario se comprueba y no se toca; `remove` solo borra un prefijo con sello |
 | E3 | Env de la app: receta derivada del env local, wheel en desarrollo, `env=` en el ejecutor remoto, regla de jobs vivos | Un job remoto contra el laptop de Mario sin preparar nada a mano |
 | E4 | Espera en el motor: un job dice qué herramientas necesita y no arranca hasta que están en el destino | Sustituye a `tool:<nombre>@<destino>` |
 | E5 | UI en ms_components: envs y herramientas por destino | — |
