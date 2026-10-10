@@ -17,6 +17,10 @@ def _process_executor(resources):
     """The executor `resources.process` names, or None for the pool of a login node."""
     role = resources.process
     if role.kind == "ray":
+        if role.ray.hosts and not role.ray.address:
+            from ms_flow.ray_hosts import RayOverHosts
+
+            return RayOverHosts(role.ray.hosts, role.ray.env)
         from ms_flow.engine import RayExecutor
 
         return RayExecutor(role.ray.address or None, shared=role.ray.shared_disk)
@@ -28,7 +32,7 @@ def _process_executor(resources):
                               template=Path(queue.template).read_text() if queue.template else JOB_SH,
                               python=queue.python, setup=queue.setup, runner=queue.runner,
                               elements_per_job=queue.elements_per_job or None, max_jobs=queue.max_jobs or None,
-                              poll_s=queue.poll_seconds, shared=queue.shared_disk)
+                              poll_s=queue.poll_seconds, shared=queue.shared_disk, env=queue.env)
     if _login_node() and not role.on_login_node:
         return None
     from ms_flow.engine import ProcessExecutor

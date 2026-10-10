@@ -107,7 +107,9 @@ class RemoteExecutor:
     runs, with `@python@`, `@setup@` (the lines that prepare the environment) and `@runner@`
     (arguments for the runner, like `--ray auto`) filled in. `elements_per_job` is how many
     elements go in each job of the queue, all of them by default, and `max_jobs` how many tasks
-    of the engine it holds at once, any number by default.
+    of the engine it holds at once, any number by default. `env` is an environment there that
+    holds this package (see `ms_env.app_recipe`): its python runs the runner, with its programs
+    first on the `PATH`, and `python` is not asked for.
 
     The function has to be importable on the other side, and an element that fails and is tried
     again goes in a job of its own. Each `File` in an element travels with the job, once however
@@ -128,8 +130,11 @@ class RemoteExecutor:
     def __init__(self, host: str | None = None, *, workdir: str = "ms_flow_jobs", scheduler: str = "none",
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
-                 part_seconds: float = 30, shared: bool | None = None):
+                 part_seconds: float = 30, shared: bool | None = None, env: str = ""):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
+        if env:
+            python = shlex.quote(f"{env}/bin/python")
+            setup = f'export PATH={shlex.quote(env + "/bin")}:"$PATH"\n{setup}'
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared

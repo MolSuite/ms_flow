@@ -175,3 +175,43 @@ def test_canceling_stops_what_an_earlier_run_left_there(tmp_path):
         engine.cancel(job)
         assert engine.wait(job, 60).status == "canceled"
         assert _until(lambda: not _inside(home) and not home.exists())
+
+
+def test_an_env_gives_the_python_and_goes_first_on_the_path(tmp_path):
+    env, seen = tmp_path / "env", tmp_path / "seen"
+    (env / "bin").mkdir(parents=True)
+    python = env / "bin" / "python"
+    python.write_text(f'#!/bin/sh\necho "$PATH" > {seen}\nexec {sys.executable} "$@"\n')
+    python.chmod(0o755)
+    with Engine(cpus=2) as engine:
+        engine.register("far", RemoteExecutor(workdir=str(tmp_path / "far"), env=str(env), poll_s=0.2, part_seconds=0.1,
+                                              setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}"))
+        ended = engine.wait(engine.submit("far", workers.noop, [{"idx": 0}]), 60)
+    assert ended.status == "completed"
+    assert seen.read_text().startswith(f"{env}/bin:")
+
+
+def _where(payload: dict) -> str:
+    import socket
+
+    time.sleep(0.5)
+    return socket.gethostname() + ":" + Path(payload["file"]).read_text()
+
+
+@pytest.mark.skipif("MS_FLOW_RAY_HOST" not in os.environ, reason="needs another machine: MS_FLOW_RAY_HOST=host:env")
+def test_another_machine_joins_the_ray_of_this_one_and_runs_its_share(tmp_path):
+    from ray import cloudpickle
+
+    from ms_flow.ray_hosts import RayOverHosts
+
+    cloudpickle.register_pickle_by_value(sys.modules[__name__])  # the other machine does not have this file
+    host, env = os.environ["MS_FLOW_RAY_HOST"].split(":", 1)
+    (tmp_path / "said").write_text("hello")
+    got, errors = [], []
+    with Engine(cpus=1) as engine:
+        engine.register("ray", RayOverHosts([host], env))
+        job = engine.submit("ray", _where, [{"file": File(str(tmp_path / "said"))} for _ in range(60)],
+                            on_results=got.extend, on_error=lambda key, error: errors.append(error))
+        assert engine.wait(job, 180).status == "completed", errors[:1]
+    names = {result.split(":")[0] for key, result in got}
+    assert len(names) == 2 and all(result.endswith(":hello") for key, result in got)
