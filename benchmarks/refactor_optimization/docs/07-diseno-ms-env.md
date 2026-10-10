@@ -1,6 +1,6 @@
 # 07 — Diseño de `ms_env`
 
-Estado: **propuesta, 2026-10-09**. Nada construido. Las decisiones de Mario de ese día están recogidas; al final queda lo que sigue abierto.
+Estado: **aprobado por Mario, 2026-10-09**. Nada construido. Se empieza por E1 cuando exista el repo.
 
 ## Lo que dijo Mario
 
@@ -116,14 +116,13 @@ E1 a E3 se prueban con el laptop de Mario como destino `ssh` real: es la primera
 
 Cerradas por Mario (2026-10-09):
 
-- Paquete propio; `ms_flow` depende de él; el `ssh` vive en `ms_env`.
+- Paquete propio, `ms_env`, en su repo; quinto paquete en PyPI. `ms_flow` depende de él; el `ssh` vive en `ms_env`.
 - Un env de la app por host, actualizado en sitio. Dos versiones de la app contra el mismo host no se cubren.
 - El env es por host: cada PC en una red local, una vez en el home en un HPC.
+- «Igual» son las mismas versiones de todo, no los mismos bytes (fichero de restricciones).
+- Sin internet: empaquetar, cuando aparezca el primer host que lo pida.
+- El env remoto lleva la app entera, Qt incluido. No se parten las dependencias de la app: la UI no estorba allí y partirlas lo complica todo.
+- Con jobs vivos de la cuenta en ese host, el env no se actualiza.
 - Solo Linux.
 
-Abiertas:
-
-1. **«Igual» son las mismas versiones de todo, no los mismos bytes** (fichero de restricciones). Es la propuesta de este documento; empaquetar queda para el host sin internet.
-2. **El env remoto lleva la app entera**, Qt incluido, porque se instala como en la PC. Recortarlo a lo que usan los workers pediría partir las dependencias de AMDockVS en un extra; no se propone.
-3. **La regla de jobs vivos bloquea la actualización.** La alternativa es actualizar y dejar que esos jobs fallen.
-4. **Dónde vive el repo y cómo se llama en PyPI** (`ms_env`, quinto paquete publicado).
+Abiertas: ninguna. Lo de los nodos reservados se comprueba en el cluster (R5).
