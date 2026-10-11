@@ -64,11 +64,13 @@ def _process_executor(resources, host_env=None):
 
 
 class WorkspaceJobApiMixin:
-    #: Set by the app: `host_env(address, busy) -> path` makes sure the host has the environment
-    #: that runs its jobs and says where. It is called when `process` is given to a host with no
-    #: environment named, so before any job runs there. `busy`, when given, returns why that
-    #: environment is not to be changed now (see `ms_env.ensure`).
+    #: Set by the app: `host_env(address, busy, on_line) -> path` makes sure the host has the
+    #: environment that runs its jobs and says where. It is called when `process` is given to a
+    #: host with no environment named, so before any job runs there. `busy`, when given, returns
+    #: why that environment is not to be changed now (see `ms_env.ensure`); `on_line`, when given,
+    #: is told each line of what is done there.
     host_env = None
+    _host_line = None  # who hears those lines while `run_process_on` runs
 
     @property
     def engine(self):
@@ -95,24 +97,27 @@ class WorkspaceJobApiMixin:
         if self._engine is None:
             return  # built from the settings at first use
         self._engine.unregister("process")
-        executor = _process_executor(self.settings_manager.settings.resources, self.host_env)
+        host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, self._host_line))
+        executor = _process_executor(self.settings_manager.settings.resources, host_env)
         if executor is not None:
             self._engine.register("process", executor)
 
-    def run_process_on(self, kind: str = "process", **fields) -> None:
+    def run_process_on(self, kind: str = "process", on_line=None, **fields) -> None:
         """Say who runs what is submitted to `process`, keep it for this user and put it in place.
 
         `fields` are those of that kind in `resources.process`, the rest of them as they come:
         `run_process_on("ray", hosts=["pc2"])`, `run_process_on("queue", host="hpc")`,
         `run_process_on()` for the pool of this machine. A value that is not valid, a host that
         is not reached or not prepared, and a job on `process` that has not ended raise, and
-        leave the setting and the executor as they were.
+        leave the setting and the executor as they were. `on_line` hears what is done on a
+        host that is being prepared. It waits for those hosts: not from a thread that cannot.
         """
         manager, path = self.settings_manager, "resources.process"
         before = manager.get_global_value(path).model_dump(mode="json")
         # ponytail: going back writes the whole section as it was, defaults included.
         manager.set_global_value(path, {**before, **fields, "kind": kind} if kind == "process"
                                  else {**before, "kind": kind, kind: fields})
+        self._host_line = on_line
         try:
             if self._engine is None:
                 self.engine
@@ -120,12 +125,14 @@ class WorkspaceJobApiMixin:
                 self.reload_executors()
         except BaseException:
             manager.set_global_value(path, before)
-            if "process" not in self._engine._executors:
+            if self._engine is not None and "process" not in self._engine._executors:
                 try:
                     self.reload_executors()
                 except Exception:  # the one that was there does not come back either: said, not raised over the cause
                     log.exception("`process` was left with no executor")
             raise
+        finally:
+            self._host_line = None
 
     def _project_flow(self):
         project = self._require_active_project_runtime()

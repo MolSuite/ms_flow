@@ -272,14 +272,15 @@ class SettingsManager:
         return tuple(
             entry
             for entry in configuration_entries(Settings, self._default)
-            if not entry.path.startswith("applications")
+            if not entry.path.startswith(("applications", "resources.process"))
         )
 
     def custom_editors(self):
         """Sections that need a dedicated editor widget instead of scalar rows.
-        ``workers`` is a polymorphic, dynamically-keyed map (local + Ray/HPC executors)
-        the generic walker skips. Returns (kind, path, title) tuples — no Qt here."""
-        return (("workers", "workers", "Workers / Executors"),)
+        ``resources.process`` is one choice with the fields of what was chosen, and it is put
+        in place when saved (see ``Workspace.run_process_on``). Returns (kind, path, title)
+        tuples — no Qt here."""
+        return (("process", "resources.process", "Where jobs run"),)
 
     def get_value(self, path: str) -> Any:
         return get_path_value(self._effective, path)

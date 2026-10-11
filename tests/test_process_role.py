@@ -97,12 +97,16 @@ def test_the_workspace_puts_in_process_whoever_the_settings_name(tmp_path, monke
         assert isinstance(ms.engine.executor("process"), ProcessExecutor)
         assert ms.remote_jobs() == []  # nothing is anywhere else
 
-        def unprepared(address, busy):
+        heard = []
+
+        def unprepared(address, busy, on_line):
+            on_line(f"looking for {address}")
             raise OSError(f"{address} is not reached")
 
         ms.host_env = unprepared
         with pytest.raises(OSError, match="pc2 is not reached"):
-            ms.run_process_on("ray", hosts=["pc2"])
+            ms.run_process_on("ray", on_line=heard.append, hosts=["pc2"])
+        assert heard == ["looking for pc2"] and ms._host_line is None
         assert ms.settings_manager.settings.resources.process.kind == "process"  # as it was, and in place
         assert isinstance(ms.engine.executor("process"), ProcessExecutor)
         with pytest.raises(ValueError, match="scheduler"):

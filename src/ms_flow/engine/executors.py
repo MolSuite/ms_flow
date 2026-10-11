@@ -194,7 +194,24 @@ class RayExecutor:
         # whenever `progress` is, so that one answers with what the time before brought.
         self._tally, self._watched, self._said, self._asking = None, {}, {}, False
         self._ids = itertools.count()
-        ray.init(address=address, **{"include_dashboard": False, "log_to_driver": False, **init})
+        # What Ray starts on this machine dies with the thread that started it: this one stays
+        # until `shutdown`, so whoever makes the executor may do it from a thread that ends.
+        self._over, started, failed = threading.Event(), threading.Event(), []
+
+        def keep():
+            try:
+                ray.init(address=address, **{"include_dashboard": False, "log_to_driver": False, **init})
+            except BaseException as error:  # raised below, in the thread that asked
+                failed.append(error)
+                return
+            finally:
+                started.set()
+            self._over.wait()
+
+        threading.Thread(target=keep, name="msflow-ray", daemon=True).start()
+        started.wait()
+        if failed:
+            raise failed[0]
         # How many tasks are handed to Ray at once: it queues those it has no room for.
         self.capacity = capacity or int(ray.cluster_resources().get("CPU", 1))
         self._lost = (ray.exceptions.WorkerCrashedError, ray.exceptions.NodeDiedError,
@@ -298,6 +315,7 @@ class RayExecutor:
 
     def shutdown(self) -> None:
         self._ray.shutdown()
+        self._over.set()
 
 
 class _Slots:

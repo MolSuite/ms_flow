@@ -550,3 +550,19 @@ def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
             assert names("{nothing}") == names(None)  # one that does not fit: the short repr, as without it
         finally:
             gate.set()
+
+
+@pytest.mark.slow
+def test_a_ray_made_from_a_thread_that_ends_goes_on_running():
+    pytest.importorskip("ray")
+    from ms_flow.engine import RayExecutor
+
+    made = []
+    with Engine(cpus=2) as engine:
+        maker = threading.Thread(target=lambda: made.append(RayExecutor(num_cpus=2)))
+        maker.start()
+        maker.join()
+        engine.register("ray", made[0])
+        time.sleep(12)  # what Ray started dies some seconds after the thread that started it
+        ended = engine.wait(engine.submit("ray", workers.row, [{"idx": i} for i in range(4)]), 60)
+    assert (ended.status, ended.chunks_done) == ("completed", 4)
