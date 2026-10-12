@@ -27,6 +27,11 @@ class RayOverHosts(RayExecutor):
     def __init__(self, hosts, env, join_seconds: float = 90, **init):
         envs = [env] * len(hosts) if isinstance(env, str) else env
         self._hosts = [(Host(address), shlex.quote(f"{there}/bin/ray")) for address, there in zip(hosts, envs, strict=True)]
+        for host, _ray_there in self._hosts:
+            # ponytail: Slurm is the one told apart, as on this machine (`job_api._login_node`).
+            if host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ] && echo login || :', timeout=60).strip():
+                raise HostError(f"{host.address} is the login node of a cluster, where nothing is to compute: "
+                                "its queue is who runs jobs there")
         # The address of this machine as the others reach it: where their ssh session comes from.
         # ponytail: asked to the first host, so all of them have to be on one network with this machine.
         here = self._hosts[0][0].run("echo ${SSH_CLIENT%% *}", timeout=60).decode().strip()

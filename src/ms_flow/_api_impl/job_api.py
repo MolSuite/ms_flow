@@ -4,8 +4,8 @@ import os
 import shutil
 from pathlib import Path
 
-_LOGIN_NODE = ("this is the login node of a cluster, where the pool of processes does not run: send the job to "
-               "a queue or a Ray, or set `executors.local.on_login_node` to force it")
+_LOGIN_NODE = ("this is the login node of a cluster, where nothing is to compute: send the job to a queue "
+               "(`executors.local.on_login_node` forces the pool of this machine)")
 
 
 def _login_node() -> bool:
@@ -30,9 +30,13 @@ def blocked(name: str, settings, active) -> str:
 
     A machine works for one executor at a time, and this process joins one Ray. The pool of
     this machine is not in the way of a Ray that takes this machine: it is put aside for it
-    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it.
+    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it, and it
+    is the only one started on the login node of a cluster: a Ray has its head there even
+    when none of its tasks run on it.
     """
     asked = settings.executors[name]
+    if _login_node() and (asked.kind == "ray" or asked.kind == "loky" and not asked.on_login_node):
+        return _LOGIN_NODE
     for other in active:
         config = settings.executors.get(other)  # `thread` is nobody's
         if other == name or config is None or "queue" in (asked.kind, config.kind):

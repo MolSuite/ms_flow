@@ -150,8 +150,13 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
         done = ms.engine.wait(ms.submit(_numbers), 120)
         assert (done.status, done.chunks_done) == ("completed", 3)
 
-        # A Ray of this machine: the pool is aside while it runs, and back after it.
+        # A Ray of this machine is not for a login node. Elsewhere the pool is aside while it runs,
+        # and back after it.
         ms.save_executor("alone", kind="ray")
+        assert {row["name"]: row["state"] for row in ms.executors()}["alone"] == "blocked"
+        with pytest.raises(ValueError, match="login node"):
+            ms.activate("alone")
+        monkeypatch.setattr(job_api, "_login_node", lambda: False)
         ms.activate("alone")
         assert ms.engine.executor("alone").capacity == 2
         assert {row["name"]: row["state"] for row in ms.executors()} == {"local": "blocked", "far": "off", "alone": "on"}
