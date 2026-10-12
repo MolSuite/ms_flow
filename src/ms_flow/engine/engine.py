@@ -115,7 +115,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label")
+                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -147,13 +147,13 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives")
+                 "outlives", "threads")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
         self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
-        self.outlives = getattr(impl, "outlives", False)
+        self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
 
 
 class Engine:
@@ -248,7 +248,7 @@ class Engine:
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
                batch: int | None = None, batched: bool = False, progress: bool | None = None, origin=None,
-               label=None,
+               label=None, thread: bool = False,
                on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -282,6 +282,10 @@ class Engine:
         count how far the running chunks are and not only the ones that ended (see
         `executors.report`). By default a task of several chunks is, and a task of one when the
         job has at most two for each worker.
+        `thread` says that `fn` spends its time waiting for a program it starts, not in Python:
+        an executor that keeps a worker for each task and can spare it (the process pool) runs it
+        on a thread of this process, so no worker holds memory for it. Such a chunk is stopped
+        through the programs it tells of (see `executors.launched`).
         `label` is what a chunk goes by in `tasks` and in a failure, in place of a short repr of
         its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
         dict payload) or a function `(payload)` that returns the text. It runs here, never in a
@@ -333,6 +337,7 @@ class Engine:
                              f"the engine has {self.tokens.total}")
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.batch, job.batched, job.fine, job.label = batch or 0, batched, progress, label
+        job.thread = thread and slot.threads
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
         job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
@@ -804,6 +809,8 @@ class Engine:
             watch["cost"] = job.needs
         if slot.outlives:
             watch["key"], watch["keys"] = job.key, [member.key for member in chunk.pack or (chunk,)]
+        if job.thread:
+            watch["thread"] = True
         try:
             if chunk.pack is None:
                 chunk.handle = slot.impl.submit(job.fn, chunk.payload, chunk, **watch)

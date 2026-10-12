@@ -1,6 +1,6 @@
 """In-memory job engine."""
 from .engine import Engine, JobSnapshot, TaskSnapshot, content_key
-from .executors import ProcessExecutor, RayExecutor, ThreadExecutor, report
+from .executors import ProcessExecutor, RayExecutor, ThreadExecutor, launched, report
 from .files import Dir, File
 from .flow import Flow, job, task, writer
 from .journal import Busy

@@ -29,17 +29,20 @@ from pathlib import Path
 
 
 def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0, batch: int | None = None,
-         batched: bool = False, label=None):
+         batched: bool = False, label=None, thread: bool = False):
     """Mark a function as a task: what runs on one element, and what it needs to run.
 
     `batch` is how many elements the author wants to travel together; `batched` says the
     function takes the list of them and returns one result for each.
     `label` is what an element goes by in the monitor and in a failure: a template its keys
     fill (`"dock-R{receptor}-L{ligand}"`) or a function `(element)` that returns the text.
+    `thread` is for a function that only waits for a program it starts (a docking binary): on
+    this machine it runs on a thread of the engine's process and no worker is kept for it. It
+    tells of the program with `launched`, which is how it is stopped.
     """
     def mark(fn):
         fn.__task__ = {"cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "retries": retries, "batch": batch,
-                       "batched": batched, "label": label}
+                       "batched": batched, "label": label, "thread": thread}
         return fn
     return mark
 
@@ -187,9 +190,9 @@ class Flow:
         self._lock = threading.Lock()
 
     def submit(self, job, params=None, *, executor: str = "process", batch: int | None = None,
-               cpu: float | None = None, after=(), on_terminal=None, **engine) -> int:
-        """Start `job` and return its id. `batch` and `cpu` override the task's; `after` adds jobs
-        to wait for.
+               cpu: float | None = None, thread: bool | None = None, after=(), on_terminal=None, **engine) -> int:
+        """Start `job` and return its id. `batch`, `cpu` and `thread` override the task's; `after`
+        adds jobs to wait for.
 
         What else `Engine.submit` takes (`key`, `journal`, `priority`, `total`...) passes through.
         The sink is written on the engine's delivery thread, one transaction for each group of
@@ -202,12 +205,13 @@ class Flow:
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)
-        needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"], "cpu": cpu or fn.__task__["cpu"]}
+        needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"], "cpu": cpu or fn.__task__["cpu"],
+                 "thread": fn.__task__.get("thread", False) if thread is None else thread}
         if spec["params_model"] is not None:
             params = spec["params_model"].model_validate(params or {})
         if engine.get("journal") is not None:
             engine["key"] = engine.get("key") or uuid.uuid4().hex
-            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, "cpu": cpu, **{
+            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, "cpu": cpu, "thread": thread, **{
                 name: value for name, value in engine.items() if name not in ("journal", "key")}})
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch

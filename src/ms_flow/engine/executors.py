@@ -27,6 +27,9 @@ The engine knows an executor only through this contract:
   `submit_many` take `owner`, and the engine passes it for the tasks worth watching.
 - `batch`, optional: how many chunks the executor wants in each of its tasks, for the jobs that
   do not say.
+- `threads`, optional: an executor that keeps a worker for each task and can spare it sets it.
+  `submit` and `submit_many` then take `thread=True` for the tasks of a job that only wait for a
+  program they start (see `launched`).
 - `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
   `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the job says each of its chunks needs.
 - `outlives`, optional: an executor whose tasks go on without this process sets it. `submit` and
@@ -55,6 +58,7 @@ import traceback
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from types import SimpleNamespace
 
 from .files import Dir, swap
 
@@ -100,48 +104,66 @@ class ThreadExecutor:
 
 
 class ProcessExecutor:
-    """loky process pool. A dead worker costs the pool, never the executor: it is rebuilt."""
+    """loky process pool. A dead worker costs the pool, never the executor: it is rebuilt.
 
-    uses_tokens = True
+    The tasks of a job submitted with `thread=True` run on threads of this process instead, and
+    no worker is started or kept for them: they count against the same `capacity`.
+    A worker with nothing to do for `idle` seconds leaves, with the memory of what it imported,
+    and one is started again when there is work for it; `None` keeps them all.
+    """
 
-    def __init__(self, max_workers: int):
+    uses_tokens = threads = True
+
+    def __init__(self, max_workers: int, idle: float | None = 60.0):
         from loky.process_executor import BrokenProcessPool, ProcessPoolExecutor
 
         self.capacity = max_workers
         self._lost = (BrokenProcessPool,)
-        self._new_pool = partial(ProcessPoolExecutor, max_workers, initializer=_die_with_parent,
+        self._new_pool = partial(ProcessPoolExecutor, max_workers, timeout=idle, initializer=_die_with_parent,
                                  initargs=(os.getpid(),))
         self._pool = self._new_pool()
         self._slots = _Slots()
+        self._threads = ThreadPoolExecutor(max_workers, thread_name_prefix="msflow-task")  # started as they are used
+        self._flying = set()  # the `_Started` of each task on a thread
 
     def bind(self, on_done) -> None:
         self._on_done = on_done
 
-    def submit(self, fn, payload, tag, call=None, owner=None):
+    def submit(self, fn, payload, tag, call=None, owner=None, thread=False):
         index = None if owner is None else self._slots.take(owner, tag)
         task = (call or _call, fn, payload)
         if index is not None:
             task = (_watched, self._slots.path, index, *task)
-        try:
-            future = self._pool.submit(*task)
-        except self._lost:  # a worker died: loky refuses this pool for good
-            self._pool.shutdown(wait=False, kill_workers=True)
-            self._pool = self._new_pool()
-            future = self._pool.submit(*task)
-        future.add_done_callback(partial(self._finished, tag, index))
+        started = None
+        if thread:
+            started = _Started()
+            self._flying.add(started)
+            future = self._threads.submit(_on_thread, started, *task)
+        else:
+            try:
+                future = self._pool.submit(*task)
+            except self._lost:  # a worker died: loky refuses this pool for good
+                self._pool.shutdown(wait=False, kill_workers=True)
+                self._pool = self._new_pool()
+                future = self._pool.submit(*task)
+        future.add_done_callback(partial(self._finished, tag, index, started))
         return future
 
-    def submit_many(self, fn, payloads, tag, whole=False, owner=None):
-        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner)
+    def submit_many(self, fn, payloads, tag, whole=False, owner=None, thread=False):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner, thread)
 
     def progress(self, owner) -> dict:
         slots = self._slots
         return {slots.tags[index]: slots.done[index] for index, whose in enumerate(slots.owners) if whose == owner}
 
-    def _finished(self, tag, index, future) -> None:
+    def _finished(self, tag, index, started, future) -> None:
         if index is not None:
             self._slots.free(index)
         status, value, error = _outcome(future, self._lost)
+        if started is not None:
+            self._flying.discard(started)
+            if started.killed and status != CANCELED:  # whatever it made of its program dying
+                status, value, error = LOST, None, None
         result, peak_mb = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, peak_mb)
 
@@ -154,10 +176,15 @@ class ProcessExecutor:
         # the rest, where the chunk is not stuck in native code; add it if limits fire often.
         from loky.backend.utils import kill_process_tree
 
+        for started in tuple(self._flying):  # first: loky takes its time over each worker
+            started.kill()
         for process in list(self._pool._processes.values()):  # no public way to a busy worker
             kill_process_tree(process)  # and the programs it launched
 
     def shutdown(self) -> None:
+        for started in tuple(self._flying):
+            started.kill()
+        self._threads.shutdown(wait=False, cancel_futures=True)
         self._pool.shutdown(wait=True, kill_workers=True)  # waiting is what lets loky clean up after itself
         try:
             os.unlink(self._slots.path)  # ponytail: stays behind on Windows, where a mapped file cannot go
@@ -347,30 +374,80 @@ class _Slots:
 
 # --- Worker side --------------------------------------------------------------------
 
-_slots = None  # (path, floats): the executor's progress file as this worker maps it
-_at = None  # [slot, chunks of the task done, chunks `fn` is working on]: set while the task is watched
+_slots = None  # (path, floats): the executor's progress file as this process maps it
+# What the task running on this thread goes by, since the tasks of the pool may share a process:
+# `at` = [slot, chunks of the task done, chunks `fn` is working on] while it is watched, and
+# `started` = its `_Started` when it runs on a thread of the pool.
+_task = threading.local()
 
 
 def report(fraction: float) -> None:
-    """From a task: how far the element it is working on is, from 0 to 1.
+    """From a task, on the thread it was called on: how far the element it is working on is,
+    from 0 to 1.
 
     Does nothing unless the task is watched: a job of few elements, or one submitted with
     `progress=True`.
     """
-    if _at is not None:
-        _slots[1][_at[0]] = _at[1] + fraction * _at[2]
+    at = getattr(_task, "at", None)
+    if at is not None:
+        _slots[1][at[0]] = at[1] + fraction * at[2]
+
+
+def launched(program) -> None:
+    """From a task, on the thread it was called on: a program it started (a `subprocess.Popen`)
+    and waits for.
+
+    A task on a thread (`thread=True`) cannot be stopped, only what it runs can: when the engine
+    stops what is running (a cancel, a time limit) the programs it told of are killed, and one it
+    tells of after that is killed at once. A task that tells of none runs to its end. Does nothing
+    in a worker process, which is killed with everything it started.
+    """
+    started = getattr(_task, "started", None)
+    if started is not None:
+        started.programs.append(program)
+        if started.killed:
+            _stop(program)
+
+
+class _Started:
+    """The programs a task on a thread started: what a kill can reach of it."""
+
+    def __init__(self):
+        self.programs, self.killed = [], False
+
+    def kill(self) -> None:
+        self.killed = True  # before the programs are read: `launched` appends, then looks
+        for program in tuple(self.programs):
+            _stop(program)
+
+
+def _stop(program) -> None:
+    from loky.backend.utils import kill_process_tree
+
+    if program.poll() is None:  # and what it launched; loky's idea of a process is `multiprocessing`'s
+        kill_process_tree(SimpleNamespace(pid=program.pid, kill=program.kill, join=program.wait))
+
+
+def _on_thread(started, call, *task):
+    _task.started = started
+    try:
+        # ponytail: no peak of memory. This process is not the task's, and the program it runs
+        # is not measured: its `Popen` would have to be waited with `os.wait4`.
+        return call(*task)[0], 0
+    finally:
+        _task.started = None
 
 
 def _watched(path, index, call, fn, payload):
-    global _slots, _at
+    global _slots
     if _slots is None or _slots[0] != path:
         with open(path, "r+b") as file:
             _slots = (path, memoryview(mmap.mmap(file.fileno(), 0)).cast("d"))
-    _at = [index, 0, 1]
+    _task.at = [index, 0, 1]
     try:
         return call(fn, payload)
     finally:
-        _at = None
+        _task.at = None
 
 
 def _call(fn, payload):
@@ -399,7 +476,7 @@ class _Tally:
 
 def _told(tally, index, call, fn, payload):
     """`_watched` on a node: what the task says goes to the tally, twice a second at most."""
-    global _slots, _at
+    global _slots
     said, over = [0.0], threading.Event()
 
     def tell():
@@ -410,11 +487,11 @@ def _told(tally, index, call, fn, payload):
                 tally.tell.remote(index, sent)
 
     threading.Thread(target=tell, daemon=True).start()
-    _slots, _at = (None, said), [0, 0, 1]
+    _slots, _task.at = (None, said), [0, 0, 1]
     try:
         return call(fn, payload)
     finally:
-        _at = None
+        _task.at = None
         over.set()
         tally.drop.remote(index)  # ponytail: a task stopped with its worker leaves its number there
 
@@ -483,14 +560,16 @@ def _call_many(fn, payloads):
             outcomes.append((fn(payload), None))
         except Exception:  # one chunk failing is not the others failing
             outcomes.append((None, traceback.format_exc()))
-        if _at is not None:
-            _at[1] = _slots[1][_at[0]] = len(outcomes)
+        at = getattr(_task, "at", None)
+        if at is not None:
+            at[1] = _slots[1][at[0]] = len(outcomes)
     return outcomes, _peak_mb()
 
 
 def _call_whole(fn, payloads):
-    if _at is not None:
-        _at[2] = len(payloads)
+    at = getattr(_task, "at", None)
+    if at is not None:
+        at[2] = len(payloads)
     results = list(fn(payloads))
     if len(results) != len(payloads):
         raise ValueError(f"{len(results)} results for {len(payloads)} payloads: a batched function returns one for each")

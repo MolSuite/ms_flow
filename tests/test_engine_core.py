@@ -11,7 +11,7 @@ from contextlib import closing
 import pytest
 
 from benchmarks.refactor_optimization import workers
-from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key, report
+from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key, launched, report
 
 
 def _boom_on_3(payload):
@@ -42,6 +42,16 @@ def _half_then_held(payload):
     while payload["held"] and not os.path.exists(payload["gate"]):
         time.sleep(0.01)
     return payload["idx"]
+
+
+def _waits_for_a_program(payload):
+    """What a docking task does: starts a program, tells of it and waits for it."""
+    program = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({payload['s']})"])
+    launched(program)
+    report(0.5)
+    if program.wait():
+        raise RuntimeError("the program was stopped")
+    return os.getpid()
 
 
 class _Trickle:
@@ -404,6 +414,55 @@ def test_retries_time_limit_and_cancel_that_kills(tmp_path):
         while engine.tokens.free[0] != 4 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert engine.tokens.free[0] == 4
+
+
+def test_a_task_that_waits_for_a_program_runs_on_a_thread_of_the_pool():
+    def flying(job_id, progress):
+        deadline = time.monotonic() + 30
+        while [task.progress for task in engine.tasks(job_id)] != progress:
+            assert time.monotonic() < deadline, engine.tasks(job_id)
+            time.sleep(0.01)
+
+    def free():
+        deadline = time.monotonic() + 5
+        while engine.tokens.free[0] != 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return engine.tokens.free[0]
+
+    with Engine(cpus=2, mem_mb=0) as engine:
+        pool = ProcessExecutor(4)
+        engine.register("process", pool)
+
+        # in this process, as many at once as there are CPUs, each one saying how far it is
+        pids = []
+        job_id = engine.submit("process", _waits_for_a_program, [{"s": 0.5, "idx": i} for i in range(4)], thread=True,
+                               total=4, on_result=lambda key, pid: pids.append(pid))
+        flying(job_id, [0.5, 0.5])
+        assert engine.wait(job_id, 30).status == "completed" and pids == [os.getpid()] * 4
+        assert not pool._pool._processes  # and no worker was started for them
+
+        # stopped through the program it told of: canceled, or running past its time
+        hung = engine.submit("process", _waits_for_a_program, [{"s": 60, "idx": i} for i in range(2)], thread=True, total=2)
+        flying(hung, [0.5, 0.5])
+        engine.cancel(hung)
+        assert engine.wait(hung, 10).status == "canceled" and free() == 2
+        late = [{"s": 60 if i == 1 else 0.2, "idx": i} for i in range(6)]
+        snap = engine.wait(engine.submit("process", _waits_for_a_program, late, thread=True, timeout=1.0), 60)
+        assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 5, 1)
+        assert "timed out" in snap.error and free() == 2
+
+
+def test_the_workers_of_the_pool_leave_when_idle_and_come_back():
+    with Engine(cpus=2, mem_mb=0) as engine:
+        pool = ProcessExecutor(2, idle=0.5)
+        engine.register("process", pool)
+        naps = [{"idx": i, "s": 0.2} for i in range(4)]
+        assert engine.wait(engine.submit("process", workers.nap, naps), 30).status == "completed"
+        deadline = time.monotonic() + 15
+        while pool._pool._processes:
+            assert time.monotonic() < deadline, pool._pool._processes
+            time.sleep(0.05)
+        assert engine.wait(engine.submit("process", workers.nap, naps), 30).chunks_done == 4
 
 
 def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
