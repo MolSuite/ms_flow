@@ -98,6 +98,10 @@ class GeneralConfig(BaseModel):
         description="On startup, drop registry entries whose project folder no longer exists (e.g. tmp test projects).",
     )
 
+    # Chosen where the executors are started and stopped, not typed into a grid.
+    default_executor: str = Field(
+        default="local", description="Who runs a job that names nobody.", json_schema_extra={"settings_hidden": True})
+
     @field_validator("log_level", mode="before")
     @classmethod
     def normalize_level_name(cls, v: str) -> str:
@@ -151,6 +155,10 @@ class Settings(BaseModel):
         for name in (*self.hosts, *self.executors):
             if not NAME.fullmatch(name):
                 raise ValueError(f"`{name}` is not a name: letters, digits, `_` and `-`, and no digit first")
+        if "thread" in self.executors:
+            raise ValueError("`thread` is the name of the threads of this process")
+        if self.general.default_executor not in self.executors:
+            self.general.default_executor = "local"  # the one it named is not kept any more
         for name, host in self.hosts.items():
             if bool(host.address) == (name == "local"):
                 raise ValueError("`hosts.local` is this machine: it has no address" if name == "local"

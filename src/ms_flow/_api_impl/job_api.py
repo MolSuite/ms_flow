@@ -25,6 +25,26 @@ def _jobs_in_queue(address: str, workdir: str, scheduler: str) -> str:
     return f"{alive} of its jobs are in the queue there" if alive else ""
 
 
+def blocked(name: str, settings, active) -> str:
+    """Why the executor kept as `name` is not to be started while those in `active` run, or nothing.
+
+    A machine works for one executor at a time, and this process joins one Ray. The pool of
+    this machine is not in the way of a Ray that takes this machine: it is put aside for it
+    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it.
+    """
+    asked = settings.executors[name]
+    for other in active:
+        config = settings.executors.get(other)  # `thread` is nobody's
+        if other == name or config is None or "queue" in (asked.kind, config.kind):
+            continue
+        if asked.kind == config.kind == "ray":
+            return f"one Ray at a time, and `{other}` is active"
+        shared = [host for host in asked.hosts if host in config.hosts]
+        if shared and config.kind == "ray":
+            return f"`{shared[0]}` works for `{other}`, which is active"
+    return ""
+
+
 def _here(local) -> tuple[int, int, int | None]:
     """The CPUs, the GPUs and the memory in MB (None: the engine's own budget) that
     `hosts.local` gives to jobs."""
@@ -101,20 +121,119 @@ class WorkspaceJobApiMixin:
             engine = Engine(cpus=cpus, gpus=gpus, mem_mb=mem_mb, state_dir=self._master_db_path.parent)
             engine.register("thread", ThreadExecutor(cpus * 2))
             self._engine = engine
-            self.reload_executors()
+            self._local_back()
         return self._engine
 
-    def reload_executors(self) -> None:
-        """Make the pool of this machine again as `hosts.local` and `executors.local` say now.
-
-        Raises `ValueError` while a job submitted to `local` has not ended, and leaves it as it was.
-        """
-        if self._engine is None:
-            return  # built from the settings at first use
-        self._engine.unregister("local")
+    def _local_back(self) -> None:
         executor = build_executor("local", self.settings_manager.settings)
         if executor is not None:
             self._engine.register("local", executor)
+
+    def _active(self) -> set[str]:
+        """The executors that take jobs now. Never builds the engine: before its first use
+        nothing does but the pool of this machine."""
+        if self._engine is not None:
+            return {name for name in self._engine._executors if name != "thread"}
+        pool = self.settings_manager.settings.executors["local"]
+        return {"local"} if pool.on_login_node or not _login_node() else set()
+
+    def executors(self) -> list[dict]:
+        """One row for each executor kept: `name`, `kind`, `hosts`, `default`, and `state`:
+        `on`, `starting`, `off`, or `blocked` when it is off and not to be started now, with
+        `why`. Safe to poll."""
+        settings, active = self.settings_manager.settings, self._active()
+        rows = []
+        for name, config in settings.executors.items():
+            why = "" if name in active or name in self._starting else blocked(name, settings, active)
+            state = "starting" if name in self._starting else "on" if name in active else "blocked" if why else "off"
+            rows.append({"name": name, "kind": config.kind, "hosts": list(config.hosts), "state": state, "why": why,
+                         "default": name == settings.general.default_executor})
+        return rows
+
+    def activate(self, name: str, on_line=None) -> None:
+        """Start the executor kept as `name`, which takes jobs under that name from then on.
+
+        Refused with `ValueError` while another active one has one of its machines or is a Ray
+        too (see `blocked`). A Ray that takes this machine puts the pool of it aside until it
+        is deactivated, so the pool must have no job that has not ended. A host that is not
+        reached or not prepared raises, and leaves everything as it was. `on_line` hears what
+        is done on a host that is being prepared. It waits for its hosts: not from a thread
+        that cannot.
+        """
+        settings, engine = self.settings_manager.settings, self.engine
+        if name not in settings.executors:
+            raise ValueError(f"no executor is kept as `{name}`")
+        self._starting.add(name)
+        try:
+            with self._activation:
+                if name in engine._executors:
+                    return
+                why = blocked(name, settings, self._active())
+                if why:
+                    raise ValueError(f"`{name}` is not started: {why}")
+                config = settings.executors[name]
+                aside = config.kind == "ray" and "local" in config.hosts and "local" in engine._executors
+                if aside:
+                    try:
+                        engine.unregister("local")
+                    except ValueError:
+                        raise ValueError(f"`{name}` takes this machine, and its pool has jobs that have not ended") from None
+                try:
+                    host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, on_line))
+                    executor = build_executor(name, settings, host_env)
+                    if executor is None:
+                        raise RuntimeError(_LOGIN_NODE)
+                    engine.register(name, executor)
+                except BaseException:
+                    if aside:
+                        self._local_back()
+                    raise
+                if aside:
+                    self._aside = name
+        finally:
+            self._starting.discard(name)
+
+    def deactivate(self, name: str) -> None:
+        """Stop the executor active as `name`. Refused with `ValueError` while a job submitted
+        to it has not ended. The pool of this machine comes back if it was aside for this one."""
+        if self._engine is None or name not in self._active():
+            return
+        with self._activation:
+            self._engine.unregister(name)
+            if self._aside == name:
+                self._aside = None
+                self._local_back()
+
+    def _change(self, table: str, name: str, change) -> None:
+        """Run `change` on the entry `name` of `hosts` or `executors`, unless an active executor
+        is made of it. The pool of this machine is the one made again with what is kept."""
+        executors = self.settings_manager.settings.executors
+        users = [key for key in self._active() & set(executors) if self._engine is not None and
+                 (key == name if table == "executors" else name in executors[key].hosts)]
+        if users and users != ["local"]:
+            raise ValueError(f"`{table}.{name}` is in use by `{users[0]}`, which is active: deactivate it first")
+        with self._activation:
+            if users:
+                self._engine.unregister("local")  # refused while it has jobs, and then nothing is changed
+            try:
+                change()
+            finally:
+                if users:
+                    self._local_back()
+
+    def save_host(self, name: str, **fields) -> None:
+        """`SettingsManager.save_host`, refused while an active executor works on that machine."""
+        self._change("hosts", name, lambda: self.settings_manager.save_host(name, **fields))
+
+    def remove_host(self, name: str) -> None:
+        self._change("hosts", name, lambda: self.settings_manager.remove_host(name))
+
+    def save_executor(self, name: str, **fields) -> None:
+        """`SettingsManager.save_executor`, refused while that executor is active."""
+        self._change("executors", name, lambda: self.settings_manager.save_executor(name, **fields))
+
+    def remove_executor(self, name: str) -> None:
+        self._change("executors", name, lambda: self.settings_manager.remove_executor(name))
 
     def _project_flow(self):
         project = self._require_active_project_runtime()
@@ -125,24 +244,24 @@ class WorkspaceJobApiMixin:
             self._flow = Flow(self.engine, project.project_db)
         return self._flow
 
-    def submit(self, job, params=None, *, executor: str = "local", **options) -> int:
+    def submit(self, job, params=None, *, executor: str | None = None, **options) -> int:
         """Run a `ms_flow.engine.job` in the active project and return its id, for `engine.status`
         and `engine.wait`.
 
         Its results go to the project's store, and the job is recorded in the project's
         `executor.db`: closing the project interrupts it, and submitting it again with the same
-        `key=` continues it. `executor` is `local` (the pool of this machine), `thread`, or the
-        name of another one that is registered; `options` are those of `ms_flow.engine.Flow.submit`.
+        `key=` continues it. `executor` is `thread` or the name of an active one (see
+        `activate`), by default the one the settings give (`general.default_executor`);
+        `options` are those of `ms_flow.engine.Flow.submit`.
         """
         flow = self._project_flow()
-        try:
-            self._engine.executor(executor)
-        except KeyError:
-            if executor != "local":
-                raise
-            raise RuntimeError(_LOGIN_NODE if _login_node() else
-                               "nothing is registered as `local`: see `reload_executors`") from None
-        return flow.submit(job, params, journal="project", executor=executor, **options)
+        name = executor or self.settings_manager.settings.general.default_executor
+        if name not in self._engine._executors:
+            raise RuntimeError(
+                f"the pool of this machine is aside while `{self._aside}` has it" if name == "local" and self._aside
+                else _LOGIN_NODE if name == "local" and _login_node()
+                else f"`{name}` is not active: see `Workspace.activate`")
+        return flow.submit(job, params, journal="project", executor=name, **options)
 
     def resume(self, key: str, **options) -> int:
         """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,

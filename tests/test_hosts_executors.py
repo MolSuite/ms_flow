@@ -123,7 +123,6 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
     _home(tmp_path, monkeypatch)
     monkeypatch.setattr(job_api, "_login_node", lambda: True)
     ms = Workspace(app_id="role")
-    settings = ms.settings_manager
     try:
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
         with pytest.raises(RuntimeError, match="login node"):  # no pool there, and the threads are still here
@@ -131,22 +130,36 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
         assert isinstance(ms.engine.executor("thread"), ThreadExecutor)
 
         # The queue of this machine, with the environment this test runs in.
-        settings.save_host("local", env=sys.prefix, workdir=str(tmp_path / "far"))
-        settings.save_executor("far", kind="queue", scheduler="none", poll_seconds=0.2,
-                               setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}")
-        ms.engine.register("far", job_api.build_executor("far", settings.settings))
+        ms.save_host("local", env=sys.prefix, workdir=str(tmp_path / "far"))
+        ms.save_executor("far", kind="queue", scheduler="none", poll_seconds=0.2,
+                         setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}")
+        ms.activate("far")
         assert isinstance(ms.engine.executor("far"), RemoteExecutor)
         done = ms.engine.wait(ms.engine.submit("far", workers.row, [{"idx": i} for i in range(3)]), 120)
         assert (done.status, done.chunks_done) == ("completed", 3)
         assert _until(lambda: ms.remote_jobs("far") == [])  # asked of that machine: what ended well leaves nothing
         assert ms.remote_jobs("local") == []  # nothing is anywhere else
 
-        settings.save_host("local", cpus=2)
-        settings.save_executor("local", kind="loky", on_login_node=True)  # said in so many words
-        ms.reload_executors()
+        with pytest.raises(ValueError, match="in use by `far`"):  # the queue is made of this machine as it is kept
+            ms.save_host("local", cpus=2)
+        ms.deactivate("far")
+        ms.save_host("local", cpus=2)
+        ms.save_executor("local", kind="loky", on_login_node=True)  # said in so many words
+        ms.activate("local")
         assert isinstance(ms.engine.executor("local"), ProcessExecutor) and ms.engine.executor("local").capacity == 2
         done = ms.engine.wait(ms.submit(_numbers), 120)
         assert (done.status, done.chunks_done) == ("completed", 3)
+
+        # A Ray of this machine: the pool is aside while it runs, and back after it.
+        ms.save_executor("alone", kind="ray")
+        ms.activate("alone")
+        assert ms.engine.executor("alone").capacity == 2
+        assert {row["name"]: row["state"] for row in ms.executors()} == {"local": "blocked", "far": "off", "alone": "on"}
+        # (a function its nodes can import: the ones of this file are not)
+        done = ms.engine.wait(ms.engine.submit("alone", workers.row, [{"idx": i} for i in range(3)]), 120)
+        assert (done.status, done.chunks_done) == ("completed", 3)
+        ms.deactivate("alone")
+        assert isinstance(ms.engine.executor("local"), ProcessExecutor)
     finally:
         ms.shutdown()
 
@@ -196,3 +209,79 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     with pytest.raises(ValueError, match="nothing prepares it"):
         built("lab", None)
     assert asked == [("login", "1 of its jobs are in the queue there")] * 3 + [("pc2", None), ("pc3", None), ("pc2", None)]
+
+
+def test_a_machine_works_for_one_executor_at_a_time(tmp_path, monkeypatch):
+    """The rules of `activate`, on executors that run nothing."""
+    from ms_flow import engine as engines
+    from ms_flow import ray_hosts
+    from ms_flow._api_impl.job_api import blocked
+    from ms_flow.api import Workspace
+
+    class Ray(_Held):
+        def __init__(self, *said, **init):
+            super().__init__()
+
+    _home(tmp_path, monkeypatch)
+    monkeypatch.setattr(ray_hosts, "RayOverHosts", Ray)
+    monkeypatch.setattr(engines, "RayExecutor", Ray)
+    ms = Workspace(app_id="rules")
+    try:
+        for name, address in (("laptop", "192.168.1.2"), ("pc1", "192.168.1.3"), ("pc2", "192.168.1.4")):
+            ms.save_host(name, address=address, env="/env")
+        ms.save_executor("lab", kind="ray", hosts=["local", "pc1", "pc2"])
+        ms.save_executor("lab_laptop", kind="ray", hosts=["local", "laptop", "pc1", "pc2"])
+        ms.save_executor("far", kind="ray", hosts=["laptop"])
+        ms.save_executor("hpc", kind="queue", hosts=["laptop"])
+        settings = ms.settings_manager.settings
+
+        assert blocked("lab", settings, {"local", "thread", "hpc"}) == ""  # the pool is put aside for it
+        assert "one Ray at a time" in blocked("lab_laptop", settings, {"lab"})
+        assert "`local` works for `lab`" in blocked("local", settings, {"lab"})
+        assert blocked("local", settings, {"far"}) == blocked("hpc", settings, {"far", "lab"}) == ""
+
+        def states():
+            return {row["name"]: row["state"] for row in ms.executors()}
+
+        assert states() == {"local": "on", "lab": "off", "lab_laptop": "off", "far": "off", "hpc": "off"}  # no engine yet
+        ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
+        heard = []
+
+        def unprepared(address, busy, on_line):
+            on_line(f"looking for {address}")
+            raise OSError(f"{address} is not reached")
+
+        ms.host_env = unprepared
+        ms.save_host("pc2", address="192.168.1.4")  # no environment named: the app is asked, and fails
+        with pytest.raises(OSError, match="192.168.1.4 is not reached"):
+            ms.activate("lab", on_line=heard.append)
+        assert heard == ["looking for 192.168.1.4"] and states()["local"] == "on"  # as it was
+        ms.save_host("pc2", address="192.168.1.4", env="/env")
+
+        ms.activate("lab")
+        assert states() == {"local": "blocked", "lab": "on", "lab_laptop": "blocked", "far": "blocked", "hpc": "off"}
+        with pytest.raises(ValueError, match="one Ray at a time"):
+            ms.activate("lab_laptop")
+        with pytest.raises(ValueError, match="`local` works for `lab`"):
+            ms.activate("local")
+        with pytest.raises(RuntimeError, match="aside while `lab` has it"):
+            ms.submit(_numbers)  # the default is the pool, and nobody sends its jobs elsewhere for it
+        for change in (lambda: ms.save_executor("lab", kind="ray", hosts=["pc1"]), lambda: ms.remove_executor("lab"),
+                       lambda: ms.save_host("pc1", address="192.168.1.3", cpus=4), lambda: ms.save_host("local", cpus=4)):
+            with pytest.raises(ValueError, match="in use by `lab`"):
+                change()
+
+        ms.settings_manager.set_default_executor("lab")
+        running = ms.submit(_numbers)  # to the default one
+        lab = ms.engine.executor("lab")
+        assert _until(lambda: lab.tasks)
+        with pytest.raises(ValueError, match="have not ended"):
+            ms.deactivate("lab")
+        ms.engine.cancel(running)
+        assert _until(lambda: ms.engine.status(running).finished_at is not None)
+        ms.deactivate("lab")
+        assert lab.down and states()["local"] == "on" and states()["lab_laptop"] == "off"  # the pool is back
+        ms.remove_executor("lab")
+        assert ms.settings_manager.settings.general.default_executor == "local"  # the one it named is gone
+    finally:
+        ms.shutdown()

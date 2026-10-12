@@ -73,7 +73,7 @@ class WorkspaceProjectRuntimeMixin:
         self._close_project_runtime()
         if self._engine is not None:
             self._engine.close()
-            self._engine = None
+            self._engine = self._aside = None
 
     def _close_project_runtime(self):
         active_project = self._runtime_state.active_project

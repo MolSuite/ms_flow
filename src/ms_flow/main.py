@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Optional
 from uuid import UUID
 
@@ -76,6 +77,8 @@ class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
 
         self._runtime_state = ProjectRuntimeState()
         self._engine = self._flow = None  # see `Workspace.engine` and `Workspace.submit`
+        # see `Workspace.activate`: who put the pool of this machine aside, who is starting, one at a time
+        self._aside, self._starting, self._activation = None, set(), threading.Lock()
         self.project_logger = None
         self._advanced = WorkspaceAdvancedAccess(self)
 

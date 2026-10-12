@@ -306,6 +306,12 @@ class SettingsManager:
                 ".".join(map(str, e["loc"])) + ": " + e["msg"] if e["loc"] else e["msg"].removeprefix("Value error, ")
                 for e in error.__cause__.errors())) from None
 
+    def set_default_executor(self, name: str) -> None:
+        """Say who runs a job that names nobody: one of the executors kept."""
+        if name not in self._global.executors:
+            raise ValueError(f"no `executors.{name}` is kept")
+        self.set_global_value("general.default_executor", name)
+
     def remove_host(self, name: str) -> None:
         """Forget a machine. One that an executor names is refused: take it out of there first."""
         users = [key for key, executor in self._global.executors.items() if name in executor.hosts]
@@ -323,6 +329,8 @@ class SettingsManager:
             raise ValueError(f"no `{table}.{name}` is kept")
         overrides = deepcopy(self._global_overrides)
         delete_path_value(overrides, f"{table}.{name}")
+        if table == "executors" and self._global.general.default_executor == name:
+            delete_path_value(overrides, "general.default_executor")
         self._global_overrides = overrides
         self._save_overrides(self.global_path, overrides)
         self._refresh_effective()
