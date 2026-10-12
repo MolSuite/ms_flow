@@ -365,6 +365,17 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         assert sorted(row["input"] for row in failed) == ["1", "3"]  # which elements they were
         assert ms.job_failures(again.key) == []
         assert (tmp_path / "one" / "executor.db").exists()
+
+        # a running job moves: canceled where it is, and continued on the executor named
+        with pytest.raises(RuntimeError, match="`nowhere` is not active"):
+            ms.move(done.key, "nowhere")
+        rows = sql(db, "SELECT count(*) FROM docking_results")[0][0]
+        moving = ms.submit(every_ligand, executor="thread", key="moved", cpu=2)
+        _until(lambda: ms.engine.status(moving).chunks_done >= 20)
+        moved = ms.engine.wait(ms.move("moved", "local"), 120)
+        assert (ms.engine.status(moving).status, moved.status, moved.chunks_done) == ("canceled", "completed", 300)
+        assert ms.origin("moved")["options"] == {"executor": "local", "cpu": 2}
+        assert rows + 300 <= sql(db, "SELECT count(*) FROM docking_results")[0][0] < rows + 320
     finally:
         ms.shutdown()
     assert ms._engine is None

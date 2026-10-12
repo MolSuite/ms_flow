@@ -259,12 +259,20 @@ class WorkspaceJobApiMixin:
         """
         flow = self._project_flow()
         name = executor or self.settings_manager.settings.general.default_executor
+        self._ready(name)
+        return flow.submit(job, params, journal="project", executor=name, **options)
+
+    def _ready(self, name: str) -> None:
         if name not in self._engine._executors:
             raise RuntimeError(
                 f"the pool of this machine is aside while `{self._aside}` has it" if name == "local" and self._aside
                 else _LOGIN_NODE if name == "local" and _login_node()
                 else f"`{name}` is not active: see `Workspace.activate`")
-        return flow.submit(job, params, journal="project", executor=name, **options)
+
+    def origin(self, key: str) -> dict:
+        """What the job recorded under `key` in the active project was submitted with: `job` (its
+        `module:qualname`), `params` and `options`. Raises for one `resume` cannot submit again."""
+        return self._project_flow().origin(key, journal="project")
 
     def resume(self, key: str, **options) -> int:
         """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
@@ -273,8 +281,20 @@ class WorkspaceJobApiMixin:
         otherwise for this run, and bring what the record cannot keep (`on_terminal`)."""
         from ms_flow.engine.flow import named
 
-        origin = self._project_flow().origin(key, journal="project")
+        origin = self.origin(key)
         return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
+
+    def move(self, key: str, executor: str, **options) -> int:
+        """Continue on `executor` the job recorded under `key`: `resume`, for one that may be running.
+        A job this session runs is canceled first and waited for, so not from a thread that cannot
+        wait: what its tasks in flight had done is done again there."""
+        self.origin(key)  # nothing is canceled for a job that cannot be submitted again,
+        self._ready(executor)  # or that has nowhere to go
+        for job in self._engine.jobs():
+            if job.key == key and job.finished_at is None:
+                self._engine.cancel(job.id)
+                self._engine.wait(job.id)
+        return self.resume(key, executor=executor, **options)
 
     def remote_jobs(self, executor: str) -> list[dict]:
         """What the executor of that name has on another machine, whichever session or project

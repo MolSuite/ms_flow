@@ -186,9 +186,10 @@ class Flow:
         self._writing: dict[int, frozenset] = {}  # the tables each job that has not ended writes
         self._lock = threading.Lock()
 
-    def submit(self, job, params=None, *, executor: str = "process", batch: int | None = None, after=(),
-               on_terminal=None, **engine) -> int:
-        """Start `job` and return its id. `batch` overrides the task's; `after` adds jobs to wait for.
+    def submit(self, job, params=None, *, executor: str = "process", batch: int | None = None,
+               cpu: float | None = None, after=(), on_terminal=None, **engine) -> int:
+        """Start `job` and return its id. `batch` and `cpu` override the task's; `after` adds jobs
+        to wait for.
 
         What else `Engine.submit` takes (`key`, `journal`, `priority`, `total`...) passes through.
         The sink is written on the engine's delivery thread, one transaction for each group of
@@ -201,12 +202,12 @@ class Flow:
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)
-        needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"]}
+        needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"], "cpu": cpu or fn.__task__["cpu"]}
         if spec["params_model"] is not None:
             params = spec["params_model"].model_validate(params or {})
         if engine.get("journal") is not None:
             engine["key"] = engine.get("key") or uuid.uuid4().hex
-            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, **{
+            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, "cpu": cpu, **{
                 name: value for name, value in engine.items() if name not in ("journal", "key")}})
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
