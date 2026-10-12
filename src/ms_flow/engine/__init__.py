@@ -7,5 +7,5 @@ from .journal import Busy
 from .tokens import memory_budget_mb
 
 __all__ = ["Busy", "Dir", "Engine", "File", "Flow", "JobSnapshot", "content_key", "ProcessExecutor", "RayExecutor",
-           "TaskSnapshot", "ThreadExecutor", "job",
+           "TaskSnapshot", "ThreadExecutor", "job", "launched",
            "memory_budget_mb", "report", "task", "writer"]
