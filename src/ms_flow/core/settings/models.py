@@ -51,15 +51,20 @@ class HostConfig(BaseModel):
     """A machine that runs jobs, kept by name. The one named `local` is this machine."""
 
     address: str = Field(default="", description="How `ssh` names it. Empty is this machine.")
-    env: str = Field(default="", description="The environment there that holds the app. Empty: the app prepares one.")
+    env: str = Field(default="", title="Environment", description="The environment there that holds the app. Empty: the app prepares one.")
     workdir: str = Field(
-        default=".molsuite/jobs",
+        default=".molsuite/jobs", title="Work directory",
         description="Where what runs there keeps its files; a relative one is under the home of the account.")
-    cpus: int = Field(default=0, description=_SHARE)
-    gpus: int = Field(default=0, description=_SHARE)
-    memory_gb: int = Field(default=0, description=_SHARE)
+    cpus: int = Field(default=0, title="CPUs", description=_SHARE)
+    gpus: int = Field(default=0, title="GPUs", description=_SHARE)
+    memory_gb: int = Field(default=0, title="Memory (GB)", description=_SHARE)
     tools: Dict[str, str] = Field(
         default_factory=dict, description="Where a program is there, by its name, when it is not the one the app installs.")
+
+
+def _of(kind: str, default: Any, description: str, **limits) -> Any:
+    """A field of `ExecutorConfig` that only one kind of executor reads: a form shows it for that one."""
+    return Field(default=default, description=f"`{kind}`: {description}", json_schema_extra={"kind": kind}, **limits)
 
 
 class ExecutorConfig(BaseModel):
@@ -72,17 +77,16 @@ class ExecutorConfig(BaseModel):
 
     kind: Literal["loky", "ray", "queue"]
     hosts: List[str] = Field(default_factory=lambda: ["local"])
-    on_login_node: bool = Field(default=False, description="`loky`: let the pool run on the login node of a cluster.")
-    scheduler: Literal["slurm", "none"] = Field(default="slurm", description="`queue`: who keeps the queue.")
-    setup: str = Field(default="", description="`queue`: the shell lines that prepare the environment before the runner starts.")
-    runner: str = Field(default="", description="`queue`: arguments for the runner, like `--ray auto` or `--cpus 16`.")
-    template: str = Field(default="", description="`queue`: a file with the script the queue runs. Empty is the one built in.")
-    elements_per_job: int = Field(
-        default=0, ge=0, description="`queue`: how many elements go in each job of the queue. 0 is all of them.")
-    max_jobs: int = Field(default=0, ge=0, description="`queue`: how many jobs it has in the queue at once. 0 is any number.")
-    poll_seconds: float = Field(default=30, gt=0, description="`queue`: how often the queue is asked.")
-    shared_disk: Optional[bool] = Field(
-        default=None, description="`queue`: whether the other side sees the disk of this machine. Unset: only on `local`.")
+    on_login_node: bool = _of("loky", False, "let the pool run on the login node of a cluster.")
+    scheduler: Literal["slurm", "none"] = _of("queue", "slurm", "who keeps the queue.")
+    setup: str = _of("queue", "", "the shell lines that prepare the environment before the runner starts.")
+    runner: str = _of("queue", "", "arguments for the runner, like `--ray auto` or `--cpus 16`.")
+    template: str = _of("queue", "", "a file with the script the queue runs. Empty is the one built in.")
+    elements_per_job: int = _of("queue", 0, "how many elements go in each job of the queue. 0 is all of them.", ge=0)
+    max_jobs: int = _of("queue", 0, "how many jobs it has in the queue at once. 0 is any number.", ge=0)
+    poll_seconds: float = _of("queue", 30, "how often the queue is asked.", gt=0)
+    shared_disk: Optional[bool] = _of(
+        "queue", None, "whether the other side sees the disk of this machine. Unset: only on `local`.")
 
 
 class DatabaseConfig(BaseModel):
