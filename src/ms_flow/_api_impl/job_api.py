@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 from pathlib import Path
 
-log = logging.getLogger(__name__)
-
-_LOGIN_NODE = ("this is the login node of a cluster, where the pool of processes does not run: set "
-               "`resources.process.kind` to `queue` or `ray`, or `resources.process.on_login_node` to force it")
+_LOGIN_NODE = ("this is the login node of a cluster, where the pool of processes does not run: send the job to "
+               "a queue or a Ray, or set `executors.local.on_login_node` to force it")
 
 
 def _login_node() -> bool:
@@ -16,11 +13,11 @@ def _login_node() -> bool:
     return shutil.which("sbatch") is not None and "SLURM_JOB_ID" not in os.environ
 
 
-def _jobs_in_queue(queue) -> str:
-    """Why the environment on the host of `queue` is not to be changed now, or nothing."""
+def _jobs_in_queue(address: str, workdir: str, scheduler: str) -> str:
+    """Why the environment on the host of a queue is not to be changed now, or nothing."""
     from ms_flow.remote import RemoteExecutor
 
-    there = RemoteExecutor(queue.host, workdir=queue.workdir, scheduler=queue.scheduler)
+    there = RemoteExecutor(address, workdir=workdir, scheduler=scheduler)
     try:
         alive = sum(row["in_queue"] for row in there.jobs_there())
     finally:
@@ -28,111 +25,96 @@ def _jobs_in_queue(queue) -> str:
     return f"{alive} of its jobs are in the queue there" if alive else ""
 
 
-def _process_executor(resources, host_env=None):
-    """The executor `resources.process` names, or None for the pool of a login node.
+def _here(local) -> tuple[int, int, int | None]:
+    """The CPUs, the GPUs and the memory in MB (None: the engine's own budget) that
+    `hosts.local` gives to jobs."""
+    from ms_flow.core.settings.models import gpus_here, share
+    from ms_flow.engine.tokens import physical_memory_mb, usable_cpus
+
+    return (share(local.cpus, usable_cpus(), 1), share(local.gpus, gpus_here()),
+            share(local.memory_gb * 1024, physical_memory_mb(), 1024) if local.memory_gb else None)
+
+
+def build_executor(name: str, settings, host_env=None):
+    """The executor `settings.executors[name]` describes, or None for the pool on a login node.
 
     A host with no environment named gets it from `host_env` (see `Workspace.host_env`).
     """
-    role = resources.process
-    if role.kind == "ray":
-        if role.ray.hosts and not role.ray.address:
-            from ms_flow.ray_hosts import RayOverHosts
-
-            if not role.ray.env and host_env is None:
-                raise ValueError("`resources.process.ray.env` is empty and nothing prepares the hosts: see `Workspace.host_env`")
-            # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
-            return RayOverHosts(role.ray.hosts, role.ray.env or [host_env(host, None) for host in role.ray.hosts])
+    config = settings.executors[name]
+    hosts = [settings.hosts[host] for host in config.hosts]
+    if config.kind == "ray":
         from ms_flow.engine import RayExecutor
 
-        return RayExecutor(role.ray.address or None, shared=role.ray.shared_disk)
-    if role.kind == "queue":
+        # Without `local` among its hosts this machine holds the head and runs none of its tasks.
+        cpus, gpus, _ = _here(settings.hosts["local"]) if "local" in config.hosts else (0, 0, None)
+        # ponytail: memory is left to Ray, which takes its share of what the machine has.
+        others = [host for host in hosts if host.address]
+        if not others:
+            return RayExecutor(None, num_cpus=cpus, num_gpus=gpus)
+        from ms_flow.ray_hosts import RayOverHosts
+
+        if host_env is None and not all(host.env for host in others):
+            raise ValueError(f"a host of `executors.{name}` has no `env` and nothing prepares it: see `Workspace.host_env`")
+        # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
+        # ponytail: `cpus`, `gpus` and `memory_gb` of the other hosts are not told to their Ray
+        # yet: each gives all it has. They go in its `ray start` when a host is there to try it on.
+        return RayOverHosts([host.address for host in others],
+                            [host.env or host_env(host.address, None) for host in others],
+                            num_cpus=cpus, num_gpus=gpus)
+    if config.kind == "queue":
         from ms_flow.remote import JOB_SH, RemoteExecutor
 
-        queue, env = role.queue, role.queue.env
-        if queue.host and not env and queue.python == "python" and host_env is not None:
-            env = host_env(queue.host, lambda: _jobs_in_queue(queue))
-        return RemoteExecutor(queue.host or None, workdir=queue.workdir, scheduler=queue.scheduler,
-                              template=Path(queue.template).read_text() if queue.template else JOB_SH,
-                              python=queue.python, setup=queue.setup, runner=queue.runner,
-                              elements_per_job=queue.elements_per_job or None, max_jobs=queue.max_jobs or None,
-                              poll_s=queue.poll_seconds, shared=queue.shared_disk, env=env)
-    if _login_node() and not role.on_login_node:
+        host, env = hosts[0], hosts[0].env
+        if host.address and not env and host_env is not None:
+            env = host_env(host.address, lambda: _jobs_in_queue(host.address, host.workdir, config.scheduler))
+        return RemoteExecutor(host.address or None, workdir=host.workdir, scheduler=config.scheduler,
+                              template=Path(config.template).read_text() if config.template else JOB_SH,
+                              setup=config.setup, runner=config.runner,
+                              elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
+                              poll_s=config.poll_seconds, shared=config.shared_disk, env=env)
+    if _login_node() and not config.on_login_node:
         return None
     from ms_flow.engine import ProcessExecutor
 
-    return ProcessExecutor(resources.local.max_processes)
+    return ProcessExecutor(_here(hosts[0])[0])
 
 
 class WorkspaceJobApiMixin:
     #: Set by the app: `host_env(address, busy, on_line) -> path` makes sure the host has the
-    #: environment that runs its jobs and says where. It is called when `process` is given to a
-    #: host with no environment named, so before any job runs there. `busy`, when given, returns
-    #: why that environment is not to be changed now (see `ms_env.ensure`); `on_line`, when given,
-    #: is told each line of what is done there.
+    #: environment that runs its jobs and says where. It is for a host with no `env` named,
+    #: before any job runs there. `busy`, when given, returns why that environment is not to
+    #: be changed now (see `ms_env.ensure`); `on_line`, when given, is told each line of what
+    #: is done there.
     host_env = None
-    _host_line = None  # who hears those lines while `run_process_on` runs
 
     @property
     def engine(self):
-        """The engine behind `submit`, built at first use: the one that shares out this machine.
+        """The engine behind `submit`, built at first use: the one that shares out this machine,
+        with its threads as `thread` and its pool of processes as `local`.
 
         Raises `ms_flow.engine.Busy` when another process of this user already runs one.
         """
         if self._engine is None:
             from ms_flow.engine import Engine, ThreadExecutor
 
-            local = self.settings_manager.settings.resources.local
-            engine = Engine(cpus=local.cpus, gpus=local.gpus, state_dir=self._master_db_path.parent,
-                            mem_mb=local.memory_gb * 1024 if local.memory_gb else None)
-            engine.register("thread", ThreadExecutor(local.max_threads))
+            cpus, gpus, mem_mb = _here(self.settings_manager.settings.hosts["local"])
+            engine = Engine(cpus=cpus, gpus=gpus, mem_mb=mem_mb, state_dir=self._master_db_path.parent)
+            engine.register("thread", ThreadExecutor(cpus * 2))
             self._engine = engine
             self.reload_executors()
         return self._engine
 
     def reload_executors(self) -> None:
-        """Put in `process` whoever `resources.process` names now. Call it after changing that setting.
+        """Make the pool of this machine again as `hosts.local` and `executors.local` say now.
 
-        Raises `ValueError` while a job submitted to `process` has not ended, and leaves it as it was.
+        Raises `ValueError` while a job submitted to `local` has not ended, and leaves it as it was.
         """
         if self._engine is None:
             return  # built from the settings at first use
-        self._engine.unregister("process")
-        host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, self._host_line))
-        executor = _process_executor(self.settings_manager.settings.resources, host_env)
+        self._engine.unregister("local")
+        executor = build_executor("local", self.settings_manager.settings)
         if executor is not None:
-            self._engine.register("process", executor)
-
-    def run_process_on(self, kind: str = "process", on_line=None, **fields) -> None:
-        """Say who runs what is submitted to `process`, keep it for this user and put it in place.
-
-        `fields` are those of that kind in `resources.process`, the rest of them as they come:
-        `run_process_on("ray", hosts=["pc2"])`, `run_process_on("queue", host="hpc")`,
-        `run_process_on()` for the pool of this machine. A value that is not valid, a host that
-        is not reached or not prepared, and a job on `process` that has not ended raise, and
-        leave the setting and the executor as they were. `on_line` hears what is done on a
-        host that is being prepared. It waits for those hosts: not from a thread that cannot.
-        """
-        manager, path = self.settings_manager, "resources.process"
-        before = manager.get_global_value(path).model_dump(mode="json")
-        # ponytail: going back writes the whole section as it was, defaults included.
-        manager.set_global_value(path, {**before, **fields, "kind": kind} if kind == "process"
-                                 else {**before, "kind": kind, kind: fields})
-        self._host_line = on_line
-        try:
-            if self._engine is None:
-                self.engine
-            else:
-                self.reload_executors()
-        except BaseException:
-            manager.set_global_value(path, before)
-            if self._engine is not None and "process" not in self._engine._executors:
-                try:
-                    self.reload_executors()
-                except Exception:  # the one that was there does not come back either: said, not raised over the cause
-                    log.exception("`process` was left with no executor")
-            raise
-        finally:
-            self._host_line = None
+            self._engine.register("local", executor)
 
     def _project_flow(self):
         project = self._require_active_project_runtime()
@@ -143,23 +125,24 @@ class WorkspaceJobApiMixin:
             self._flow = Flow(self.engine, project.project_db)
         return self._flow
 
-    def submit(self, job, params=None, **options) -> int:
+    def submit(self, job, params=None, *, executor: str = "local", **options) -> int:
         """Run a `ms_flow.engine.job` in the active project and return its id, for `engine.status`
         and `engine.wait`.
 
         Its results go to the project's store, and the job is recorded in the project's
         `executor.db`: closing the project interrupts it, and submitting it again with the same
-        `key=` continues it. `options` are those of `ms_flow.engine.Flow.submit`.
+        `key=` continues it. `executor` is `local` (the pool of this machine), `thread`, or the
+        name of another one that is registered; `options` are those of `ms_flow.engine.Flow.submit`.
         """
         flow = self._project_flow()
         try:
-            self._engine.executor(options.get("executor", "process"))
+            self._engine.executor(executor)
         except KeyError:
-            if options.get("executor", "process") != "process":
+            if executor != "local":
                 raise
             raise RuntimeError(_LOGIN_NODE if _login_node() else
-                               "nothing is registered as `process`: see `reload_executors`") from None
-        return flow.submit(job, params, journal="project", **options)
+                               "nothing is registered as `local`: see `reload_executors`") from None
+        return flow.submit(job, params, journal="project", executor=executor, **options)
 
     def resume(self, key: str, **options) -> int:
         """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
@@ -171,18 +154,17 @@ class WorkspaceJobApiMixin:
         origin = self._project_flow().origin(key, journal="project")
         return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
 
-    def remote_jobs(self) -> list[dict]:
-        """What the executor that plays `process` has on another machine, whichever session or
-        project sent it and with or without a project open: see `RemoteExecutor.jobs_there`.
-        Nothing when it runs its jobs here. It asks that machine, so not from a thread that
-        cannot wait."""
-        slot = self.engine._executors.get("process")
+    def remote_jobs(self, executor: str) -> list[dict]:
+        """What the executor of that name has on another machine, whichever session or project
+        sent it and with or without a project open: see `RemoteExecutor.jobs_there`. Nothing
+        when it runs its jobs here. It asks that machine, so not from a thread that cannot wait."""
+        slot = self.engine._executors.get(executor)
         return slot.impl.jobs_there() if hasattr(getattr(slot, "impl", None), "jobs_there") else []
 
-    def remove_remote_job(self, dir: str) -> None:
+    def remove_remote_job(self, executor: str, dir: str) -> None:
         """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
         this session waits for is refused: cancel the job."""
-        self.engine.executor("process").remove_there(dir)
+        self.engine.executor(executor).remove_there(dir)
 
     def jobs(self, limit: int | None = None) -> list:
         """The jobs of the active project, oldest first; with `limit`, the last ones.

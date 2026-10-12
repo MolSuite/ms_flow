@@ -15,11 +15,3 @@ console_level = "INFO"
 
 [database]
 connection_timeout = 30
-
-[resources.local]
-cpus = -1
-gpus = -1
-max_threads = -1
-max_processes = -1
-
-[workers]
