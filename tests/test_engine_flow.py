@@ -8,7 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from ms_flow.core.database.project import ProjectStore
-from ms_flow.engine import Engine, Flow, ProcessExecutor, ThreadExecutor, job, task
+from ms_flow.engine import Engine, Flow, ProcessExecutor, ThreadExecutor, job, task, writer
 from ms_flow.query import QuerySpec, Rows
 from ms_flow.progress import watch_job
 from ms_flow.sinks import file_sink, graph_sink, table_sink
@@ -128,6 +128,21 @@ def kept_by_its_writer(params, project):
     return range(params["n"])
 
 
+class Shouted:
+    """A job's own writer that changes what arrives and leaves the writing to a sink."""
+
+    def __init__(self, params, project):
+        self.sink = writer(file_sink("out/shouted.txt", fmt="text", append=True), project)
+
+    def write(self, results):
+        self.sink.write([text.replace("\n", "!\n") for text in results])
+
+
+@job(task=line, output=Shouted)
+def changed_before_its_sink(params, project):
+    return range(params["n"])
+
+
 @job(task=line, reads=("sizes",))
 def after_the_writer(params, project):
     SEEN["stored_when_read"] = "lines" in SEEN
@@ -205,6 +220,9 @@ def test_a_job_writes_files_or_through_its_own_writer_which_has_the_last_word(pr
         assert sorted((tmp_path / "out/lines.txt").read_text().split(), key=int) == [str(n) for n in range(50)]
         assert submit(whole_file).status == "completed"  # one file, written when the job completes
         assert sorted(row["half"] for row in json.loads((tmp_path / "out/halves.json").read_text())) == [0, 1, 2, 3]
+
+        assert submit(changed_before_its_sink, {"n": 3}).status == "completed"
+        assert sorted((tmp_path / "out/shouted.txt").read_text().split()) == ["0!", "1!", "2!"]
 
         SEEN.pop("lines", None)
         kept = flow.submit(kept_by_its_writer, {"n": 5}, executor="thread")

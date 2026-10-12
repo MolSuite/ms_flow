@@ -122,10 +122,14 @@ class _File:
             self.path.write_bytes(self._bytes(self.kept))
 
 
+def writer(output, project):
+    """A `table_sink`, a `graph_sink` or a `file_sink` as the writer the engine makes of it: for
+    a job's own writer that changes what its tasks returned and leaves the writing to a sink."""
+    return _Table(output, project) if hasattr(output, "table") else _File(output, project)
+
+
 def _writer(output, params, project):
-    if hasattr(output, "table"):
-        return _Table(output, project)
-    return _File(output, project) if hasattr(output, "fmt") else output(params, project)
+    return writer(output, project) if hasattr(output, "table") or hasattr(output, "fmt") else output(params, project)
 
 
 def _merged(output, results: list):
