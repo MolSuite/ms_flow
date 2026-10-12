@@ -142,3 +142,12 @@ def test_verify_does_not_read_the_file_into_memory(tmp_path):
         tracemalloc.stop()
     assert os.path.getsize(path) > 12_000_000
     assert peak < 4 * (1 << 20)
+
+
+def test_reading_a_shard_brings_no_database():
+    """A worker opens shards; the package they live in must not load SQL with them."""
+    import subprocess
+    import sys
+
+    code = "import sys; from ms_flow.core.data.shard import Shard; assert 'sqlalchemy' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)
