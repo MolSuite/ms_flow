@@ -1,4 +1,5 @@
 """The machines and the executors kept by name in the settings, and what the workspace makes of them."""
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -173,7 +174,7 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     """Whose address, whose environment and how much of this machine: said by the hosts it names."""
     from ms_flow import engine, ray_hosts, remote
     from ms_flow._api_impl import job_api
-    from ms_flow.core.settings.models import Settings
+    from ms_flow.core.settings.models import Settings, share
 
     class Far:
         def __init__(self, host=None, **said):
@@ -197,7 +198,7 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     monkeypatch.setattr(job_api, "_here", lambda local: (local.cpus, 1, None))
     settings = Settings(
         hosts={"local": {"cpus": 6}, "hpc": {"address": "login", "workdir": "scratch/jobs"},
-               "mine": {"address": "login2", "env": "/mine"}, "pc2": {"address": "pc2"}, "pc3": {"address": "pc3"}},
+               "mine": {"address": "login2", "env": "/mine"}, "pc2": {"address": "pc2", "cpus": -2, "memory_gb": 8}, "pc3": {"address": "pc3"}},
         executors={"slurm": {"kind": "queue", "hosts": ["hpc"]}, "slurm2": {"kind": "queue", "hosts": ["mine"]},
                    "alone": {"kind": "ray"}, "lab": {"kind": "ray", "hosts": ["local", "pc2", "pc3"]},
                    "others": {"kind": "ray", "hosts": ["pc2"]}})
@@ -209,8 +210,16 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     assert built("slurm", None).said["env"] == ""  # no app behind: the `python` of that account
     assert built("slurm2").said["env"] == "/mine"
     assert built("alone") == (None, {"num_cpus": 6, "num_gpus": 1})  # a Ray of this machine alone
-    assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"], {"num_cpus": 6, "num_gpus": 1})
-    assert built("others") == (["pc2"], ["/envs/pc2"], {"num_cpus": 0, "num_gpus": 0})  # the head here runs nothing
+    assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"],
+                            {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)]})  # each host gives its share
+    # the head here runs nothing
+    assert built("others") == (["pc2"], ["/envs/pc2"], {"num_cpus": 0, "num_gpus": 0, "limits": [(-2, 0, 8)]})
+    # The share of a host is worked out by its shell, as `share` does here.
+    has = int(subprocess.check_output("nproc"))
+    for cpus in (-2, 3, 4096, -4096):
+        said = subprocess.check_output(["sh", "-c", "echo" + ray_hosts._flag("num-cpus", cpus, "nproc", 1)], text=True)
+        assert said.strip() == f"--num-cpus={share(cpus, has, 1)}"
+    assert ray_hosts._flag("num-cpus", 0, "nproc", 1) == ""  # all it has: Ray counts it
     with pytest.raises(ValueError, match="nothing prepares it"):
         built("lab", None)
     assert asked == [("login", "1 of its jobs are in the queue there")] * 3 + [("pc2", None), ("pc3", None), ("pc2", None)]

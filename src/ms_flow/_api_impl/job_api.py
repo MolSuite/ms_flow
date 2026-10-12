@@ -80,10 +80,9 @@ def build_executor(name: str, settings, host_env=None):
         if host_env is None and not all(host.env for host in others):
             raise ValueError(f"a host of `executors.{name}` has no `env` and nothing prepares it: see `Workspace.host_env`")
         # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
-        # ponytail: `cpus`, `gpus` and `memory_gb` of the other hosts are not told to their Ray
-        # yet: each gives all it has. They go in its `ray start` when a host is there to try it on.
         return RayOverHosts([host.address for host in others],
                             [host.env or host_env(host.address, None) for host in others],
+                            limits=[(host.cpus, host.gpus, host.memory_gb) for host in others],
                             num_cpus=cpus, num_gpus=gpus)
     if config.kind == "queue":
         from ms_flow.remote import JOB_SH, RemoteExecutor

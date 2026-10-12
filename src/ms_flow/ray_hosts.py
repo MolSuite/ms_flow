@@ -17,16 +17,31 @@ from ms_flow.engine.executors import RayExecutor
 log = logging.getLogger(__name__)
 
 
+def _flag(name: str, asked: int, has: str, least: int = 0, times: int = 1) -> str:
+    """The option of `ray start` that gives it `ms_flow.core.settings.models.share(asked, has, least)`,
+    worked out by the shell of the machine, where `has` is the command that counts what it has."""
+    if not asked:
+        return ""  # Ray takes all it finds
+    want = asked if asked > 0 else f"has + {asked}"
+    return (f" --{name}=$(has=$({has}); n=$(({want})); n=$((n > has ? has : n)); "
+            f"echo $(((n < {least} ? {least} : n) * {times})))")
+
+
 class RayOverHosts(RayExecutor):
     """`hosts` as `ssh` names them, `env` the path of the environment on each of them: one for
-    all, or one for each.
+    all, or one for each. `limits` gives for each the (CPUs, GPUs, GB of memory) that are for
+    its tasks, as `HostConfig` counts them: without it a machine gives all it has.
 
     No machine sees the disk of another: the files of an element travel through Ray.
     """
 
-    def __init__(self, hosts, env, join_seconds: float = 90, **init):
+    def __init__(self, hosts, env, join_seconds: float = 90, limits=None, **init):
         envs = [env] * len(hosts) if isinstance(env, str) else env
         self._hosts = [(Host(address), shlex.quote(f"{there}/bin/ray")) for address, there in zip(hosts, envs, strict=True)]
+        gives = ["".join((_flag("num-cpus", cpus, "nproc", 1),
+                          _flag("num-gpus", gpus, "nvidia-smi --list-gpus 2>/dev/null | wc -l"),
+                          _flag("memory", memory_gb, "awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo", 1, 2 ** 30)))
+                 for cpus, gpus, memory_gb in limits or [(0, 0, 0)] * len(hosts)]
         for host, _ray_there in self._hosts:
             # ponytail: Slurm is the one told apart, as on this machine (`job_api._login_node`).
             if host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ] && echo login || :', timeout=60).strip():
@@ -38,10 +53,10 @@ class RayOverHosts(RayExecutor):
         super().__init__(None, shared=False, _node_ip_address=here, **init)
         address = self._ray.get_runtime_context().gcs_address
         try:
-            for host, ray_there in self._hosts:
+            for (host, ray_there), given in zip(self._hosts, gives, strict=True):
                 # ponytail: `ray stop` ends every Ray of the account on that machine, one left by a
                 # session that died included. A host that runs a Ray of its own is not one to list here.
-                host.run(f"{ray_there} stop >/dev/null 2>&1; {ray_there} start --address={address}",
+                host.run(f"{ray_there} stop >/dev/null 2>&1; {ray_there} start --address={address}{given}",
                          timeout=join_seconds)
             limit = time.monotonic() + join_seconds
             while sum(node["Alive"] for node in self._ray.nodes()) <= len(self._hosts):
