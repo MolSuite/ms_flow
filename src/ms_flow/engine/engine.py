@@ -147,13 +147,14 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives", "threads")
+                 "outlives", "threads", "watches_all")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
         self.packs, self.kills, self.killing = hasattr(impl, "submit_many"), hasattr(impl, "kill"), False
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
         self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
+        self.watches_all = getattr(impl, "watches_all", False)
 
 
 class Engine:
@@ -280,8 +281,9 @@ class Engine:
         passed back as `state` when the job continues; `state` is None the first time.
         `progress` says whether the tasks of the job are watched, for `JobSnapshot.progress` to
         count how far the running chunks are and not only the ones that ended (see
-        `executors.report`). By default a task of several chunks is, and a task of one when the
-        job has at most two for each worker.
+        `executors.report`). By default every task is on an executor that watches for nothing (the
+        process pool); on another, a task of several chunks, and a task of one when the job has at
+        most two for each worker.
         `thread` says that `fn` spends its time waiting for a program it starts, not in Python:
         an executor that keeps a worker for each task and can spare it (the process pool) runs it
         on a thread of this process, so no worker holds memory for it. Such a chunk is stopped
@@ -797,11 +799,13 @@ class Engine:
         chunk.doomed, chunk.spared = None, False
         chunk.started = time.perf_counter()  # before it is in `flying`, which `tasks` reads from any thread
         job.flying.add(chunk)
-        # Watched: a task of several chunks, which counts them by itself, and a task of one when
-        # its job has few (or says so), where how far each one is makes the difference.
+        # Watched: every task where watching one costs nothing. Elsewhere a task of several chunks,
+        # which counts them by itself, and a task of one when its job has few (or says so), where
+        # how far each one is makes the difference.
         fine = job.fine
         if fine is None:
-            fine = chunk.pack is not None or (job.total is not None and job.total <= 2 * slot.impl.capacity)
+            fine = slot.watches_all or chunk.pack is not None or (
+                job.total is not None and job.total <= 2 * slot.impl.capacity)
         watch = {"owner": job.id} if fine and slot.tells else {}
         if slot.costs:
             # ponytail: what the job says, not what one chunk says of itself (`cpu` in its payload):

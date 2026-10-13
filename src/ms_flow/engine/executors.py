@@ -25,6 +25,8 @@ The engine knows an executor only through this contract:
 - `progress(owner) -> dict`, optional: how many chunks' worth of work each task in flight that
   was submitted with `owner=` that value has done, by its `tag`. With it `submit` and
   `submit_many` take `owner`, and the engine passes it for the tasks worth watching.
+- `watches_all`, optional: an executor for which watching a task costs nothing sets it, and every
+  task of a job that does not say otherwise is worth watching.
 - `batch`, optional: how many chunks the executor wants in each of its tasks, for the jobs that
   do not say.
 - `threads`, optional: an executor that keeps a worker for each task and can spare it sets it.
@@ -112,7 +114,7 @@ class ProcessExecutor:
     and one is started again when there is work for it; `None` keeps them all.
     """
 
-    uses_tokens = threads = True
+    uses_tokens = threads = watches_all = True  # watching: a float in a file the worker has mapped
 
     def __init__(self, max_workers: int, idle: float | None = 60.0):
         from loky.process_executor import BrokenProcessPool, ProcessPoolExecutor
@@ -385,8 +387,8 @@ def report(fraction: float) -> None:
     """From a task, on the thread it was called on: how far the element it is working on is,
     from 0 to 1.
 
-    Does nothing unless the task is watched: a job of few elements, or one submitted with
-    `progress=True`.
+    Does nothing unless the task is watched: any on the process pool; elsewhere one of a job of few
+    elements, or of a job submitted with `progress=True`.
     """
     at = getattr(_task, "at", None)
     if at is not None:

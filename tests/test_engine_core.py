@@ -304,10 +304,10 @@ def test_worker_death_costs_one_chunk():
 class _CountingPool(ProcessExecutor):
     tasks = 0
 
-    def submit(self, *args):
+    def submit(self, *args, **options):
         self.tasks += 1
         self.sizes.append(len(args[1]) if len(args) > 3 else 1)  # a fourth argument: a shared task
-        return super().submit(*args)
+        return super().submit(*args, **options)
 
 
 @pytest.mark.slow
@@ -497,8 +497,12 @@ def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
         (tmp_path / "packed").touch()
         assert engine.wait(packed, 30).progress == 1.0
 
-        # not watched (many chunks, or an executor that cannot tell): the chunks that ended, no more
-        for executor, n in (("process", 6), ("thread", 2)):
+        # not watched (many chunks where watching has a price, or an executor that cannot tell): the
+        # chunks that ended, no more
+        priced = ProcessExecutor(2)
+        priced.watches_all = False  # what an executor of far tasks is
+        engine.register("priced", priced)
+        for executor, n in (("priced", 6), ("thread", 2)):
             job_id = engine.submit(executor, _half_then_held, held(n, lambda i: True, executor), total=n)
             while not (tmp_path / f"{executor}.said").exists():
                 time.sleep(0.01)
@@ -507,11 +511,13 @@ def test_progress_counts_how_far_the_running_chunks_are(tmp_path):
             (tmp_path / executor).touch()
             assert engine.wait(job_id, 30).progress == 1.0
 
-        # unless the job asks for it
-        asked = engine.submit("process", _half_then_held, held(6, lambda i: True, "asked"), total=6, progress=True)
-        reaches(asked, 0.5 * 2 / 6)
-        (tmp_path / "asked").touch()
-        assert engine.wait(asked, 30).progress == 1.0
+        # unless the job asks for it, or watching costs nothing: the process pool, however many chunks
+        for executor, options in (("priced", {"progress": True}), ("process", {})):
+            asked = engine.submit(executor, _half_then_held, held(6, lambda i: True, executor + "-asked"), total=6,
+                                  **options)
+            reaches(asked, 0.5 * 2 / 6)
+            (tmp_path / (executor + "-asked")).touch()
+            assert engine.wait(asked, 30).progress == 1.0
 
         # no total until the source ends: nothing to be a part of
         ended = threading.Event()
