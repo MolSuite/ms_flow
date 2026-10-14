@@ -35,17 +35,14 @@ ms.shutdown()
 pip install ms_flow            # engine + projects: SQLite and loky
 ```
 
-## Where to look
+## Documentation
 
-- [5-minute quickstart](docs/guides/quickstart_5min.md) — first working job.
-- [Runnable examples](examples/README.md) — scripts y notebook.
-- [Public API](docs/guides/public_api.md) — API.
-- [Docs index](docs/README.md) — guides, contracts, operation
-- [Benchmarks](benchmarks/README.md) — performance.
+<https://molsuite.github.io/ms_flow/>: a guide to tasks, jobs, sinks, following and
+continuing jobs and where they run, and the API reference.
 
 ## Status
 
-Beta. The public API (`ms_flow.api`) is the stable surface; `ms_flow.core.*` may change without notice.
+Beta. The public API (`ms_flow`, `ms_flow.api`, `ms_flow.engine`) is the stable surface; `ms_flow.core.*` may change without notice.
 
 ## License
 
