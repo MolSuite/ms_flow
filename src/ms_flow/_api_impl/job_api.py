@@ -1,579 +1,353 @@
 from __future__ import annotations
 
-import functools
-import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
-from uuid import UUID
+import os
+import shutil
+from pathlib import Path
 
-from ms_flow.core.data import TableOutputSpec
-from ms_flow.core.executor.dispatch_model import DispatchPolicy
-from ms_flow.core.executor.submission_service import executor_is_supported
-from ms_flow.core.executor.job_snapshot import JobSnapshot
-from ms_flow.job_templates import batch_job, streaming_job
-
-if TYPE_CHECKING:
-    from ms_flow.tasking import JobDefinition, TaskDefinition
+_LOGIN_NODE = ("this is the login node of a cluster, where nothing is to compute: send the job to a queue "
+               "(`executors.local.on_login_node` forces the pool of this machine)")
 
 
-_OPERATIONAL_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
-    "strict": {
-        "max_inflight_tasks": 8,
-        "max_inflight_items": 128,
-        "output_flush_every": 100,
-    },
-    "balanced": {
-        "max_inflight_tasks": None,
-        "max_inflight_items": None,
-        "output_flush_every": None,
-    },
-    "throughput": {
-        "max_inflight_tasks": 64,
-        "max_inflight_items": 2048,
-        "output_flush_every": 1000,
-    },
-}
+def _login_node() -> bool:
+    # ponytail: Slurm is the one told apart; the commands of another scheduler when a cluster has one.
+    return shutil.which("sbatch") is not None and "SLURM_JOB_ID" not in os.environ
 
 
-def _normalize_operational_profile(value: Any) -> str:
-    profile = str(value or "balanced").strip().lower()
-    if profile not in _OPERATIONAL_PROFILE_PRESETS:
-        raise ValueError("operational_profile must be 'strict', 'balanced' or 'throughput'.")
-    return profile
+def _jobs_in_queue(address: str, workdir: str, scheduler: str) -> str:
+    """Why the environment on the host of a queue is not to be changed now, or nothing."""
+    from ms_flow.remote import RemoteExecutor
+
+    there = RemoteExecutor(address, workdir=workdir, scheduler=scheduler)
+    try:
+        alive = sum(row["in_queue"] for row in there.jobs_there())
+    finally:
+        there.shutdown()
+    return f"{alive} of its jobs are in the queue there" if alive else ""
 
 
-def _has_inline_workflow_arguments(
-    *,
-    name: str | None,
-    input: Any,
-    process: Callable[..., Any] | Any | None,
-    output: Any,
-    description: str,
-    task_name: str | None,
-    setup: Optional[Callable[..., Any]],
-    stage: Optional[Callable[..., Any]],
-    finalize: Optional[Callable[..., Any]],
-    result_handler: Optional[Callable[..., Any]],
-    flush_every: int,
-    executor: str,
-    supported_executors,
-    cpu_required: int | None,
-    stage_fail_policy: str,
-    max_stage_failures: int,
-    store_results: bool,
-    tags,
-) -> bool:
-    return any(
-        (
-            name is not None,
-            input is not None,
-            process is not None,
-            output is not None,
-            bool(description),
-            task_name is not None,
-            setup is not None,
-            stage is not None,
-            finalize is not None,
-            result_handler is not None,
-            flush_every != 500,
-            bool(str(executor or "").strip()),
-            bool(tuple(supported_executors or ())),
-            cpu_required is not None,
-            stage_fail_policy != "fail_fast",
-            int(max_stage_failures) != 0,
-            bool(store_results),
-            bool(tuple(tags or ())),
-        )
-    )
+def blocked(name: str, settings, active) -> str:
+    """Why the executor kept as `name` is not to be started while those in `active` run, or nothing.
+
+    A machine works for one executor at a time, and this process joins one Ray. The pool of
+    this machine is not in the way of a Ray that takes this machine: it is put aside for it
+    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it, and it
+    is the only one started on the login node of a cluster: a Ray has its head there even
+    when none of its tasks run on it.
+    """
+    asked = settings.executors[name]
+    if _login_node() and (asked.kind == "ray" or asked.kind == "loky" and not asked.on_login_node):
+        return _LOGIN_NODE
+    for other in active:
+        config = settings.executors.get(other)  # `thread` is nobody's
+        if other == name or config is None or "queue" in (asked.kind, config.kind):
+            continue
+        if asked.kind == config.kind == "ray":
+            return f"one Ray at a time, and `{other}` is active"
+        shared = [host for host in asked.hosts if host in config.hosts]
+        if shared and config.kind == "ray":
+            return f"`{shared[0]}` works for `{other}`, which is active"
+    return ""
 
 
-class MolSuiteJobApiMixin:
-    def run(
-        self,
-        spec=None,
-        *,
-        name: str | None = None,
-        input=None,
-        process: Callable[..., Any] | Any | None = None,
-        output=None,
-        description: str = "",
-        task_name: str | None = None,
-        setup: Optional[Callable[..., Any]] = None,
-        stage: Optional[Callable[..., Any]] = None,
-        finalize: Optional[Callable[..., Any]] = None,
-        result_handler: Optional[Callable[..., Any]] = None,
-        flush_every: int = 500,
-        executor: str = "",
-        supported_executors=(),
-        cpu_required: int | None = None,
-        stage_fail_policy: str = "fail_fast",
-        max_stage_failures: int = 0,
-        store_results: bool = False,
-        tags=(),
-        params: dict[str, Any] | None = None,
-        config: dict[str, Any] | None = None,
-        queue_policy: str = "fifo",
-        priority: int = 0,
-    ) -> str:
-        from ms_flow.specs.workflow import WorkflowLauncher, WorkflowSpec, workflow
+def _here(local) -> tuple[int, int, int | None]:
+    """The CPUs, the GPUs and the memory in MB (None: the engine's own budget) that
+    `hosts.local` gives to jobs."""
+    from ms_flow.core.settings.models import gpus_here, share
+    from ms_flow.engine.tokens import physical_memory_mb, usable_cpus
 
-        if spec is None:
-            if input is None or process is None:
-                raise ValueError(
-                    "run(...) requires spec=... or the triple input=..., process=..., output=...."
-                )
-            resolved_name = str(name or "").strip()
-            if not resolved_name:
-                raise ValueError("run(name=...) cannot be empty when building the workflow inline.")
-            spec = workflow(
-                name=resolved_name,
-                input=input,
-                process=process,
-                output=output,
-                description=description,
-                task_name=task_name,
-                setup=setup,
-                stage=stage,
-                finalize=finalize,
-                result_handler=result_handler,
-                flush_every=flush_every,
-                executor=executor,
-                supported_executors=tuple(supported_executors or ()),
-                cpu_required=cpu_required,
-                stage_fail_policy=stage_fail_policy,
-                max_stage_failures=max_stage_failures,
-                store_results=store_results,
-                tags=tuple(tags or ()),
-            )
-        else:
-            if _has_inline_workflow_arguments(
-                name=name,
-                input=input,
-                process=process,
-                output=output,
-                description=description,
-                task_name=task_name,
-                setup=setup,
-                stage=stage,
-                finalize=finalize,
-                result_handler=result_handler,
-                flush_every=flush_every,
-                executor=executor,
-                supported_executors=supported_executors,
-                cpu_required=cpu_required,
-                stage_fail_policy=stage_fail_policy,
-                max_stage_failures=max_stage_failures,
-                store_results=store_results,
-                tags=tags,
-            ):
-                raise ValueError(
-                    "run(spec=...) does not accept inline workflow parameters. "
-                    "Use spec=... alone, or the simple path name=..., input=..., process=..., output=...."
-                )
-            if not isinstance(spec, WorkflowSpec):
-                raise TypeError(
-                    "run(spec=...) requires a WorkflowSpec. "
-                    "For a JobDefinition use job_def.submit(...), job_def.run(...) or submit_job(job_def, ...)."
-                )
+    return (share(local.cpus, usable_cpus(), 1), share(local.gpus, gpus_here()),
+            share(local.memory_gb * 1024, physical_memory_mb(), 1024) if local.memory_gb else None)
 
-        return WorkflowLauncher(self).submit(
-            spec,
-            params=params,
-            config=config,
-            queue_policy=queue_policy,
-            priority=priority,
-        )
 
-    def task(self, name: str, **kwargs):
-        """Decorator to define a task."""
+def build_executor(name: str, settings, host_env=None):
+    """The executor `settings.executors[name]` describes, or None for the pool on a login node.
 
-        def decorator(func):
-            from ms_flow.tasking import task
+    A host with no environment named gets it from `host_env` (see `Workspace.host_env`).
+    """
+    config = settings.executors[name]
+    hosts = [settings.hosts[host] for host in config.hosts]
+    if config.kind == "ray":
+        from ms_flow.engine import RayExecutor
 
-            t = task(name=name, handler=func, **kwargs)
-            return t
+        # Without `local` among its hosts this machine holds the head and runs none of its tasks.
+        cpus, gpus, _ = _here(settings.hosts["local"]) if "local" in config.hosts else (0, 0, None)
+        # ponytail: memory is left to Ray, which takes its share of what the machine has.
+        others = [host for host in hosts if host.address]
+        if not others:
+            return RayExecutor(None, num_cpus=cpus, num_gpus=gpus)
+        from ms_flow.ray_hosts import RayOverHosts
 
-        return decorator
+        if host_env is None and not all(host.env for host in others):
+            raise ValueError(f"a host of `executors.{name}` has no `env` and nothing prepares it: see `Workspace.host_env`")
+        # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
+        return RayOverHosts([host.address for host in others],
+                            [host.env or host_env(host.address, None) for host in others],
+                            limits=[(host.cpus, host.gpus, host.memory_gb) for host in others],
+                            num_cpus=cpus, num_gpus=gpus)
+    if config.kind == "queue":
+        from ms_flow.remote import JOB_SH, RemoteExecutor
 
-    def job(self, name: str, task: Any, **kwargs):
-        """Decorator to define a job."""
+        host, env = hosts[0], hosts[0].env
+        if host.address and not env and host_env is not None:
+            env = host_env(host.address, lambda: _jobs_in_queue(host.address, host.workdir, config.scheduler))
+        return RemoteExecutor(host.address or None, workdir=host.workdir, scheduler=config.scheduler,
+                              template=Path(config.template).read_text() if config.template else JOB_SH,
+                              setup=config.setup, runner=config.runner,
+                              elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
+                              poll_s=config.poll_seconds, shared=config.shared_disk, env=env)
+    if _login_node() and not config.on_login_node:
+        return None
+    from ms_flow.engine import ProcessExecutor
 
-        def decorator(func):
-            from ms_flow.tasking import job
+    return ProcessExecutor(_here(hosts[0])[0])
 
-            j = job(name=name, task=task, chunker=func, **kwargs)
-            return j
 
-        return decorator
+class WorkspaceJobApiMixin:
+    #: Set by the app: `host_env(address, busy, on_line) -> path` makes sure the host has the
+    #: environment that runs its jobs and says where. It is for a host with no `env` named,
+    #: before any job runs there. `busy`, when given, returns why that environment is not to
+    #: be changed now (see `ms_env.ensure`); `on_line`, when given, is told each line of what
+    #: is done there.
+    host_env = None
 
-    def _resolve_sink(self, sink: Any) -> Any:
-        """Resolve sink object. If string, convert to TableOutputSpec."""
-        if isinstance(sink, str):
-            return TableOutputSpec(table_name=sink)
-        return sink
+    @property
+    def engine(self):
+        """The engine behind `submit`, built at first use: the one that shares out this machine,
+        with its threads as `thread` and its pool of processes as `local`.
 
-    def submit_job(
-        self,
-        job: "JobDefinition",
-        *,
-        params: dict[str, Any] | Any | None = None,
-        chunks=None,
-        config: dict[str, Any] | None = None,
-        project_id: str | UUID | None = None,
-        depends_on: list[str] | None = None,
-        queue_policy: str = "fifo",
-        priority: int = 0,
-        executor_name: str | None = None,
-        cpu_required: int | None = None,
-        max_job_cpu: int | None = None,
-        max_inflight_tasks: int | None = None,
-        max_inflight_items: int | None = None,
-        total_chunks: int | None = None,
-        chunk_fail_fast_min_processed: int | None = None,
-        chunk_fail_fast_max_failed_ratio: float | None = None,
-        chunk_fail_fast_max_consecutive_failures: int | None = None,
-        store_results: bool | None = None,
-        output_spec: Any = None,
-        output_flush_every: int | None = None,
-        operational_profile: str | None = None,
-        result_handler=None,
-        result_handler_args: tuple[Any, ...] = (),
-        result_handler_kwargs: dict[str, Any] | None = None,
-    ) -> str:
-        if self.active_context is None:
-            if project_id is None:
-                raise RuntimeError(
-                    f"There is no active project to run job '{job.name}'. "
-                    "Use create_or_open_project()/open_project(), or pass project_id."
-                )
-            self.open_project(project_id)
+        Raises `ms_flow.engine.Busy` when another process of this user already runs one.
+        """
+        if self._engine is None:
+            from ms_flow.engine import Engine, ThreadExecutor
 
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
+            cpus, gpus, mem_mb = _here(self.settings_manager.settings.hosts["local"])
+            engine = Engine(cpus=cpus, gpus=gpus, mem_mb=mem_mb, state_dir=self._master_db_path.parent)
+            engine.register("thread", ThreadExecutor(cpus * 2))
+            self._engine = engine
+            self._local_back()
+        return self._engine
 
-        submit_config = dict(config or {})
-        effective_project_id = project_id
-        if effective_project_id is None and self.active_context is not None:
-            effective_project_id = str(self.active_context.id)
+    def _local_back(self) -> None:
+        executor = build_executor("local", self.settings_manager.settings)
+        if executor is not None:
+            self._engine.register("local", executor)
 
-        selected_executor = str(executor_name or job.executor).strip() or job.executor
-        if not executor_is_supported(
-            self.executor_manager, selected_executor, job.supported_executors
-        ):
-            raise ValueError(
-                f"Executor '{selected_executor}' is not supported by job '{job.name}'. "
-                f"Compatible: {job.supported_executors}."
-            )
+    def _active(self) -> set[str]:
+        """The executors that take jobs now. Never builds the engine: before its first use
+        nothing does but the pool of this machine."""
+        if self._engine is not None:
+            return {name for name in self._engine._executors if name != "thread"}
+        pool = self.settings_manager.settings.executors["local"]
+        return {"local"} if pool.on_login_node or not _login_node() else set()
 
-        prepared_chunks = chunks
-        deferred_chunk_build = False
-        resolved_total_chunks = total_chunks
-        if prepared_chunks is None:
-            if params is None:
-                raise ValueError(
-                    f"Job '{job.name}' requires params or chunks. "
-                    "Pass params=... so MolSuite builds the chunks, or chunks=... if you already materialised them."
-                )
+    def executors(self) -> list[dict]:
+        """One row for each executor kept: `name`, `kind`, `hosts`, `default`, and `state`:
+        `on`, `starting`, `off`, or `blocked` when it is off and not to be started now, with
+        `why`. Safe to poll."""
+        settings, active = self.settings_manager.settings, self._active()
+        rows = []
+        for name, config in settings.executors.items():
+            why = "" if name in active or name in self._starting else blocked(name, settings, active)
+            state = "starting" if name in self._starting else "on" if name in active else "blocked" if why else "off"
+            rows.append({"name": name, "kind": config.kind, "hosts": list(config.hosts), "state": state, "why": why,
+                         "default": name == settings.general.default_executor})
+        return rows
 
-            job_config = dict(submit_config)
-            if "project_store" not in job_config:
-                job_config["project_store"] = self.project_store
-            if "project_db" not in job_config:
-                job_config["project_db"] = self.project_db
-            if "project_context" not in job_config:
-                job_config["project_context"] = self.active_context
-            if "project_resources" not in job_config:
-                resource_map = self.get_project_resource_map(project_id=effective_project_id)
-                if resource_map:
-                    job_config["project_resources"] = resource_map
+    def activate(self, name: str, on_line=None) -> None:
+        """Start the executor kept as `name`, which takes jobs under that name from then on.
 
-            if depends_on and job.chunker_ref:
-                prepared_chunks = iter(())
-                deferred_chunk_build = True
-            else:
-                prepared_chunks = job.build_chunks(params, config=job_config)
-                if resolved_total_chunks is None:
-                    resolved_total_chunks = job.count_chunks(params, config=job_config)
+        Refused with `ValueError` while another active one has one of its machines or is a Ray
+        too (see `blocked`). A Ray that takes this machine puts the pool of it aside until it
+        is deactivated, so the pool must have no job that has not ended. A host that is not
+        reached or not prepared raises, and leaves everything as it was. `on_line` hears what
+        is done on a host that is being prepared. It waits for its hosts: not from a thread
+        that cannot.
+        """
+        settings, engine = self.settings_manager.settings, self.engine
+        if name not in settings.executors:
+            raise ValueError(f"no executor is kept as `{name}`")
+        self._starting.add(name)
+        try:
+            with self._activation:
+                if name in engine._executors:
+                    return
+                why = blocked(name, settings, self._active())
+                if why:
+                    raise ValueError(f"`{name}` is not started: {why}")
+                config = settings.executors[name]
+                aside = config.kind == "ray" and "local" in config.hosts and "local" in engine._executors
+                if aside:
+                    try:
+                        engine.unregister("local")
+                    except ValueError:
+                        raise ValueError(f"`{name}` takes this machine, and its pool has jobs that have not ended") from None
+                try:
+                    host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, on_line))
+                    executor = build_executor(name, settings, host_env)
+                    if executor is None:
+                        raise RuntimeError(_LOGIN_NODE)
+                    engine.register(name, executor)
+                except BaseException:
+                    if aside:
+                        self._local_back()
+                    raise
+                if aside:
+                    self._aside = name
+        finally:
+            self._starting.discard(name)
 
-        handler_instance = result_handler
-        if handler_instance is None:
-            handler_instance = job.build_result_handler(
-                *result_handler_args,
-                **(result_handler_kwargs or {}),
-            )
+    def deactivate(self, name: str) -> None:
+        """Stop the executor active as `name`. Refused with `ValueError` while a job submitted
+        to it has not ended. The pool of this machine comes back if it was aside for this one."""
+        if self._engine is None or name not in self._active():
+            return
+        with self._activation:
+            self._engine.unregister(name)
+            if self._aside == name:
+                self._aside = None
+                self._local_back()
 
-        effective_output_spec = self._resolve_sink(output_spec if output_spec is not None else job.output_spec)
-        limits = self.settings_manager.settings.operational_limits
-        profile = _normalize_operational_profile(
-            operational_profile
-            if operational_profile is not None
-            else submit_config.get("operational_profile", limits.operational_profile)
-        )
-        preset = _OPERATIONAL_PROFILE_PRESETS[profile]
-        effective_max_inflight_tasks = (
-            max(1, int(max_inflight_tasks))
-            if max_inflight_tasks is not None
-            else int(preset["max_inflight_tasks"] or limits.default_max_inflight_tasks)
-        )
-        effective_max_inflight_items = (
-            max(1, int(max_inflight_items))
-            if max_inflight_items is not None
-            else int(preset["max_inflight_items"] or limits.default_max_inflight_items)
-        )
-        effective_output_flush_every = (
-            int(output_flush_every)
-            if output_flush_every is not None
-            else int(preset["output_flush_every"] or job.output_flush_every)
-        )
-        operational_policy = {
-            "profile": profile,
-            "max_inflight_tasks": effective_max_inflight_tasks,
-            "max_inflight_items": effective_max_inflight_items,
-            "output_flush_every": effective_output_flush_every,
-        }
+    def _change(self, table: str, name: str, change) -> None:
+        """Run `change` on the entry `name` of `hosts` or `executors`, unless an active executor
+        is made of it. The pool of this machine is the one made again with what is kept."""
+        executors = self.settings_manager.settings.executors
+        users = [key for key in self._active() & set(executors) if self._engine is not None and
+                 (key == name if table == "executors" else name in executors[key].hosts)]
+        if users and users != ["local"]:
+            raise ValueError(f"`{table}.{name}` is in use by `{users[0]}`, which is active: deactivate it first")
+        with self._activation:
+            if users:
+                self._engine.unregister("local")  # refused while it has jobs, and then nothing is changed
+            try:
+                change()
+            finally:
+                if users:
+                    self._local_back()
 
-        return self.executor_manager.submit_job(
-            executor_name=selected_executor,
-            chunks=prepared_chunks,
-            run_chunk=job.task.handler_ref,
-            project_id=effective_project_id,
-            origin_id=self.app_id,
-            task_type=job.name,
-            priority=priority,
-            depends_on=depends_on,
-            queue_policy=queue_policy,
-            default_cpu_required=cpu_required or job.cpu_required,
-            max_job_cpu=max_job_cpu,
-            max_inflight_tasks=effective_max_inflight_tasks,
-            max_inflight_items=effective_max_inflight_items,
-            job_payload={
-                "job_name": job.name,
-                "task_name": job.task.name,
-                "_operational_profile": operational_policy,
-                "_supported_executors": list(job.supported_executors),
-                "_chunker_ref": job.chunker_ref,
-                # The handler instance dies with the process; its factory and the arguments
-                # that survive a round-trip through JSON are what lets a reattached job
-                # rebuild it. Live objects (the project store) are re-injected on restore.
-                "_result_handler_ref": "" if result_handler is not None else job.result_handler_ref,
-                "_result_handler_kwargs": {
-                    key: value
-                    for key, value in (result_handler_kwargs or {}).items()
-                    if isinstance(value, (str, int, float, bool, list, dict, type(None)))
-                },
-                "_chunk_counter_ref": job.chunk_counter_ref,
-                "_chunker_params": params,
-                "_dispatch_policy": DispatchPolicy(
-                    max_inflight_tasks=effective_max_inflight_tasks,
-                    max_inflight_items=effective_max_inflight_items,
-                ).to_mapping(),
-                "_default_cpu_required": cpu_required or job.cpu_required,
-                "_deferred_chunk_build_pending": deferred_chunk_build,
-                "_data_context": {
-                    "project_path": str(self.active_context.path) if self.active_context is not None else "",
-                    "project_db_path": (
-                        str(self.project_db.db_path)
-                        if self.project_db is not None and self.project_db.db_path is not None
-                        else ""
-                    ),
-                    "executor_db_path": (
-                        str(self.executor_db.db_path)
-                        if self.executor_db is not None and self.executor_db.db_path is not None
-                        else ""
-                    ),
-                    # Deferred chunk builds (depends_on + chunker) rebuild config from this
-                    # context, so persist the JSON-safe resource map too — otherwise jobs that
-                    # resolve a project resource at chunk-build time (e.g. chemistry's 'molecules'
-                    # storage dir) fail with "Missing project resource" once they're deferred.
-                    "project_resources": self.get_project_resource_map(project_id=effective_project_id),
-                },
-            },
-            result_handler=handler_instance,
-            store_results=job.store_results if store_results is None else bool(store_results),
-            setup_ref=job.setup_ref,
-            stage_ref=job.stage_chunk_ref,
-            finalize_ref=job.finalize_ref,
-            stage_fail_policy=job.stage_fail_policy,
-            max_stage_failures=job.max_stage_failures,
-            output_spec=effective_output_spec,
-            output_flush_every=effective_output_flush_every,
-            total_chunks=(
-                max(0, int(resolved_total_chunks))
-                if resolved_total_chunks is not None
-                else len(prepared_chunks) if isinstance(prepared_chunks, list) else None
-            ),
-            chunk_fail_fast_min_processed=chunk_fail_fast_min_processed,
-            chunk_fail_fast_max_failed_ratio=chunk_fail_fast_max_failed_ratio,
-            chunk_fail_fast_max_consecutive_failures=chunk_fail_fast_max_consecutive_failures,
-        )
+    def save_host(self, name: str, **fields) -> None:
+        """`SettingsManager.save_host`, refused while an active executor works on that machine."""
+        self._change("hosts", name, lambda: self.settings_manager.save_host(name, **fields))
 
-    def wait_for_job(
-        self,
-        job_id: str,
-        *,
-        poll_s: float = 0.25,
-        progress_cb: Callable[[JobSnapshot], None] | None = None,
-    ) -> JobSnapshot:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
+    def remove_host(self, name: str) -> None:
+        self._change("hosts", name, lambda: self.settings_manager.remove_host(name))
 
-        terminal = {"completed", "failed", "canceled"}
-        while True:
-            row = self.executor_manager.get_job(job_id)
-            if row is None:
-                raise RuntimeError(f"No se encontro job: {job_id}")
-            if progress_cb is not None:
-                progress_cb(row)
-            if row.status in terminal:
-                return row
-            time.sleep(max(0.05, float(poll_s)))
+    def save_executor(self, name: str, **fields) -> None:
+        """`SettingsManager.save_executor`, refused while that executor is active."""
+        self._change("executors", name, lambda: self.settings_manager.save_executor(name, **fields))
 
-    def get_executor_job(self, job_id: str) -> JobSnapshot | None:
-        """Return the current executor snapshot without waiting."""
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        return self.executor_manager.get_job(str(job_id))
+    def remove_executor(self, name: str) -> None:
+        self._change("executors", name, lambda: self.settings_manager.remove_executor(name))
 
-    def purge_job_history(self, *, older_than_days: float = 30.0) -> dict[str, int]:
-        """Prune chunks and events of finished jobs. Runs by itself when a project opens."""
-        self._require_runtime()
-        access = getattr(self, "executor_access", None)
-        if access is None:
-            self._require_executor_db()
-            raise RuntimeError("ExecutorStore is not available for the active project.")
-        return access.purge_finished_jobs(older_than_days=older_than_days)
+    def _project_flow(self):
+        project = self._require_active_project_runtime()
+        if self._flow is None:
+            from ms_flow.engine import Flow
 
-    def get_job_outputs(self, job_id: str) -> list[dict[str, Any]]:
-        self._require_runtime()
-        access = getattr(self, "executor_access", None)
-        if access is None:
-            self._require_executor_db()
-            raise RuntimeError("ExecutorStore is not available for the active project.")
-        return access.list_job_outputs(job_id)
+            self.engine.attach("project", project.context.path / "executor.db")
+            self._flow = Flow(self.engine, project.project_db)
+        return self._flow
 
-    def get_job_chunks(
-        self,
-        *,
-        job_id: str | None = None,
-        job_ids: list[str] | None = None,
-        statuses: tuple[str, ...] | list[str] | None = None,
-        limit: int | None = None,
-        include_payload: bool = False,
-    ) -> list[dict[str, Any]]:
-        self._require_runtime()
-        access = getattr(self, "executor_access", None)
-        if access is None:
-            self._require_executor_db()
-            raise RuntimeError("ExecutorStore is not available for the active project.")
-        return access.list_job_chunks(
-            job_id=job_id,
-            job_ids=job_ids,
-            statuses=statuses,
-            limit=limit,
-            include_payload=include_payload,
-        )
+    def submit(self, job, params=None, *, executor: str | None = None, **options) -> int:
+        """Run a `ms_flow.engine.job` in the active project and return its id, for `engine.status`
+        and `engine.wait`.
 
-    def get_job_event_records(
-        self,
-        *,
-        after_event_id: int = 0,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        self._require_runtime()
-        access = getattr(self, "executor_access", None)
-        if access is None:
-            self._require_executor_db()
-            raise RuntimeError("ExecutorStore is not available for the active project.")
-        return access.list_job_events(
-            after_event_id=after_event_id,
-            limit=limit,
-            ascending=True,
-        )
+        Its results go to the project's store, and the job is recorded in the project's
+        `executor.db`: closing the project interrupts it, and submitting it again with the same
+        `key=` continues it. `executor` is `thread` or the name of an active one (see
+        `activate`), by default the one the settings give (`general.default_executor`);
+        `options` are those of `ms_flow.engine.Flow.submit`.
+        """
+        flow = self._project_flow()
+        name = executor or self.settings_manager.settings.general.default_executor
+        self._ready(name)
+        return flow.submit(job, params, journal="project", executor=name, **options)
 
-    def get_job_events(self, job_id: str, limit: int | None = None) -> list[dict[str, Any]]:
-        self._require_runtime()
-        access = getattr(self, "executor_access", None)
-        if access is None:
-            self._require_executor_db()
-            raise RuntimeError("ExecutorStore is not available for the active project.")
-        rows = access.list_job_events(job_id=job_id, limit=limit, ascending=True)
-        return [
-            {
-                "level": row["level"],
-                "type": row["event_type"],
-                "message": row["message"],
-                "created_at": row["created_at"].isoformat(),
-            }
-            for row in rows
-        ]
+    def _ready(self, name: str) -> None:
+        if name not in self._engine._executors:
+            raise RuntimeError(
+                f"the pool of this machine is aside while `{self._aside}` has it" if name == "local" and self._aside
+                else _LOGIN_NODE if name == "local" and _login_node()
+                else f"`{name}` is not active: see `Workspace.activate`")
 
-    def cancel_job(self, job_id: str) -> None:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        self.executor_manager.cancel_job(job_id)
+    def origin(self, key: str) -> dict:
+        """What the job recorded under `key` in the active project was submitted with: `job` (its
+        `module:qualname`), `params` and `options`. Raises for one `resume` cannot submit again."""
+        return self._project_flow().origin(key, journal="project")
 
-    def resubmit_job(
-        self,
-        job_id: str,
-        *,
-        executor_name: str | None = None,
-        cpu_required: int | None = None,
-        queue_policy: str | None = None,
-        priority: int | None = None,
-        project_id: str | UUID | None = None,
-        store_results: bool | None = None,
-        output_spec: Any = None,
-        output_flush_every: int | None = None,
-    ) -> str:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        return self.executor_manager.resubmit_job(
-            job_id,
-            executor_name=executor_name,
-            cpu_required=cpu_required,
-            queue_policy=queue_policy,
-            priority=priority,
-            project_id=project_id,
-            store_results=store_results,
-            output_spec=output_spec,
-            output_flush_every=output_flush_every,
-        )
+    def resume(self, key: str, **options) -> int:
+        """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
+        with the params and options it was submitted with: one that was interrupted (the project
+        or the application was closed) or canceled continues where it was. `options` say
+        otherwise for this run, and bring what the record cannot keep (`on_terminal`)."""
+        from ms_flow.engine.flow import named
 
-    def get_executor_status(self) -> dict[str, Any]:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        return self.executor_manager.get_status()
+        origin = self.origin(key)
+        return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
 
-    def get_executor_capability_matrix(self) -> dict[str, dict[str, Any]]:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        return self.executor_manager.get_executor_capability_matrix()
+    def move(self, key: str, executor: str, **options) -> int:
+        """Continue on `executor` the job recorded under `key`: `resume`, for one that may be running.
+        A job this session runs is canceled first and waited for, so not from a thread that cannot
+        wait: what its tasks in flight had done is done again there."""
+        self.origin(key)  # nothing is canceled for a job that cannot be submitted again,
+        self._ready(executor)  # or that has nowhere to go
+        for job in self._engine.jobs():
+            if job.key == key and job.finished_at is None:
+                self._engine.cancel(job.id)
+                self._engine.wait(job.id)
+        return self.resume(key, executor=executor, **options)
 
-    def activate_compute_backend(self, backend: str, **kwargs) -> dict[str, Any]:
-        """Switch the logical ``compute`` executor between ``loky`` (local) and
-        ``ray`` (cluster). Returns the resulting backend status dict."""
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        return self.executor_manager.activate_compute_backend(backend, **kwargs)
+    def remote_jobs(self, executor: str) -> list[dict]:
+        """What the executor of that name has on another machine, whichever session or project
+        sent it and with or without a project open: see `RemoteExecutor.jobs_there`. Nothing
+        when it runs its jobs here. It asks that machine, so not from a thread that cannot wait."""
+        slot = self.engine._executors.get(executor)
+        return slot.impl.jobs_there() if hasattr(getattr(slot, "impl", None), "jobs_there") else []
 
-    def compute_backend_status(self) -> dict[str, Any]:
-        self._require_runtime()
-        if self.executor_manager is None:
-            raise RuntimeError("ExecutorManager no inicializado.")
-        status = dict(self.executor_manager.compute_backend_status())
-        # Why the configured backend may not be the live one (unreachable ray, etc).
-        status["fallback_reason"] = getattr(self, "compute_backend_fallback", "")
-        return status
+    def remove_remote_job(self, executor: str, dir: str) -> None:
+        """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
+        this session waits for is refused: cancel the job."""
+        self.engine.executor(executor).remove_there(dir)
+
+    def jobs(self, limit: int | None = None) -> list:
+        """The jobs of the active project, oldest first; with `limit`, the last ones.
+
+        What a monitor shows: every job on record in the project's journal, the ones of earlier
+        sessions too, each as the engine has it now when it ran it in this session. Reads the
+        journal without owning it and never builds the engine, so it is safe to poll.
+        """
+        project = self._runtime_state.active_project
+        if project is None:
+            return []
+        from ms_flow.engine import JobSnapshot
+        from ms_flow.engine.journal import recorded
+
+        live = {(job.key, job.started_at): job for job in (self._engine.jobs() if self._flow is not None else ())}
+        # ponytail: a job of a process that died reads as running until this session's first
+        # submit opens the journal, which is what marks it interrupted.
+        listed = [live.pop((row["job_id"], row["started_at"]), None)
+                  or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
+                                 row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
+                                 min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None)
+                  for row in recorded(project.context.path / "executor.db", limit)]
+        # One just submitted is not in the file until the journal's next write. Only the active
+        # project has jobs that have not ended: closing a project interrupts its own.
+        return listed + [job for job in live.values() if job.finished_at is None]
+
+    def job_tasks(self, job_id: int | None) -> list:
+        """The tasks in flight of a job this session runs, by its `JobSnapshot.id`: see
+        `Engine.tasks`. Nothing for a job of another session. Never builds the engine."""
+        return self._engine.tasks(job_id) if self._engine is not None and job_id is not None else []
+
+    def job_failures(self, key: str, limit: int = 200) -> list[dict]:
+        """`attempt`, `error` (the traceback) and `input` (a short repr of the element) of the
+        chunks that failed in the job recorded under `key` (`JobSnapshot.key`) in the active
+        project, at most `limit`."""
+        from ms_flow.engine.journal import failures
+
+        return failures(self._require_active_project_runtime().context.path / "executor.db", key, limit)
 
     def get_project_store(self):
         return self.advanced.project_store
 
 
-__all__ = ["MolSuiteJobApiMixin", "batch_job", "streaming_job"]
+__all__ = ["WorkspaceJobApiMixin"]

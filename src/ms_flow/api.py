@@ -1,19 +1,15 @@
-"""Recommended public surface for MolSuite's simple, declarative path.
+"""Recommended public surface: the facade, projects, settings, and the names to write a job.
 
-`molsuite.api` exposes the happy path for apps, workflows and reusable jobs.
-Advanced engine access is deliberately kept apart in `molsuite.advanced` and
-behind `ms.advanced`.
+The engine itself (`Engine`, executors, `Flow`) is `ms_flow.engine`.
 """
 
 from ms_flow.core.apps import AppManifest, AppRegistry
 from ms_flow.core.app_settings import AppSettingSpec
 from ms_flow.core.configuration import ConfigurationEntry, PydanticConfiguration
 from ms_flow.artifacts import ArtifactRegistry
-from ms_flow.core.executor.job_snapshot import JobSnapshot
 from ms_flow.core.data import FileArtifact, FileInputSpec, ProjectOutputDirSpec
-from ms_flow.job_templates import batch_job, streaming_job
-from ms_flow.main import MolSuite
-from ms_flow.tasking import CapabilitySpec, JobSpec, RequirementSpec
+from ms_flow.engine import JobSnapshot, job, report, task
+from ms_flow.main import Workspace
 from ms_flow.core.project.catalog import (
     AppProjectCatalog,
     ProjectCatalog,
@@ -29,14 +25,12 @@ from ms_flow.core.project.resources import (
 from ms_flow.runtime import AppRuntime
 from ms_flow.sinks import file_sink, graph_sink, table_sink
 from ms_flow.specs import (
-    WorkflowSpec,
     inline_items,
     project_file,
     project_file_out,
     project_query,
     project_table,
     project_table_out,
-    workflow,
 )
 
 __all__ = [
@@ -46,13 +40,10 @@ __all__ = [
     "AppRuntime",
     "AppSettingSpec",
     "ArtifactRegistry",
-    "CapabilitySpec",
     "ConfigurationEntry",
     "FileArtifact",
     "FileInputSpec",
     "JobSnapshot",
-    "JobSpec",
-    "MolSuite",
     "ProjectCatalog",
     "ProjectCatalogBackend",
     "ProjectCatalogEditor",
@@ -62,18 +53,17 @@ __all__ = [
     "ProjectResourceContract",
     "ProjectResourceSpec",
     "PydanticConfiguration",
-    "RequirementSpec",
-    "WorkflowSpec",
-    "batch_job",
+    "Workspace",
     "file_sink",
     "graph_sink",
     "inline_items",
+    "job",
     "project_file",
     "project_file_out",
     "project_query",
     "project_table",
     "project_table_out",
-    "streaming_job",
+    "report",
     "table_sink",
-    "workflow",
+    "task",
 ]

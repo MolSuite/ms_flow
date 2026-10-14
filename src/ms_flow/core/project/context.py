@@ -29,7 +29,7 @@ class ProjectDataContext(BaseModel):
     It avoids coupling the core to app facades or runtime internals.
     """
 
-    molsuite: object
+    workspace: object
     active_context: object | None = None
     project_store_handle: object | None = None
     project_resources: dict[str, object] = Field(default_factory=dict)
@@ -38,8 +38,8 @@ class ProjectDataContext(BaseModel):
     def project_db(self) -> object | None:
         # Delegated (not frozen at construction) so the context always
         # reflects the currently active project.
-        return getattr(self.molsuite, "project_db", None)
+        return getattr(self.workspace, "project_db", None)
 
     @property
     def project_store(self) -> object | None:
-        return getattr(self.molsuite, "project_store", None)
+        return getattr(self.workspace, "project_store", None)

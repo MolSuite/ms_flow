@@ -5,7 +5,7 @@ from typing import Any, Iterable, Optional
 from uuid import UUID
 
 from ms_flow.core.project.catalog import AppProjectCatalog
-from ms_flow.main import MolSuite
+from ms_flow.main import Workspace
 from ms_flow.core.project.context import ProjectContext
 from ms_flow.core.project.resources import ProjectResource, ProjectResourceContract, ProjectResourceSpec
 
@@ -24,21 +24,21 @@ class BaseRuntime:
         app_settings=None,
     ):
         self.app_id = app_id
-        self.molsuite = MolSuite(
+        self.workspace = Workspace(
             app_id=app_id,
             host_namespace=app_id,
             project_resources=project_resources,
             app_settings=app_settings,
         )
-        self.logger = self.molsuite.get_app_logger(logger_name or app_id)
+        self.logger = self.workspace.get_app_logger(logger_name or app_id)
 
     def shutdown(self):
-        """Shut down the MolSuite engine."""
-        self.molsuite.shutdown()
+        """Shut down the Workspace engine."""
+        self.workspace.shutdown()
 
     def list_projects(self, page: int = 1, items_per_page: int = 20):
         """List projects filtered by this application's app_id."""
-        return self.molsuite.list_projects(page=page, items_per_page=items_per_page)
+        return self.workspace.list_projects(page=page, items_per_page=items_per_page)
 
     def create_project(
         self,
@@ -49,7 +49,7 @@ class BaseRuntime:
         extra_dirs: list[str] | None = None
     ) -> ProjectContext:
         """Create a new project for this application."""
-        context = self.molsuite.create_project(
+        context = self.workspace.create_project(
             name=name,
             folder=folder,
             description=description,
@@ -61,7 +61,7 @@ class BaseRuntime:
         return context
 
     def _validate_project_app_id(self, project_id: UUID | str):
-        project = self.molsuite.project_manager.get_project_by_id_global(project_id)
+        project = self.workspace.project_manager.get_project_by_id_global(project_id)
         project_app_id = (project.app_id or "").strip()
         runtime_app_id = self.app_id.strip()
         if project_app_id != runtime_app_id:
@@ -74,13 +74,13 @@ class BaseRuntime:
     def open_project(self, project_id: UUID | str, extra_dirs: list[str] | None = None) -> ProjectContext:
         """Open and activate an existing project."""
         self._validate_project_app_id(project_id)
-        context = self.molsuite.open_project(project_id, extra_dirs=extra_dirs)
+        context = self.workspace.open_project(project_id, extra_dirs=extra_dirs)
         self.on_project_activated(context)
         return context
 
     def close_project(self):
         """Deactivate the current project."""
-        self.molsuite.close_project()
+        self.workspace.close_project()
 
     def create_or_open_project(
         self,
@@ -90,7 +90,7 @@ class BaseRuntime:
         extra_dirs: list[str] | None = None,
     ) -> ProjectContext:
         """Find a project by name/path, or create it if it does not exist."""
-        context = self.molsuite.create_or_open_project(
+        context = self.workspace.create_or_open_project(
             name=name,
             folder=folder,
             description=description,
@@ -100,42 +100,39 @@ class BaseRuntime:
         self.on_project_activated(context)
         return context
 
-    def run(self, *args, **kwargs) -> str:
-        """Shortcut to run a declarative workflow on the active runtime."""
-        return self.molsuite.run(*args, **kwargs)
-
-    def submit_job(self, job, **kwargs) -> str:
-        return self.molsuite.submit_job(job, **kwargs)
+    def submit(self, job, params=None, **options) -> int:
+        """Run a job in the active project. See `Workspace.submit`."""
+        return self.workspace.submit(job, params, **options)
 
     @property
     def active_context(self) -> Optional[ProjectContext]:
         """Context of the currently active project."""
-        return self.molsuite.active_context
+        return self.workspace.active_context
 
     def _require_active_project(self) -> ProjectContext:
         """Ensure there is an active project, or raise."""
-        if self.molsuite.active_context is None:
+        if self.workspace.active_context is None:
             raise RuntimeError(f"There is no active project for {self.app_id}.")
-        return self.molsuite.active_context
+        return self.workspace.active_context
 
     def get_project_store(self):
         """Return the data store of the active project."""
         self._require_active_project()
-        return self.molsuite.advanced.project_store
+        return self.workspace.advanced.project_store
 
     @property
     def artifacts(self):
         self._require_active_project()
-        return self.molsuite.artifacts
+        return self.workspace.artifacts
 
     def get_project_resource_contract(self) -> ProjectResourceContract:
-        return self.molsuite.get_project_resource_contract()
+        return self.workspace.get_project_resource_contract()
 
     def list_project_resources(self, project_id: UUID | str | None = None) -> dict[str, ProjectResource]:
-        return self.molsuite.list_project_resources(project_id=project_id)
+        return self.workspace.list_project_resources(project_id=project_id)
 
     def get_project_resource(self, key: str, project_id: UUID | str | None = None) -> ProjectResource:
-        return self.molsuite.get_project_resource(key, project_id=project_id)
+        return self.workspace.get_project_resource(key, project_id=project_id)
 
     def get_project_resource_path(
         self,
@@ -144,7 +141,7 @@ class BaseRuntime:
         project_id: UUID | str | None = None,
         create_parent: bool = False,
     ) -> Path:
-        return self.molsuite.get_project_resource_path(
+        return self.workspace.get_project_resource_path(
             key,
             *parts,
             project_id=project_id,
@@ -152,19 +149,19 @@ class BaseRuntime:
         )
 
     def get_project_resource_map(self, project_id: UUID | str | None = None) -> dict[str, dict[str, str]]:
-        return self.molsuite.get_project_resource_map(project_id=project_id)
+        return self.workspace.get_project_resource_map(project_id=project_id)
 
     def project_resource_specs(self) -> tuple[ProjectResourceSpec, ...]:
-        return self.molsuite.project_resource_specs()
+        return self.workspace.project_resource_specs()
 
     def app_setting_specs(self):
-        return self.molsuite.app_setting_specs()
+        return self.workspace.app_setting_specs()
 
     def get_app_setting(self, key: str):
-        return self.molsuite.get_app_setting(key)
+        return self.workspace.get_app_setting(key)
 
     def update_app_setting(self, key: str, value, *, save_global_too: bool = False) -> None:
-        self.molsuite.update_app_setting(key, value, save_global_too=save_global_too)
+        self.workspace.update_app_setting(key, value, save_global_too=save_global_too)
 
     def on_project_activated(self, context: ProjectContext):
         """

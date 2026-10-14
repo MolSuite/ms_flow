@@ -1,0 +1,120 @@
+{
+  "label": "engine core",
+  "recorded_at": "2026-10-08T05:15:38+00:00",
+  "commit": "c4d045a",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        372.8713,
+        376.5202,
+        375.4486,
+        374.9361,
+        377.4071
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        563.7011,
+        562.7161,
+        550.2258
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        0.0135,
+        0.0157,
+        0.0262
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        0.1364,
+        0.1466,
+        0.2066
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        0.0161
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        0.0199
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        1.232
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        0.0
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        69.2617
+      ],
+      "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.020022957259934627,
+        0.019199319034960353,
+        0.019165096234937663,
+        0.020056695925013628,
+        0.020176562934939284
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.19315710901486455,
+        0.18980477580495062,
+        0.193831937280047,
+        0.1875791570948786,
+        0.1960612237699388
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.0224175789495348,
+        0.02232622485025786,
+        0.021698307149927133
+      ],
+      "unit": "ms"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": true,
+    "worker_death_pool_recovers": true,
+    "kill9_no_orphans": true,
+    "second_engine_safe": true
+  },
+  "long_jobs": {
+    "measured_at": "2026-10-08",
+    "commit": "9a9f206"
+  }
+}

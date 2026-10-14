@@ -10,13 +10,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import SQLModel, Session
 
-from ms_flow.core.database.executor_models import (
-    ExecutorHeartbeat,
-    ExecutorJob,
-    ExecutorJobChunk,
-    ExecutorJobEvent,
-    ExecutorJobFeedState,
-)
 from ms_flow.core.database.master_models import (
     Project,
     ProjectJobIndex,
@@ -26,15 +19,7 @@ MASTER_TABLES = (
     Project.__table__,
     ProjectJobIndex.__table__,
 )
-EXECUTOR_TABLES = (
-    ExecutorJob.__table__,
-    ExecutorJobFeedState.__table__,
-    ExecutorJobChunk.__table__,
-    ExecutorJobEvent.__table__,
-    ExecutorHeartbeat.__table__,
-)
 MASTER_TABLE_NAMES = {table.name for table in MASTER_TABLES}
-EXECUTOR_TABLE_NAMES = {table.name for table in EXECUTOR_TABLES}
 SCHEMA_VERSION_TABLE = "_schema_versions"
 
 
@@ -103,7 +88,7 @@ def create_project_tables(engine):
     project_tables = [
         table
         for table in all_tables
-        if table.name not in MASTER_TABLE_NAMES and table.name not in EXECUTOR_TABLE_NAMES
+        if table.name not in MASTER_TABLE_NAMES
     ]
     if project_tables:
         SQLModel.metadata.create_all(engine, tables=project_tables)

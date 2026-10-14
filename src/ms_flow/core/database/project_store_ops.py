@@ -58,9 +58,9 @@ def resolve_project_store_ops(source: Any) -> "_ProjectStoreSqliteOps":
             ops = _ops_from_candidate(project_db)
             if ops is not None:
                 return ops
-        molsuite = getattr(candidate, "molsuite", None)
-        if molsuite is not None and molsuite is not candidate:
-            ops = _ops_from_candidate(molsuite)
+        workspace = getattr(candidate, "workspace", None)
+        if workspace is not None and workspace is not candidate:
+            ops = _ops_from_candidate(workspace)
             if ops is not None:
                 return ops
         return None
@@ -68,7 +68,7 @@ def resolve_project_store_ops(source: Any) -> "_ProjectStoreSqliteOps":
     ops = _ops_from_candidate(source)
     if ops is None:
         raise ValueError(
-            "Could not resolve project store SQLite operations from source. Usa MolSuite, ProjectDataContext o ProjectStore."
+            "Could not resolve project store SQLite operations from source. Use Workspace, ProjectDataContext or ProjectStore."
         )
     return ops
 
@@ -777,15 +777,22 @@ class _ProjectStoreSqliteOps:
                     resolved_rows: list[dict[str, Any]] = []
                     row_refs: list[str | None] = []
                     ref_field = str(node.get("ref_field") or "$ref")
+                    # A ref some relation resolves must name one row: two rows under it and the
+                    # last one would silently take the children of both. An upsert node repeats
+                    # refs on purpose (same key, same row).
+                    refs_resolved = node_name in fk_target_nodes and node_write_mode != "upsert"
+                    seen_refs: set[str] = set()
 
                     for raw_row in rows:
                         row_payload = dict(raw_row)
                         row_ref = row_payload.get(ref_field)
                         row_refs.append(None if row_ref is None else str(row_ref))
-                        if row_ref is not None and str(row_ref) in ref_maps[node_name]:
-                            raise DataContractError(
-                                f"Graph node '{node_name}' contains duplicate ref '{row_ref}'."
-                            )
+                        if refs_resolved and row_ref is not None:
+                            if str(row_ref) in seen_refs:
+                                raise DataContractError(
+                                    f"Graph node '{node_name}' contains duplicate ref '{row_ref}'."
+                                )
+                            seen_refs.add(str(row_ref))
 
                         for relation in relations_by_source[node_name]:
                             fk_field = str(relation["fk_field"])

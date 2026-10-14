@@ -14,26 +14,18 @@ from ms_flow.core.configuration import (
     set_path_value,
 )
 from ms_flow.core.events import setting_changed
-from ms_flow.core.settings.models import Settings
+from ms_flow.core.settings.models import NAME, ExecutorConfig, HostConfig, Settings, molsuite_home
 
 _MISSING = object()
 
 
-_MB = 1024 * 1024
 # Renamed/removed settings, see ``reconcile_overrides``. Add an entry whenever one changes.
 _LEGACY_KEYS: dict[str, Any] = {
     "data_dir": None,
     "executor_db": None,
-    **{
-        f"operational_limits.{name}_bytes": (f"operational_limits.{name}_mb", lambda value: value / _MB)
-        for name in (
-            "max_inline_chunk_payload",
-            "max_spool_payload",
-            "output_sink_max_buffer",
-            "output_sink_max_payload",
-            "output_sink_max_pending",
-        )
-    },
+    "operational_limits": None,  # the knobs of the engine before `ms_flow.engine`
+    "resources": None,  # this machine is `hosts.local`, and who runs the jobs `executors`
+    "workers": None,
 }
 
 
@@ -44,7 +36,7 @@ class SettingsManager:
     icon_name = None
 
     def __init__(self):
-        self.global_dir = Path.home() / ".molsuite"
+        self.global_dir = molsuite_home()
         self.global_path = self.global_dir / "config.toml"
         self.project_path: Optional[Path] = None
         self.default_path = Path(__file__).with_name("defaults.toml")
@@ -282,14 +274,67 @@ class SettingsManager:
         return tuple(
             entry
             for entry in configuration_entries(Settings, self._default)
-            if not entry.path.startswith("applications")
+            # Tables kept by name, not rows of scalars: `save_host`, `save_executor`.
+            if not entry.path.startswith(("applications", "hosts", "executors"))
         )
 
-    def custom_editors(self):
-        """Sections that need a dedicated editor widget instead of scalar rows.
-        ``workers`` is a polymorphic, dynamically-keyed map (local + Ray/HPC executors)
-        the generic walker skips. Returns (kind, path, title) tuples — no Qt here."""
-        return (("workers", "workers", "Workers / Executors"),)
+    def save_host(self, name: str, **fields) -> None:
+        """Keep a machine under `name` for this user, new or in place of what it was:
+        `save_host("laptop", address="192.168.1.2", cpus=-2)`. The fields are those of
+        `HostConfig`, and the ones not given are its defaults. `local` is this machine.
+        What is not valid raises `ValueError` and leaves the settings as they were."""
+        self._save_named("hosts", HostConfig, name, fields)
+
+    def save_executor(self, name: str, **fields) -> None:
+        """Keep who runs jobs under `name`, as `save_host` keeps a machine:
+        `save_executor("lab", kind="ray", hosts=["local", "pc1"])`. The fields are those of
+        `ExecutorConfig`, and its hosts are kept ones. `local` is the pool of this machine."""
+        self._save_named("executors", ExecutorConfig, name, fields)
+
+    def _save_named(self, table: str, model, name: str, fields: dict) -> None:
+        unknown = sorted(set(fields) - set(model.model_fields))
+        if unknown:
+            raise ValueError(f"`{table}.{name}` has no {', '.join(unknown)}")
+        if not NAME.fullmatch(name):  # a dot in it would be read as a path
+            raise ValueError(f"`{name}` is not a name: letters, digits, `_` and `-`, and no digit first")
+        try:
+            self.set_global_value(f"{table}.{name}", fields)
+        except ValueError as error:  # said as one line a person reads, not as pydantic lists it
+            if not isinstance(error.__cause__, ValidationError):
+                raise
+            raise ValueError("; ".join(
+                ".".join(map(str, e["loc"])) + ": " + e["msg"] if e["loc"] else e["msg"].removeprefix("Value error, ")
+                for e in error.__cause__.errors())) from None
+
+    def set_default_executor(self, name: str) -> None:
+        """Say who runs a job that names nobody: one of the executors kept."""
+        if name not in self._global.executors:
+            raise ValueError(f"no `executors.{name}` is kept")
+        self.set_global_value("general.default_executor", name)
+
+    def remove_host(self, name: str) -> None:
+        """Forget a machine. One that an executor names is refused: take it out of there first."""
+        users = [key for key, executor in self._global.executors.items() if name in executor.hosts]
+        if users and name != "local":
+            raise ValueError(f"`hosts.{name}` is a host of {', '.join(users)}")
+        self._remove_named("hosts", name)
+
+    def remove_executor(self, name: str) -> None:
+        self._remove_named("executors", name)
+
+    def _remove_named(self, table: str, name: str) -> None:
+        if name == "local":
+            raise ValueError(f"`{table}.local` is this machine: it is changed, not removed")
+        if name not in getattr(self._global, table):
+            raise ValueError(f"no `{table}.{name}` is kept")
+        overrides = deepcopy(self._global_overrides)
+        delete_path_value(overrides, f"{table}.{name}")
+        if table == "executors" and self._global.general.default_executor == name:
+            delete_path_value(overrides, "general.default_executor")
+        self._global_overrides = overrides
+        self._save_overrides(self.global_path, overrides)
+        self._refresh_effective()
+        setting_changed.send(self, key=f"{table}.{name}", value=None, scope="global")
 
     def get_value(self, path: str) -> Any:
         return get_path_value(self._effective, path)

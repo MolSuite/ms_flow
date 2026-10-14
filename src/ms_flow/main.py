@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from pathlib import Path
+import threading
 from typing import Optional
 from uuid import UUID
 
 from ms_flow._api_impl import (
-    MolSuiteAdvancedAccess,
-    MolSuiteJobApiMixin,
-    MolSuiteProjectRuntimeMixin,
+    WorkspaceAdvancedAccess,
+    WorkspaceJobApiMixin,
+    WorkspaceProjectRuntimeMixin,
 )
 from ms_flow.artifacts import ArtifactRegistry
 from ms_flow.core.app_settings import coerce_app_setting_specs
-from ms_flow.core.database import ExecutorDB, ExecutorStore, MasterDB, ProjectStore
+from ms_flow.core.database import MasterDB, ProjectStore
 from ms_flow.core.project import ProjectResourceContract
 from ms_flow.core.project import ProjectRuntimeState
 from ms_flow.core.project.context import ProjectContext
@@ -21,7 +21,7 @@ from ms_flow.core.settings.manager import SettingsManager
 from ms_flow.logger import LoggingManager
 
 
-class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
+class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
     """
     Main core facade.
 
@@ -40,7 +40,7 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
     ):
         self.app_id = str(app_id).strip()
         if not self.app_id:
-            raise ValueError("MolSuite requires a non-empty app_id.")
+            raise ValueError("Workspace requires a non-empty app_id.")
         self.host_namespace = str(host_namespace or "").strip() or self.app_id
         self.settings_manager = SettingsManager()
         legacy_specs = coerce_app_setting_specs(app_settings)
@@ -61,10 +61,8 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
         )
         self.logging_manager.start()
         self.app_logger = self.logging_manager.get_app_logger("core")
-        self.executor_logger = None
 
         self._master_db_path = self.settings_manager.settings.projects_db
-        self._executor_db_relative = Path("executor.db")
 
         self.master_db = MasterDB(self._master_db_path)
         self.project_manager = ProjectManager(self.master_db, app_id_filter=self.app_id)
@@ -78,13 +76,11 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
         )
 
         self._runtime_state = ProjectRuntimeState()
+        self._engine = self._flow = None  # see `Workspace.engine` and `Workspace.submit`
+        # see `Workspace.activate`: who put the pool of this machine aside, who is starting, one at a time
+        self._aside, self._starting, self._activation = None, set(), threading.Lock()
         self.project_logger = None
-        self._advanced = MolSuiteAdvancedAccess(self)
-
-    @property
-    def executor_db(self) -> ExecutorDB | None:
-        runtime = self._runtime_state.active_project
-        return runtime.executor_db if runtime is not None else None
+        self._advanced = WorkspaceAdvancedAccess(self)
 
     def app_setting_specs(self):
         return self.settings_manager.app_setting_specs(self.app_id)
@@ -101,10 +97,6 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
         )
 
     @property
-    def executor_access(self) -> ExecutorStore | None:
-        return self.executor_db
-
-    @property
     def project_db(self) -> ProjectStore | None:
         runtime = self._runtime_state.active_project
         return runtime.project_db if runtime is not None else None
@@ -113,10 +105,6 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
     def project_store(self) -> ProjectStore | None:
         runtime = self._runtime_state.active_project
         return runtime.project_store if runtime is not None else None
-
-    @property
-    def executor_manager(self):
-        return self._runtime_state.executor_manager
 
     @property
     def active_context(self) -> Optional[ProjectContext]:
@@ -135,7 +123,7 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
             runtime.project_logger = value
 
     @property
-    def advanced(self) -> MolSuiteAdvancedAccess:
+    def advanced(self) -> WorkspaceAdvancedAccess:
         """Explicit access to advanced surfaces outside the public happy path."""
         return self._advanced
 
@@ -164,5 +152,5 @@ class MolSuite(MolSuiteJobApiMixin, MolSuiteProjectRuntimeMixin):
 
 
 if __name__ == "__main__":
-    ms = MolSuite(app_id="molsuite")
+    ms = Workspace(app_id="molsuite")
     print(ms)

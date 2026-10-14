@@ -5,27 +5,34 @@ jobs, executors and persistence in the same process as your app — no broker, n
 daemon, no server. Works from a Qt app, a notebook or a plain script.
 
 ```python
-from ms_flow.api import MolSuite, table_sink
-from workers import double_value  # el handler vive en un modulo importable
+import sqlite3
 
-ms = MolSuite(app_id="demo")
+from ms_flow import Workspace, job, table_sink, task
+
+
+@task()
+def double_value(value: int) -> dict:
+    return {"value": value, "double_value": 2 * value}
+
+
+@job(task=double_value, output=table_sink("results", columns=("value", "double_value")))
+def double_values(params, project):
+    yield from range(1000)
+
+
+ms = Workspace(app_id="demo")
 ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
+with sqlite3.connect(ms.project_db.db_path) as db:
+    db.execute("CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)")
 
-job_id = ms.run(
-    name="double_values",
-    input=[{"value": v} for v in range(1000)],
-    process=double_value,
-    output=table_sink("results", columns=("value", "double_value")),
-    executor="thread",
-)
-print(ms.wait_for_job(job_id).status)
+print(ms.engine.wait(ms.submit(double_values)).status)
+ms.shutdown()
 ```
 
 ## Install
 
 ```bash
-pip install ms_flow            # core: control plane + SQLite + loky
-pip install "ms_flow[ray]"     # Ray executor
+pip install ms_flow            # engine + projects: SQLite and loky
 ```
 
 ## Where to look

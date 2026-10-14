@@ -1,0 +1,119 @@
+{
+  "label": "resume count",
+  "recorded_at": "2026-10-08T23:28:32+00:00",
+  "commit": "789eef2+dirty",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        365.9036,
+        369.4581,
+        385.189,
+        393.8124,
+        382.7313
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        102.6543,
+        102.3993,
+        91.9235
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        0.0207,
+        0.0263,
+        0.0303
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        0.0173,
+        0.012,
+        0.0121
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        0.0247
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        0.0306
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        1.2391
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        0.001
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        38.0703
+      ],
+      "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.0335,
+        0.0344,
+        0.0344,
+        0.0331,
+        0.0342
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.0139,
+        0.0135,
+        0.0139,
+        0.0131,
+        0.0138
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.0341,
+        0.0347,
+        0.0336
+      ],
+      "unit": "ms"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": true,
+    "worker_death_pool_recovers": true,
+    "kill9_no_orphans": true,
+    "resume_skips_done": true,
+    "second_engine_safe": true,
+    "retry_then_done": true,
+    "hung_chunk_cut": true
+  }
+}

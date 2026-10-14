@@ -1,0 +1,127 @@
+{
+  "label": "forced batch",
+  "recorded_at": "2026-10-09T13:54:29+00:00",
+  "commit": "467e8f2",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        548.8208,
+        363.3273,
+        362.9494,
+        368.2182,
+        364.2058
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        97.6492,
+        85.7615,
+        86.5238
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        0.0311,
+        0.0421,
+        0.0374
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        0.0216,
+        0.0154,
+        0.0163
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        0.024
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        0.0297
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        1.2376
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        0.001
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        37.8398
+      ],
+      "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.0336,
+        0.034,
+        0.0327,
+        0.0323,
+        0.0338
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.0122,
+        0.0126,
+        0.0126,
+        0.012,
+        0.0119
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.0327,
+        0.0294,
+        0.0289
+      ],
+      "unit": "ms"
+    },
+    "write_long_ms": {
+      "values": [
+        0.0177,
+        0.0166,
+        0.0167
+      ],
+      "unit": "ms"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": true,
+    "worker_death_pool_recovers": true,
+    "kill9_no_orphans": true,
+    "resume_skips_done": true,
+    "second_engine_safe": true,
+    "retry_then_done": true,
+    "hung_chunk_cut": true
+  }
+}

@@ -1,0 +1,151 @@
+# 07 — Diseño de `ms_env`
+
+Estado: **aprobado por Mario, 2026-10-09**. E1 construida en ramas locales (`ms_env`: `feat/e1-target-recipes`; `ms_flow`, ms_components y AMDockVS: `refactor/ms-env`), salvo `remove`, que pasa a E2. E2 construida en la rama local `feat/e2-stamp-verify-remove` de `ms_env`, salvo `installed(host)`.
+
+## Lo que dijo Mario
+
+- `ms_env` es importante y es un paquete propio. Hace dos cosas: crea los env donde corren los programas que no son compatibles con el nuestro o piden aislamiento, y **replica el env en el remoto**.
+- También es responsable de **comprobar e instalar en el remoto la misma versión de la app** (AMDockVS) que corre en la PC. Lo que se ejecute allí tiene que ser lo mismo que hay aquí.
+- **Un solo env por host, que se actualiza**, y no un env por versión: es más fácil y más limpio. Si el mismo usuario usa dos versiones distintas de la app contra el mismo host, no se cubre.
+- El env es **por host**. En una red local con Ray se crea en cada PC, en teoría igual al que se está ejecutando. En un HPC se instala una vez en el home, que el sistema exporta a los nodos; se activa en el fichero del job. En nodos reservados cree que pasa lo mismo, sin haberlo comprobado.
+- Internet en el host: sí en el HPC. En PC de la red local no lo tiene claro, y pregunta si hay forma de replicar el env de forma íntegra, sabiendo que las versiones del sistema operativo pueden ser distintas.
+- `ms_flow` puede depender de `ms_env`, con el acceso `ssh` ahí.
+- Solo Linux. Windows queda fuera.
+
+## Lo que ya hay
+
+La mitad está escrita dentro de `ms_flow`, en lo único que sobrevivió del motor viejo en `core/executor/`.
+
+| Qué | Dónde | Estado |
+|---|---|---|
+| Receta TOML por herramienta (`[tool]`, `[locate]`, `[env]`, `[[install]]`) | `core/executor/tools.py` | En uso: AMDockVS tiene 4 (openbabel, pkasso, qvina, adgpu) |
+| Buscar una instalación que funcione: rutas del usuario, prefijo gestionado, `PATH` | `tools.locate` | En uso |
+| Crear un prefijo conda; descarga micromamba si no hay gestor | `tools._env_steps` | En uso |
+| Instalar en un hilo de la app, sin proyecto abierto | `tools.install_tool` | En uso |
+| Esperar por una herramienta: `tool:<nombre>@<destino>` en `depends_on` | `tools.dependency_state` | **Muerto**: lo leía el alimentador del motor viejo |
+| Pasos con log línea a línea | `provisioning.Step`, `run_step`, `run_steps` | En uso (diálogo de pasos de ms_components, AMDockVS) |
+| Probar un worker | `provisioning.test_steps` | En uso (editor de workers de ms_components) |
+| YAML de `ray up`, `prepare_steps`, `conda_bootstrap_command`, `in_env`, `probe_tcp`, `ray_preflight`, `prefix_python`, `prefix_command` | `provisioning.py` | **Sin llamadas** fuera del propio fichero |
+| `ssh` | `provisioning.ssh_argv` y `remote.Remote` | Dos implementaciones |
+| Env del otro lado para el runner | `resources.process.queue.python` y `.setup` | **A mano**: nadie lo crea; el runner solo exige la misma versión menor de Python |
+
+## La idea
+
+Una **receta** dice cómo saber si algo funciona y cómo instalarlo. Un **host** es dónde: esta máquina u otra a la que se entra por `ssh`. `ms_env` aplica una receta a un host.
+
+Replicar no es copiar: es **aplicar la misma receta en otro host**. Es lo que `tools.py` ya hace con las herramientas; lo nuevo es una receta para el env de la app.
+
+```mermaid
+flowchart LR
+    R["Receta<br/>TOML de la herramienta<br/>o env de la app"] --> E["ms_env.ensure(receta, host)"]
+    E --> L["Host local<br/>sh"]
+    E --> S["Host remoto<br/>ssh + sh"]
+    S --> H["PC de la red (Ray)<br/>una vez por PC"]
+    S --> C["HPC<br/>una vez, en el home"]
+```
+
+`ms_env` es la capa más baja: solo biblioteca estándar, sin Qt y sin importar `ms_flow`. `ms_flow` lo importa para su ejecutor remoto; las apps, para sus herramientas.
+
+## Piezas
+
+- **Host.** `Host(address=None)`: `run(orden, datos)` y el envío y la recogida de ficheros como flujos `tar`. Sale de `remote.Remote`, y `provisioning.ssh_argv` desaparece. Las reglas no cambian: el `ssh` del sistema con `BatchMode=yes`, solo llaves, ninguna credencial gestionada, nada escuchando del otro lado.
+- **Receta.** El formato TOML de hoy, sin cambios.
+- **Cuatro verbos.** `status(receta, host)`, `ensure(receta, host)` (crea, actualiza o no hace nada), `verify(receta, host)` (qué le falta a un env para cumplir la receta) y `remove(receta, host)`. Más `installed(host)` para listar lo que hay.
+- **Sello.** Cada prefijo instalado lleva un fichero con lo que se instaló (nombre y hash de la receta). Dice dos cosas: que el prefijo es de `ms_env` y si está al día, sin volver a resolver nada.
+
+## De quién es un env
+
+Pedido por Mario (2026-10-09): si el usuario da la ruta de su env para un programa, no se instala desde cero: se comprueba que cumple lo que pide la receta. Y `ms_env` crea, actualiza y elimina envs, con micromamba.
+
+El sello decide de quién es un prefijo, y de eso sale qué se le puede hacer:
+
+| Qué hay en el prefijo | De quién | `ensure` | `remove` |
+|---|---|---|---|
+| Nada | De nadie | Lo crea y lo sella | Nada que borrar |
+| Sello igual al de la receta | `ms_env` | Nada | Lo borra |
+| Sello distinto, o instalación a medias | `ms_env` | Lo rehace: eso es actualizar | Lo borra |
+| Algo sin sello | Usuario | Lo comprueba. Nunca lo cambia | No lo toca |
+
+- **Comprobar.** `verify` devuelve la lista de lo que no cumple, vacía si cumple: cada paquete de conda fijado en `[env]` (se mira en `conda-meta` del prefijo), cada paquete de pip fijado (se pregunta al Python del prefijo) y la orden `check` contra los ejecutables de ese prefijo. Si la lista no está vacía, `ensure` falla y la enseña; no instala nada encima.
+- **Un ejecutable suelto** que registra el usuario (no un env) solo pasa por su `check`, como hasta ahora.
+- **Actualizar es rehacer.** Se borra el prefijo y se crea de nuevo. Con versiones fijadas y la caché de paquetes de micromamba, rehacer es enlazar ficheros otra vez. Actualizar en sitio es cosa del env de la app (E3), que es grande y cambia poco.
+- **Instalación a medias.** micromamba no crea sobre una carpeta que no sea suya, así que el sello se escribe al final. Mientras dura la instalación hay una marca junto al prefijo (`{prefijo}.installing`); si la instalación se corta, la marca dice que lo que quedó es de `ms_env` y se puede rehacer.
+- **micromamba.** Los envs se crean con micromamba: el que haya en el `PATH`, y si no hay, uno que `ms_env` descarga en `{tools_home}/micromamba`. Otro gestor (conda, mamba) solo si la app lo nombra.
+- Lo que instaló una versión sin sello (E1) cuenta como del usuario: se comprueba y se usa, pero `ms_env` no lo borra.
+
+## El env de la app en el remoto
+
+Lo que corre allí es `python -m ms_flow.runner`, que importa las funciones de la app. No hace falta un runner de la app: hace falta que la app esté instalada allí **en la misma versión**.
+
+- **Uno por host**, en un prefijo fijo (`{envs_home}/{app}`), que se actualiza en sitio.
+- **Igual al de la PC.** La receta se deriva del env que está corriendo: la versión menor de Python y un fichero de restricciones con `nombre==versión` de todo lo instalado aquí (`importlib.metadata`). En el host: `pip install {app}=={versión} -c restricciones.txt`. Mismas versiones de todo sin copiar bytes, así que da igual que el sistema operativo sea otro.
+- **Comprobación al conectar.** El sello del host contra el hash de la receta local. Igual: adelante. Distinto: se actualiza.
+- **No se actualiza con jobs vivos.** Un job con clave sigue en la cola del HPC con la app cerrada (R6). Si el env cambia debajo, ese job arranca con otro código que el que lo preparó. Regla: si la cuenta tiene jobs vivos en ese host (`ms.remote_jobs()` lo sabe), no se actualiza y se dice por qué. Es la misma regla que ya vale para los ejecutores: solo cambian sin jobs activos.
+- **En desarrollo** la versión no distingue nada (el código cambia sin cambiar de número). El código local viaja como wheel construido de la fuente, y el sello lleva su hash.
+- El ejecutor remoto recibe `env=` y rellena él `@python@` y `@setup@`; escribirlos a mano sigue siendo posible.
+
+### Por host
+
+| Dónde | Cuántas veces | Quién activa |
+|---|---|---|
+| PC de la red local (Ray) | Una por PC | El arranque del worker de Ray en esa PC |
+| HPC | Una, en el home de la cuenta | La plantilla del job (`@setup@`) |
+| Nodos reservados dentro de un job | Ninguna más: ven el mismo home | La plantilla, al lanzar Ray en cada nodo |
+
+Lo de los nodos reservados es lo habitual (home compartido, y Slurm pasa el entorno a `srun`), pero se comprueba en el cluster de Mario (R5), no se da por hecho.
+
+### Sin internet en el host
+
+La receta necesita que el host llegue a conda-forge y a PyPI. Para uno que no llega hay una segunda forma de `ensure`, **empaquetar**: el env se empaqueta en la PC (`conda-pack`), viaja por el mismo `ssh` como `tar` y se desempaqueta allí.
+
+- Funciona entre distribuciones de Linux distintas: los paquetes de conda-forge traen sus bibliotecas y solo piden una glibc antigua.
+- No funciona entre arquitecturas (x86-64 a ARM) ni lleva los drivers de la GPU.
+- Son varios GB por host, una vez por versión.
+
+Se construye cuando aparezca el primer host sin internet, no antes.
+
+## Qué se mueve y qué se borra
+
+| De `ms_flow` | Destino |
+|---|---|
+| `core/executor/tools.py` | `ms_env`, menos `tool_dependency` / `dependency_state` |
+| `provisioning.Step`, `run_step`, `run_steps`, `find_environment_manager` | `ms_env` |
+| `remote.Remote` | `ms_env.Host`; `remote.py` lo importa |
+| `provisioning.test_steps` | Se queda en `ms_flow`, en `core/settings/probes.py` (prueba workers, no envs), hasta que el editor de workers se rehaga |
+| El resto de `provisioning.py` | Se borra |
+
+`core/executor/` desaparece de `ms_flow`. ms_components y AMDockVS cambian sus imports.
+
+## Fases
+
+Una rama local por fase.
+
+`remove` no entró en E1: el prefijo de una receta puede ser uno que registró el usuario (su propio OpenBabel), y sin el sello no hay forma de saber si lo instaló `ms_env`. Borrar solo lo que lleva sello.
+
+| Fase | Qué | Cómo se sabe que está |
+|---|---|---|
+| E1 | Repo `ms_env`: host, recetas, `status` / `ensure` / `remove`. Mover, no reescribir. Borrar lo muerto | Las 4 recetas de AMDockVS instalan igual que hoy; la suite de `ms_flow` pasa |
+| E2 | Sello, `verify`, actualizar, `remove`, micromamba primero. Después: `installed(host)` | Un segundo `ensure` no hace nada; una receta que cambia rehace el env; el env del usuario se comprueba y no se toca; `remove` solo borra un prefijo con sello |
+| E3 | Env de la app: receta derivada del env local, wheel en desarrollo, `env=` en el ejecutor remoto, regla de jobs vivos | Un job remoto contra el laptop de Mario sin preparar nada a mano |
+| E4 | Espera en el motor: un job dice qué herramientas necesita y no arranca hasta que están en el host | Sustituye a `tool:<nombre>@<destino>` |
+| E5 | UI en ms_components: envs y herramientas por host | — |
+| Después | Empaquetar (sin internet), contenedores, Windows | — |
+
+E1 a E3 se prueban con el laptop de Mario como host `ssh` real: es la primera vez que ese camino corre de verdad, porque hasta ahora solo se probó con `Remote(host=None)`.
+
+## Decisiones
+
+Cerradas por Mario (2026-10-09):
+
+- Paquete propio, `ms_env`, en su repo; quinto paquete en PyPI. `ms_flow` depende de él; el `ssh` vive en `ms_env`.
+- Un env de la app por host, actualizado en sitio. Dos versiones de la app contra el mismo host no se cubren.
+- El env es por host: cada PC en una red local, una vez en el home en un HPC.
+- «Igual» son las mismas versiones de todo, no los mismos bytes (fichero de restricciones).
+- Sin internet: empaquetar, cuando aparezca el primer host que lo pida.
+- El env remoto lleva la app entera, Qt incluido. No se parten las dependencias de la app: la UI no estorba allí y partirlas lo complica todo.
+- Con jobs vivos de la cuenta en ese host, el env no se actualiza.
+- Solo Linux.
+- (2026-10-10) El sitio donde se aplica una receta se llama `Host`, no `Target`.
+- (2026-10-10) Sin cerrojo: dos apps no instalan a la vez en el mismo prefijo.
+
+Abiertas: ninguna. Lo de los nodos reservados se comprueba en el cluster (R5).

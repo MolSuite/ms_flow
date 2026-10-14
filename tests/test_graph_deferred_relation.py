@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from ms_flow.api import MolSuite, graph_sink, streaming_job
+from ms_flow.api import Workspace, graph_sink, job, task
 
 
 def _patch_fake_home(monkeypatch, fake_home: Path):
@@ -20,11 +20,7 @@ def _patch_fake_home(monkeypatch, fake_home: Path):
     monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: fake_home)
 
 
-def _chunker(_params: dict, _config: dict):
-    yield {"index": 1}
-    yield {"index": 2}
-
-
+@task()
 def _run_chunk(payload: dict):
     index = int(payload["index"])
     # Three sites per molecule; the active one is the middle one, so a "take the first" or
@@ -64,9 +60,15 @@ def _sink():
     )
 
 
+@job(task=_run_chunk, output=_sink())
+def _deferred_graph_job(params, project):
+    yield {"index": 1}
+    yield {"index": 2}
+
+
 def test_deferred_relation_points_the_parent_at_its_own_child(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = MolSuite(app_id="testdeferred")
+    ms = Workspace(app_id="testdeferred")
     try:
         ms.create_or_open_project(
             name="deferred_project",
@@ -84,18 +86,7 @@ def test_deferred_relation_points_the_parent_at_its_own_child(tmp_path, monkeypa
         finally:
             conn.close()
 
-        job_id = ms.submit_job(
-            streaming_job(
-                name="deferred_graph_job",
-                run_chunk=_run_chunk,
-                chunker=_chunker,
-                output=_sink(),
-                flush_every=1,
-                store_results=False,
-            ),
-            params={},
-        )
-        assert ms.wait_for_job(job_id, poll_s=0.05)["status"] == "completed"
+        assert ms.engine.wait(ms.submit(_deferred_graph_job), 60).status == "completed"
 
         conn = sqlite3.connect(str(db_path))
         try:

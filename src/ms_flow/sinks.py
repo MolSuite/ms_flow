@@ -155,14 +155,15 @@ def file_sink(
     schema: str = "",
     meta: Optional[dict[str, Any]] = None,
 ) -> FileOutputSpec:
-    """Simple helper to persist results to a file.
+    """Simple helper to persist results to a file. A relative `path` is under the project.
 
-    `append=True` (text/binary fmt only) is what a long job needs: each flush writes only its
-    own batch. Without it the sink keeps everything produced in memory and rewrites the whole
-    file on every flush — O(N) RAM and O(N^2) IO over the job's total.
+    What a task returns is written as it comes when it is text or bytes, and as a JSON line
+    otherwise; with `fmt="json"` the file is one JSON list of what the tasks returned.
 
-    `per_batch=True` is the other bounded option: one numbered file per batch, keeping only the
-    path manifest in memory (which grows with the number of flushes, not of items).
+    `append=True` (text/binary fmt only) is what a long job needs: each group of results is
+    added to the file as it arrives. `per_batch=True` is the other bounded option: one numbered
+    file (`name_00001.ext`) for each group. With neither, everything is kept in memory and the
+    file is written once, when the job completes.
     """
     return FileOutputSpec(
         path=str(path),

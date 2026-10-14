@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID
 
-from ms_flow.core.database import ExecutorDB, ProjectStore
+from ms_flow.core.database import ProjectStore
 from ms_flow.core.database.master_models import Project
-from ms_flow.core.executor.job_snapshot import JobSnapshot
-from ms_flow.core.executor.manager import ExecutorManager
-from ms_flow.core.executor.provisioning import cluster_address, cluster_launch_needed, ray_preflight
 from ms_flow.core.project import ActiveProjectRuntime, ProjectDataContext, ProjectRuntimeState
 from ms_flow.core.project.context import ProjectContext
 from ms_flow.core.project.resources import ProjectResource
 from ms_flow.core.project.manager import SettingsProfile
-from ms_flow.core.settings.models import mb_to_bytes
-
-ACTIVE_PROJECT_JOB_STATUSES = ("pending", "pending_feed", "queued", "running", "staging", "cancel_requested")
 
 
-class MolSuiteProjectRuntimeMixin:
+class WorkspaceProjectRuntimeMixin:
     def get_project_resource_contract(self):
         return self._project_resource_contract
 
@@ -73,291 +66,28 @@ class MolSuiteProjectRuntimeMixin:
                 names.append(normalized)
         return names
 
-    def _resolve_executor_db_path(self, project_path: Path) -> Path:
-        return project_path.expanduser().resolve() / self._executor_db_relative
-
     def _resolve_project_db_path(self, project_path: Path) -> Path:
         return Path(project_path).expanduser().resolve() / "project.db"
 
-    def _register_configured_executors(
-        self,
-        executor_manager: ExecutorManager,
-        resources,
-        *,
-        allow_remote_compute: bool = True,
-    ) -> None:
-        registered_names: set[str] = set()
-        compute_backend = "loky"
-        compute_options: dict[str, Any] = {"max_workers": resources.max_processes}
-        for worker in self.settings_manager.settings.get_enabled_workers():
-            worker_type = str(getattr(worker, "type", "")).strip().lower()
-            worker_name = str(getattr(worker, "name", "")).strip()
-            if not worker_name:
-                continue
-            if worker_name in registered_names:
-                raise ValueError(f"Executor configurado duplicado: '{worker_name}'.")
-
-            if worker_type == "thread":
-                executor_manager.register_thread_executor(
-                    name=worker_name,
-                    max_workers=int(getattr(worker, "max_workers", resources.max_threads)),
-                )
-            elif worker_type == "process_pool":
-                compute_backend = "loky"
-                compute_options = {
-                    "max_workers": int(getattr(worker, "max_workers", resources.max_processes)),
-                }
-            elif worker_type == "ray":
-                ray_mode = str(getattr(worker, "mode", "external"))
-                if ray_mode == "local":
-                    ray_address = None
-                elif ray_mode == "managed":
-                    ray_address = cluster_address(worker)
-                else:
-                    ray_address = str(getattr(worker, "address", "")).strip() or None
-                compute_backend = "ray"
-                compute_options = {
-                    "ray_mode": ray_mode,
-                    "cpus": int(getattr(worker, "cpus", resources.cpus) or resources.cpus),
-                    "address": ray_address,
-                    "shared_fs": getattr(worker, "shared_fs", None),
-                    "gpu_slots_per_device": int(getattr(worker, "gpu_slots_per_device", 1) or 1),
-                    "needs_launch": cluster_launch_needed(worker),
-                }
-            elif worker_type == "hpc":
-                executor_manager.register_hpc_executor(
-                    name=worker_name,
-                    shared_fs=bool(getattr(worker, "shared_fs", False)),
-                    submit_command=getattr(worker, "submit_command", None),
-                    poll_command=getattr(worker, "poll_command", None),
-                    cancel_command=getattr(worker, "cancel_command", None),
-                    poll_interval_s=float(getattr(worker, "poll_interval_s", 2.0)),
-                    command_context=getattr(worker, "command_context", None),
-                    command_env=getattr(worker, "command_env", None),
-                    python_executable=getattr(worker, "python_executable", None),
-                )
-                self.app_logger.info(
-                    "HPC worker '%s' registered as external executor; local orchestration remains thread-backed.",
-                    worker_name,
-                )
-            else:
-                self.app_logger.warning(
-                    "Ignoring unsupported worker type '%s' for worker '%s'.",
-                    worker_type,
-                    worker_name,
-                )
-                continue
-            registered_names.add(worker_name)
-
-        if "thread" not in registered_names:
-            executor_manager.register_thread_executor(
-                name="thread",
-                max_workers=resources.max_threads,
-            )
-        # Opening a project must never block on the network. Ray is only activated
-        # here when it can be reached in ~2s; a cluster we would have to launch
-        # ourselves (ray up) or one that is down falls back to loky and is left for
-        # the user to activate from the monitor. Without this guard a stale
-        # [workers.ray] address froze the whole app at startup for ~60s inside
-        # ray.init's GCS reconnect loop.
-        self.compute_backend_fallback = ""
-        if compute_backend == "ray":
-            if not allow_remote_compute:
-                # Re-registering after a settings save must not start (nor tear down)
-                # a cluster backend: that is an explicit action in the monitor.
-                self.compute_backend_fallback = "Ray changes apply from the monitor (Executors tab)."
-                return
-            reason = self._ray_autostart_blocker(compute_options)
-            if reason:
-                self.compute_backend_fallback = reason
-                self.app_logger.warning("Ray not auto-activated: %s Falling back to loky.", reason)
-                compute_backend = "loky"
-        if compute_backend == "ray":
-            try:
-                executor_manager.activate_compute_backend(
-                    "ray",
-                    ray_mode=str(compute_options.get("ray_mode", "external")),
-                    cpus=int(compute_options.get("cpus", resources.cpus) or resources.cpus),
-                    address=compute_options.get("address"),
-                    shared_fs=compute_options.get("shared_fs"),
-                    gpu_slots_per_device=int(compute_options.get("gpu_slots_per_device", 1) or 1),
-                )
-                return
-            except Exception as exc:
-                self.compute_backend_fallback = f"Ray activation failed: {exc}"
-                self.app_logger.warning("%s Falling back to loky.", self.compute_backend_fallback)
-        executor_manager.activate_compute_backend(
-            "loky",
-            max_workers=int(compute_options.get("max_workers", resources.max_processes)),
-        )
-
-    @staticmethod
-    def _ray_autostart_blocker(compute_options: dict[str, Any]) -> str:
-        """Return an empty string when Ray may be activated inline, else the reason."""
-        address = compute_options.get("address")
-        if compute_options.get("needs_launch"):
-            error = ray_preflight(address)
-            return "" if not error else f"managed cluster is not running ({error})."
-        if str(compute_options.get("ray_mode", "external")).lower() == "local" and not address:
-            return ""
-        return ray_preflight(address)
-
-    def reload_configured_executors(self, *, allow_remote_compute: bool = False) -> dict[str, Any]:
-        """Re-apply the workers settings to the live manager (after saving settings).
-
-        ``register_*`` replaces an executor of the same name, so this is just the
-        registration pass again. Executors with running chunks make it fail loudly
-        rather than silently keeping the old configuration.
-        """
-        manager = self._require_executor_manager()
-        resources = self.settings_manager.settings.resources.local
-        self._register_configured_executors(manager, resources, allow_remote_compute=allow_remote_compute)
-        return {
-            "executors": sorted(manager.registered_executors()),
-            "fallback_reason": getattr(self, "compute_backend_fallback", ""),
-        }
-
-    def unregister_executor(self, name: str) -> None:
-        self._require_executor_manager().unregister_executor(name)
-
-    def _require_executor_manager(self) -> ExecutorManager:
-        manager = self.executor_manager
-        if manager is None:
-            raise RuntimeError("ExecutorManager is not initialised. Activate a project first.")
-        return manager
-
-    def _create_executor_manager(self, executor_db: ExecutorDB) -> ExecutorManager:
-        self.executor_logger = self.logging_manager.get_executor_logger("core")
-        resources = self.settings_manager.settings.resources.local
-        general = self.settings_manager.settings.general
-        limits = self.settings_manager.settings.operational_limits
-        executor_manager = ExecutorManager(
-            executor_db=executor_db,
-            master_db=self.master_db,
-            total_cpu=resources.cpus,
-            total_gpu=resources.gpus,
-            poll_interval=float(general.poll_interval),
-            progress_flush_interval=float(limits.progress_flush_interval_s),
-            staging_max_workers=int(limits.staging_max_workers),
-            max_inline_chunk_payload_bytes=mb_to_bytes(limits.max_inline_chunk_payload_mb),
-            max_spool_payload_bytes=mb_to_bytes(limits.max_spool_payload_mb),
-            logger=self.executor_logger,
-        )
-        executor_manager.configure_output_sink_limits(
-            flush_retries=int(limits.output_sink_flush_retries),
-            retry_backoff_s=float(limits.output_sink_retry_backoff_s),
-            max_buffer_factor=int(limits.output_sink_max_buffer_factor),
-            max_buffer_bytes=mb_to_bytes(limits.output_sink_max_buffer_mb),
-            max_payload_bytes=mb_to_bytes(limits.output_sink_max_payload_mb),
-            max_pending_chunks=int(limits.output_sink_max_pending_chunks),
-            max_pending_bytes=mb_to_bytes(limits.output_sink_max_pending_mb),
-        )
-        self._register_configured_executors(executor_manager, resources)
-        executor_manager.start()
-        return executor_manager
-
-    def _initialize_runtime_for_project(self, project_path: Path):
-        desired_executor_db = self._resolve_executor_db_path(project_path)
-        runtime = self._runtime_state
-        active_project = runtime.active_project
-        if (
-            runtime.initialized
-            and active_project is not None
-            and runtime.executor_manager is not None
-            and active_project.project_db is not None
-            and active_project.executor_db is not None
-            and active_project.executor_db.db_path == desired_executor_db
-        ):
-            return
-
-        executor_db = ExecutorDB(desired_executor_db)
-        try:
-            executor_db.purge_finished_jobs()
-        except Exception:
-            pass  # retention is disk hygiene: it must never block opening the project
-        project_db = ProjectStore()
-        executor_manager = runtime.executor_manager
-        previous_executor_db = active_project.executor_db if active_project is not None else None
-
-        if executor_manager is None:
-            executor_manager = self._create_executor_manager(executor_db)
-        else:
-            try:
-                executor_manager.rebind_executor_db(executor_db)
-            except Exception:
-                try:
-                    executor_db.dispose()
-                except Exception:
-                    pass
-                raise
-            if previous_executor_db is not None and previous_executor_db is not executor_db:
-                try:
-                    previous_executor_db.dispose()
-                except Exception:
-                    pass
-
-        self._runtime_state = ProjectRuntimeState(
-            executor_manager=executor_manager,
-            active_project=ActiveProjectRuntime(
-                context=self.active_context,
-                executor_db=executor_db,
-                project_db=project_db,
-                project_store=None,
-                executor_db_path=desired_executor_db,
-            ),
-        )
-        self.app_logger.info("MolSuite runtime listo: executor=%s", desired_executor_db)
-
     def _shutdown_runtime_stack(self):
-        runtime = self._runtime_state
-        active_project = runtime.active_project
-        try:
-            if runtime.executor_manager is not None:
-                runtime.executor_manager.stop()
-        except Exception:
-            pass
-        self.executor_logger = None
-
-        try:
-            if active_project is not None and active_project.project_db is not None:
-                active_project.project_db.disconnect()
-        except Exception:
-            pass
-
-        try:
-            if active_project is not None and active_project.executor_db is not None:
-                active_project.executor_db.dispose()
-        except Exception:
-            pass
-
-        self._runtime_state = ProjectRuntimeState()
+        self._close_project_runtime()
+        if self._engine is not None:
+            self._engine.close()
+            self._engine = self._aside = None
 
     def _close_project_runtime(self):
-        runtime = self._runtime_state
-        manager = runtime.executor_manager
-        active_project = runtime.active_project
-        executor_db = active_project.executor_db if active_project is not None else None
-
+        active_project = self._runtime_state.active_project
+        if self._flow is not None:  # before the project goes: what its jobs delivered is written first
+            self._flow = None
+            self._engine.detach("project")
         try:
             if active_project is not None and active_project.project_db is not None:
                 active_project.project_db.disconnect()
         except Exception:
             pass
-
-        if manager is not None:
-            manager.unbind_executor_db()
-
-        try:
-            if executor_db is not None:
-                executor_db.dispose()
-        except Exception:
-            pass
-
         self.logging_manager.clear_project_logging()
         self.project_logger = None
-        self._runtime_state = ProjectRuntimeState(
-            executor_manager=manager,
-        )
+        self._runtime_state = ProjectRuntimeState()
 
     def _require_runtime(self):
         if not self._runtime_state.initialized:
@@ -368,12 +98,6 @@ class MolSuiteProjectRuntimeMixin:
         if runtime is None or runtime.context is None:
             raise RuntimeError("There is no active project.")
         return runtime
-
-    def _require_executor_db(self) -> ExecutorDB:
-        executor_db = self.executor_db
-        if executor_db is None:
-            raise RuntimeError("ExecutorDB no inicializada.")
-        return executor_db
 
     def list_projects(self, page: int = 1, items_per_page: int = 20) -> list[Project]:
         return self.project_manager.repository.get_projects_paginated(page, items_per_page)
@@ -538,119 +262,26 @@ class MolSuiteProjectRuntimeMixin:
     def get_project_data_context(self) -> ProjectDataContext:
         return self.advanced.project_data_context()
 
-    def get_runtime_healthcheck(self) -> dict[str, Any]:
-        if self.executor_manager is None:
-            inactive_check = {
-                "ok": False,
-                "reason": "no_active_project",
-            }
-            return {
-                "status": "inactive",
-                "checks": {
-                    "runtime": inactive_check,
-                },
-                "core_health": {
-                    "status": "inactive",
-                    "ok": False,
-                    "checks": {"runtime": inactive_check},
-                },
-                "persistence_health": {
-                    "status": "inactive",
-                    "ok": False,
-                    "checks": {"executor_db": {"ok": False, "bound": False}},
-                },
-                "sink_health": {
-                    "status": "inactive",
-                    "ok": True,
-                    "checks": {},
-                },
-            }
-
-        health = dict(self.executor_manager.get_healthcheck())
-        if self.active_context is not None:
-            health["project_id"] = str(self.active_context.id)
-        return health
-
-    def register_hpc_executor(
-        self,
-        *,
-        name: str = "hpc",
-        shared_fs: bool = False,
-        submit_command: str | list[str] | tuple[str, ...] | None = None,
-        poll_command: str | list[str] | tuple[str, ...] | None = None,
-        cancel_command: str | list[str] | tuple[str, ...] | None = None,
-        poll_interval_s: float = 2.0,
-        command_env: dict[str, str] | None = None,
-        python_executable: str | None = None,
-    ) -> None:
-        manager = self._require_executor_manager()
-        manager.register_hpc_executor(
-            name=name,
-            shared_fs=shared_fs,
-            submit_command=submit_command,
-            poll_command=poll_command,
-            cancel_command=cancel_command,
-            poll_interval_s=poll_interval_s,
-            command_env=command_env,
-            python_executable=python_executable,
-        )
-
-    def register_ray_executor(
-        self,
-        *,
-        name: str = "ray",
-        mode: str = "external",
-        cpus: int = 0,
-        shared_fs: bool | None = None,
-        native: bool = False,
-        address: str | None = None,
-        namespace: str | None = None,
-        runtime_env: dict[str, Any] | None = None,
-        gpu_slots_per_device: int = 1,
-    ) -> None:
-        manager = self._require_executor_manager()
-        manager.register_ray_executor(
-            name=name,
-            mode=mode,
-            cpus=cpus,
-            shared_fs=shared_fs,
-            native=native,
-            address=address,
-            namespace=namespace,
-            runtime_env=runtime_env,
-            gpu_slots_per_device=gpu_slots_per_device,
-        )
-
-
     def refresh_master_db(self):
         self.master_db.reconnect()
         self.app_logger.debug("Master DB reconnected")
 
     def close_project(self, cancel_running_tasks: bool = True):
+        """Close the active project. Its jobs that have not ended are interrupted, not lost:
+        submitted again under the same key in a later session, each continues where it stopped.
+
+        With `cancel_running_tasks=False`, raises instead when one is still going on.
+        """
         if not self.active_context:
             self.settings_manager.clear_project()
             self.logging_manager.clear_project_logging()
             return
 
         context = self.active_context
-        cancel_error = None
         if cancel_running_tasks:
-            try:
-                self._cancel_project_tasks(context.id)
-                self.cancel_executor_jobs(
-                    project_id=context.id,
-                    statuses=ACTIVE_PROJECT_JOB_STATUSES,
-                )
-                self._wait_for_project_jobs_to_drain(context.id)
-            except Exception as exc:
-                cancel_error = exc
-        else:
-            remaining_jobs = self._list_active_project_jobs(context.id)
-            if remaining_jobs:
-                raise RuntimeError("The project cannot be closed while active jobs remain.")
-
-        if cancel_error is not None:
-            raise cancel_error
+            self._cancel_project_tasks(context.id)
+        elif self.get_project_activity()["jobs_active"]:
+            raise RuntimeError("The project cannot be closed while active jobs remain.")
 
         self.project_manager.close_project(context)
         self._close_project_runtime()
@@ -662,156 +293,30 @@ class MolSuiteProjectRuntimeMixin:
             extra={"project_id": str(context.id)},
         )
 
-    def list_executor_jobs(
-        self,
-        statuses: tuple[str, ...] = ("pending", "running"),
-        project_id: str | UUID | None = None,
-    ) -> list[JobSnapshot]:
-        if self.executor_manager is None:
-            return []
-
-        jobs: list[JobSnapshot] = []
-        for status in statuses:
-            jobs.extend(self.executor_manager.list_jobs(status=status))
-
-        if project_id is None:
-            return jobs
-
-        normalized_id = str(self._normalize_id(project_id))
-        return [job for job in jobs if job.project_id == normalized_id]
-
-    def cancel_executor_jobs(
-        self,
-        *,
-        project_id: str | UUID | None = None,
-        statuses: tuple[str, ...] = ACTIVE_PROJECT_JOB_STATUSES,
-    ) -> int:
-        if self.executor_manager is None:
-            return 0
-
-        jobs = self.list_executor_jobs(statuses=statuses, project_id=project_id)
-        canceled = 0
-        for job in jobs:
-            try:
-                self.executor_manager.cancel_job(job.job_id)
-                canceled += 1
-            except Exception:
-                continue
-        if canceled:
-            self.app_logger.warning(
-                "Canceled executor jobs: count=%s project_id=%s",
-                canceled,
-                project_id,
-                extra={"project_id": str(project_id) if project_id is not None else ""},
-            )
-        return canceled
-
-    def _list_active_project_jobs(self, project_id: str | UUID | None) -> list[JobSnapshot]:
-        active_jobs = self.list_executor_jobs(statuses=ACTIVE_PROJECT_JOB_STATUSES, project_id=project_id)
-        seen = {job.job_id for job in active_jobs}
-        for job in self._list_project_jobs_for_activity(project_id):
-            if job.job_id in seen:
-                continue
-            if self._job_has_pending_storage(job):
-                active_jobs.append(job)
-                seen.add(job.job_id)
-        return active_jobs
-
-    def _list_project_jobs_for_activity(self, project_id: str | UUID | None) -> list[JobSnapshot]:
-        if self.executor_manager is None:
-            return []
-        jobs = self.executor_manager.list_jobs(status=None)
-        if project_id is None:
-            return jobs
-        normalized_id = str(self._normalize_id(project_id))
-        return [job for job in jobs if job.project_id == normalized_id]
-
-    @staticmethod
-    def _job_has_pending_storage(job: JobSnapshot) -> bool:
-        return (
-            int(job.sink_lag_chunks or 0) > 0
-            or int(job.sink_lag_bytes or 0) > 0
-            or int(job.sink_buffered_items or 0) > 0
-            or int(job.sink_buffered_bytes or 0) > 0
-        )
-
-    def _wait_for_project_jobs_to_drain(
-        self,
-        project_id: str | UUID,
-        *,
-        timeout_s: float = 30.0,
-        poll_s: float | None = None,
-    ) -> None:
-        deadline = time.monotonic() + max(0.1, float(timeout_s))
-        sleep_s = poll_s
-        if sleep_s is None:
-            manager = self.executor_manager
-            sleep_s = manager.poll_interval if manager is not None else 0.1
-        sleep_s = max(0.02, float(sleep_s))
-
-        while time.monotonic() < deadline:
-            jobs = self._list_active_project_jobs(project_id)
-            if not jobs:
-                return
-            time.sleep(sleep_s)
-
-        remaining = self._list_active_project_jobs(project_id)
-        raise RuntimeError(
-            f"Could not drain the project before the timeout; active jobs remaining={len(remaining)}."
-        )
-
     def get_project_activity(self, project_id: str | UUID | None = None) -> dict[str, Any]:
-        normalized_project_id = None
-        if project_id is not None:
-            normalized_project_id = self._normalize_id(project_id)
-        elif self.active_context is not None:
-            normalized_project_id = self.active_context.id
-
-        jobs = self._list_active_project_jobs(normalized_project_id if normalized_project_id is not None else None)
-        runtime = self._runtime_state.active_project
-        cancellers = 0
-        if runtime is not None and runtime.context is not None:
-            if normalized_project_id is None or runtime.context.id == normalized_project_id:
-                cancellers = len(runtime.task_cancellers or [])
-        storage_pending_jobs = [job for job in jobs if self._job_has_pending_storage(job)]
-        sink_lag_chunks = sum(int(job.sink_lag_chunks or 0) for job in jobs)
-        sink_lag_bytes = sum(int(job.sink_lag_bytes or 0) for job in jobs)
-        sink_buffered_items = sum(int(job.sink_buffered_items or 0) for job in jobs)
-        sink_buffered_bytes = sum(int(job.sink_buffered_bytes or 0) for job in jobs)
+        """What is still going on in a project: its jobs that have not ended, and the external
+        tasks registered with `register_task_canceller`. Only the active project has any.
+        """
+        context = self.active_context
+        mine = context is not None and (project_id is None or context.id == self._normalize_id(project_id))
+        # ponytail: every recorded job of the engine counts, as the project's journal is the
+        # only one this facade attaches.
+        jobs = [
+            job
+            for job in (self._engine.jobs() if mine and self._flow is not None else ())
+            if job.key is not None and job.status in ("waiting", "running")
+        ]
+        cancellers = len(self._runtime_state.active_project.task_cancellers) if mine else 0
         active = bool(jobs or cancellers)
         return {
-            "project_id": str(normalized_project_id) if normalized_project_id is not None else None,
+            "project_id": str(project_id or context.id) if project_id or context else None,
             "active": active,
             "can_switch_project": not active,
             "jobs_active": len(jobs),
-            "job_ids": [job.job_id for job in jobs],
-            "statuses": sorted({job.status for job in jobs if job.status}),
-            "storage_pending_jobs": len(storage_pending_jobs),
-            "storage_pending_job_ids": [job.job_id for job in storage_pending_jobs],
-            "sink_lag_chunks": sink_lag_chunks,
-            "sink_lag_bytes": sink_lag_bytes,
-            "sink_buffered_items": sink_buffered_items,
-            "sink_buffered_bytes": sink_buffered_bytes,
+            "job_ids": [job.id for job in jobs],
+            "statuses": sorted({job.status for job in jobs}),
             "external_cancellers": cancellers,
         }
-
-    def get_project_switch_status(self, project_id: str | UUID | None = None) -> dict[str, Any]:
-        activity = self.get_project_activity(project_id=project_id)
-        reasons: list[str] = []
-        if int(activity.get("jobs_active", 0) or 0) > 0:
-            reasons.append("jobs_active")
-        if int(activity.get("storage_pending_jobs", 0) or 0) > 0:
-            reasons.append("storage_pending")
-        if int(activity.get("external_cancellers", 0) or 0) > 0:
-            reasons.append("external_cancellers")
-        return {
-            **activity,
-            "can_switch": not bool(activity.get("active", False)),
-            "block_reasons": reasons,
-        }
-
-    def can_switch_project(self, project_id: str | UUID | None = None) -> bool:
-        return bool(self.get_project_switch_status(project_id=project_id)["can_switch"])
 
     def _cancel_project_tasks(self, project_id: UUID):
         runtime = self._runtime_state.active_project
@@ -846,16 +351,10 @@ class MolSuiteProjectRuntimeMixin:
         self.app_logger.info("Projects deleted: count=%s delete_files=%s", len(normalized_ids), delete_files)
 
     def _activate_context(self, context: ProjectContext, touch_master: bool):
-        self._initialize_runtime_for_project(context.path)
-        runtime = self._runtime_state
-        active_project = runtime.active_project
-        if active_project is None or active_project.project_db is None:
-            raise RuntimeError("Runtime is incomplete for activating a project context.")
-
-        active_project.project_db.connect(context.path)
-        active_project.project_store = active_project.project_db
-        active_project.context = context
-        active_project.task_cancellers.clear()
+        project_db = ProjectStore()
+        project_db.connect(context.path)
+        active_project = ActiveProjectRuntime(context=context, project_db=project_db, project_store=project_db)
+        self._runtime_state = ProjectRuntimeState(active_project=active_project)
         self.logging_manager.set_project_logging(context.path)
         active_project.project_logger = self.logging_manager.get_project_logger("core")
         self.project_logger.info(
@@ -884,4 +383,4 @@ class MolSuiteProjectRuntimeMixin:
             pass
 
 
-__all__ = ["ACTIVE_PROJECT_JOB_STATUSES", "MolSuiteProjectRuntimeMixin"]
+__all__ = ["WorkspaceProjectRuntimeMixin"]
