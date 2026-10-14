@@ -929,6 +929,13 @@ class Engine:
 
     def _announce(self, job: _Job) -> None:
         try:
+            if job.journal is not None and job.status in RESUMABLE:
+                # The results it handed over before this are noted by the loop: once they are,
+                # the job that continues it under its key does not run them again.
+                noted = threading.Event()
+                self._events.put((noted.set,))
+                while not noted.wait(0.05) and self._threads[0].is_alive():
+                    pass  # a loop gone with `close` leaves them to it
             if job.journal is not None:
                 job.journal.flush()  # whoever hears that the job ended finds it on disk
             if job.on_terminal is not None:
