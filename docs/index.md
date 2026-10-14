@@ -1,82 +1,68 @@
 # ms_flow
 
-## What it is
+`ms_flow` runs the jobs of a scientific app in the app's own process: no
+broker, no daemon, no server. It works from a Qt app, a notebook or a script.
 
-`ms_flow` is the MolSuite orchestrator for scientific desktop applications,
-scripts and notebooks. It runs inside your own Python process: no broker,
-daemon or separate server is required.
+A **task** is what runs on one element. A **job** gives the elements, one by
+one, and says where the results go. The engine shares the elements out among
+the workers, keeps a journal of what is done, and continues a job that was cut
+short without running again what it had done.
 
-## What it does
-
-- Runs `input → process → output` jobs on threads, processes or distributed
-  backends (Ray).
-- Splits the input into chunks, dispatches them to executors and records the
-  state of every job, so progress can be observed while it runs.
-- Persists projects and results in SQLite, isolated per `app_id`.
-- Keeps domain and infrastructure apart: workers are plain Python functions
-  that do not need to know where the data comes from or where it goes.
-
-## Installation
-
-Requires Python 3.12 or newer.
+## Install
 
 ```bash
 pip install ms_flow
+pip install "ms_flow[ray]"   # to run on the machines of a network with Ray
 ```
 
-For distributed execution with Ray:
+The package requires Python 3.12 or newer. The desktop widgets (projects,
+job monitor) are in the separate `ms_components` package.
 
-```bash
-pip install "ms_flow[ray]"
-```
+## First use
 
-Desktop widgets (project browser, job monitor) live in the separate
-`ms_components` package.
-
-## Example
-
-The worker function must live in an importable module, so process and remote
-executors can rebuild it.
+Tasks and jobs live in a module the workers can import, never in `__main__`.
 
 `workers.py`:
 
 ```python
-def double_value(payload: dict) -> dict:
-    value = int(payload["value"])
-    return {"value": value, "double_value": value * 2}
+from ms_flow import job, table_sink, task
+
+
+@task()
+def double_value(value: int) -> dict:
+    return {"value": value, "double_value": 2 * value}
+
+
+@job(task=double_value, output=table_sink("results", columns=("value", "double_value")))
+def double_values(params, project):
+    yield from range(1000)
 ```
 
 `run.py`:
 
 ```python
-from ms_flow.api import MolSuite
-from workers import double_value
+import sqlite3
 
-ms = MolSuite(app_id="demo")
+from ms_flow import Workspace
+from workers import double_values
+
+ms = Workspace(app_id="demo")
 try:
-    ms.create_or_open_project(
-        name="demo",
-        folder="./demo-project",
-        activate=True,
-    )
-    job_id = ms.run(
-        name="double-values",
-        input=[{"value": 1}, {"value": 2}, {"value": 3}],
-        process=double_value,
-        executor="thread",
-    )
-    final = ms.wait_for_job(job_id)
-    print(final.status)  # completed
+    ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
+    with sqlite3.connect(ms.project_db.db_path) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)")
+
+    job_id = ms.submit(double_values)        # on the pool of processes of this machine
+    print(ms.engine.wait(job_id).status)     # completed
 finally:
     ms.shutdown()
 ```
 
-```bash
-python run.py
-```
+## Where next
 
-Continue with the [API guide](api_guide.md), copy a complete
-[example](examples.md), or browse the generated [API reference](api_reference.md).
+- The [guide](guide.md) explains tasks and jobs, results, following and
+  continuing jobs, where jobs run, and the engine without a project.
+- The [API reference](api_reference.md) lists the public names.
 
 ## License
 

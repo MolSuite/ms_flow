@@ -11,8 +11,7 @@ copyright = "Copyright &copy; 2026 MolSuite authors"
 # option), so internal notes must live outside docs/ to stay off the site.
 nav = [
   { "Home" = "index.md" },
-  { "API guide" = "api_guide.md" },
-  { "Examples" = "examples.md" },
+  { "Guide" = "guide.md" },
   { "API reference" = "api_reference.md" },
 ]
 

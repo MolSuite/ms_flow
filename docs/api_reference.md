@@ -1,29 +1,28 @@
 # API reference
 
-The reference below is generated directly from the current Python sources.
-Names beginning with an underscore are implementation details.
+The reference below is generated from the Python sources. Names beginning
+with an underscore are implementation details.
 
-## MolSuite
+## Workspace
 
-::: ms_flow.main.MolSuite
+::: ms_flow.main.Workspace
     options:
       inherited_members: true
-      # The mixin methods have no docstrings yet; hidden by default.
       show_if_no_docstring: true
 
-## Application runtimes
+## Tasks and jobs
 
-::: ms_flow.runtime.BaseRuntime
-
-::: ms_flow.runtime.AppRuntime
-
-## Workflow specs
-
-::: ms_flow.specs
-
-## Job templates
-
-::: ms_flow.job_templates
+::: ms_flow.engine
+    options:
+      members:
+        - task
+        - job
+        - report
+        - launched
+        - content_key
+        - writer
+        - JobSnapshot
+        - TaskSnapshot
 
 ## Sinks
 
@@ -33,14 +32,19 @@ Names beginning with an underscore are implementation details.
 
 ::: ms_flow.query
 
-## Selections
+## The engine
 
-::: ms_flow.selection
+::: ms_flow.engine
+    options:
+      members:
+        - Engine
+        - ProcessExecutor
+        - ThreadExecutor
+        - RayExecutor
+        - Flow
 
-## Progress
+## Hosts and executors
 
-::: ms_flow.progress
+::: ms_flow.core.settings.models.HostConfig
 
-## Tasking
-
-::: ms_flow.tasking
+::: ms_flow.core.settings.models.ExecutorConfig
