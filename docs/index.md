@@ -25,7 +25,16 @@ Tasks and jobs live in a module the workers can import, never in `__main__`.
 `workers.py`:
 
 ```python
+from sqlmodel import Field, SQLModel
+
 from ms_flow import job, table_sink, task
+
+
+class Result(SQLModel, table=True):      # the project creates this table when it opens
+    __tablename__ = "results"
+    id: int | None = Field(default=None, primary_key=True)
+    value: int
+    double_value: int
 
 
 @task()
@@ -41,19 +50,15 @@ def double_values(params, project):
 `run.py`:
 
 ```python
-import sqlite3
-
 from ms_flow import Workspace
-from workers import double_values
+from workers import Result, double_values
 
 ms = Workspace(app_id="demo")
 try:
     ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
-    with sqlite3.connect(ms.project_db.db_path) as db:
-        db.execute("CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)")
-
     job_id = ms.submit(double_values)        # on the pool of processes of this machine
     print(ms.engine.wait(job_id).status)     # completed
+    print(ms.project_db.count(Result))       # 1000
 finally:
     ms.shutdown()
 ```
