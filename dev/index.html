@@ -530,7 +530,16 @@ job monitor) are in the separate <code>ms_components</code> package.</p>
 <h2 id="first-use">First use<a class="headerlink" href="#first-use" title="Permanent link">&para;</a></h2>
 <p>Tasks and jobs live in a module the workers can import, never in <code>__main__</code>.</p>
 <p><code>workers.py</code>:</p>
-<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">ms_flow</span><span class="w"> </span><span class="kn">import</span> <span class="n">job</span><span class="p">,</span> <span class="n">table_sink</span><span class="p">,</span> <span class="n">task</span>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">sqlmodel</span><span class="w"> </span><span class="kn">import</span> <span class="n">Field</span><span class="p">,</span> <span class="n">SQLModel</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">ms_flow</span><span class="w"> </span><span class="kn">import</span> <span class="n">job</span><span class="p">,</span> <span class="n">table_sink</span><span class="p">,</span> <span class="n">task</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Result</span><span class="p">(</span><span class="n">SQLModel</span><span class="p">,</span> <span class="n">table</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>      <span class="c1"># the project creates this table when it opens</span>
+    <span class="n">__tablename__</span> <span class="o">=</span> <span class="s2">"results"</span>
+    <span class="nb">id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">primary_key</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">value</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">double_value</span><span class="p">:</span> <span class="nb">int</span>
 
 
 <span class="nd">@task</span><span class="p">()</span>
@@ -543,19 +552,15 @@ job monitor) are in the separate <code>ms_components</code> package.</p>
     <span class="k">yield from</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1000</span><span class="p">)</span>
 </code></pre></div>
 <p><code>run.py</code>:</p>
-<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">sqlite3</span>
-
-<span class="kn">from</span><span class="w"> </span><span class="nn">ms_flow</span><span class="w"> </span><span class="kn">import</span> <span class="n">Workspace</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">workers</span><span class="w"> </span><span class="kn">import</span> <span class="n">double_values</span>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">ms_flow</span><span class="w"> </span><span class="kn">import</span> <span class="n">Workspace</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">workers</span><span class="w"> </span><span class="kn">import</span> <span class="n">Result</span><span class="p">,</span> <span class="n">double_values</span>
 
 <span class="n">ms</span> <span class="o">=</span> <span class="n">Workspace</span><span class="p">(</span><span class="n">app_id</span><span class="o">=</span><span class="s2">"demo"</span><span class="p">)</span>
 <span class="k">try</span><span class="p">:</span>
     <span class="n">ms</span><span class="o">.</span><span class="n">create_or_open_project</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="s2">"demo"</span><span class="p">,</span> <span class="n">folder</span><span class="o">=</span><span class="s2">"./demo_project"</span><span class="p">,</span> <span class="n">activate</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-    <span class="k">with</span> <span class="n">sqlite3</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">project_db</span><span class="o">.</span><span class="n">db_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">db</span><span class="p">:</span>
-        <span class="n">db</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)"</span><span class="p">)</span>
-
     <span class="n">job_id</span> <span class="o">=</span> <span class="n">ms</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">double_values</span><span class="p">)</span>        <span class="c1"># on the pool of processes of this machine</span>
     <span class="nb">print</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">engine</span><span class="o">.</span><span class="n">wait</span><span class="p">(</span><span class="n">job_id</span><span class="p">)</span><span class="o">.</span><span class="n">status</span><span class="p">)</span>     <span class="c1"># completed</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">ms</span><span class="o">.</span><span class="n">project_db</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="n">Result</span><span class="p">))</span>       <span class="c1"># 1000</span>
 <span class="k">finally</span><span class="p">:</span>
     <span class="n">ms</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 </code></pre></div>
