@@ -24,7 +24,9 @@ parallel: `--workers` loky processes produce the payloads and one parent writes 
   VC  volumes, each worker writes one segment file per chunk and the parent keeps the references
   RT  SQLite blobs, the parent inserts
   PJ  a real ms_flow job: `Flow` on a `ProcessExecutor`, the task returns rows with `Payload`s and the `table_sink`
-      stores them through PayloadStore, group fsync included (V2-12). Import only; its reads are V3
+      stores them through PayloadStore, group fsync included (V2-12). Its reads are cold only, with the V3 readers:
+      `stream_all_current_s_cold` through `with_payloads` over `Rows` (a job's source), `export_all_current_s_cold`
+      through `iter_bytes` (an export)
 
 `durable_s` is `import_s` plus the `sync` right after it: the time until the import is on the disk. Variants that never
 sync (HT, PSN) otherwise finish in the page cache whenever the data fits in RAM.
@@ -326,7 +328,37 @@ def store_rows(start, stop):
     return rows
 
 
-def measure_job(root, n, workers, quick):
+def read_all_job(root, n, dev):
+    """PJ, cold: every current payload as a job's source reads it, then as an export does (V3)."""
+    from ms_flow.core.database import ProjectStore
+    from ms_flow.payloads import with_payloads
+    from ms_flow.query import QuerySpec, Rows
+
+    def run(read):
+        project = ProjectStore.open_at(root / "project.db")
+        try:
+            seconds, count = timed(lambda: read(project))
+        finally:
+            project.dispose()
+        assert count == n, (count, n)
+        return seconds
+
+    def source(project):
+        rows = Rows(project, QuerySpec(table="molecules"))
+        return sum(1 for row in with_payloads(project, rows, {"current_payload_id": "current"}) if row["current"])
+
+    def export(project):
+        with project.engine.connect() as c:
+            ids = [r[0] for r in c.exec_driver_sql("SELECT current_payload_id FROM molecules")]
+        return sum(1 for _, data in project.payloads.iter_bytes(ids) if data)
+
+    res = {}
+    for name, read in (("stream_all_current", source), ("export_all_current", export)):
+        res[name + "_s_cold"], res[name + "_cold_disk_mb"] = cold(root, "PJ", dev, lambda _: run(read), fresh=False)
+    return res
+
+
+def measure_job(root, n, workers, quick, dev=None):
     """PJ: the import as a job of the engine writes it (V2-12)."""
     from ms_flow.engine import Engine, Flow, ProcessExecutor, job, task
     from ms_flow.sinks import table_sink
@@ -356,6 +388,7 @@ def measure_job(root, n, workers, quick):
             res["verified_ids"] = verify_store(project, project.payloads, n, docked_hash)
     finally:
         project.dispose()
+    res.update(read_all_job(root, n, dev))
     res["files"] = sum(len(f) for _, _, f in os.walk(root))  # closed: no -wal/-shm
     res["size_mb"] = round(dir_size(root) / 1e6)
     return res
@@ -828,7 +861,7 @@ def main(argv=None):
             if variant in ("PS", "PSN"):
                 res = measure_store(variant, root, n, args.quick)
             elif variant == "PJ":
-                res = measure_job(root, n, args.workers, args.quick)
+                res = measure_job(root, n, args.workers, args.quick, dev)
             elif args.mode == "serial":
                 res = measure_serial(variant, root, n, args.quick, dev)
             else:

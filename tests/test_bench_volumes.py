@@ -63,8 +63,11 @@ def test_parallel_variants_join_the_serial_run_of_the_same_label(tmp_path):
         check_cold(record["variants"][name], PARALLEL_READS, "parallel_2x20k_random")
         assert "parallel_2x20k_random_s" in record["variants"][name]
     assert record["variants"]["parallel/VC"]["files"] == 4  # project.db and one segment per chunk of 1000
-    job = record["variants"]["parallel/PJ"]  # a real ms_flow job: import only, its reads are V3
+    job = record["variants"]["parallel/PJ"]  # a real ms_flow job; its reads are cold, with the V3 readers
     assert job["verified_ids"] == 200 and job["durable_s"] >= job["import_s"] > 0
+    for name in ("stream_all_current", "export_all_current"):
+        disk_mb = job[name + "_cold_disk_mb"]
+        assert job[name + "_s_cold"] > 0 and (disk_mb is None or disk_mb > 0), name
     assert job["files"] == 3  # project.db, a "ligands" and a "poses" volume
 
 
