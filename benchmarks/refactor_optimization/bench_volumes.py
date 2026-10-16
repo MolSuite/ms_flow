@@ -21,6 +21,13 @@ parallel: `--workers` loky processes produce the payloads and one parent writes 
   VC  volumes, each worker writes one segment file per chunk and the parent keeps the references
   RT  SQLite blobs, the parent inserts
 
+The read metrics are measured twice. The plain ones are warm, as on 2026-10-15: the files were just written, so SQLite
+and the volumes sit in the page cache. The `_cold` ones come after, each preceded by `fsync` + `posix_fadvise(DONTNEED)`
+on every file of the variant (no sudo) and run on a new reader; pool and loky workers start after the eviction.
+`stream_all_current_cold_disk_mb` and `parallel_<w>x20k_random_cold_disk_mb` (the 8x10k one in serial mode) are the
+MB the device read meanwhile, from /proc/diskstats: the proof that the cache was cold (null when the device is not
+listed, e.g. tmpfs or overlay).
+
 `--quick` verifies, for every variant, that 200 random molecules read back byte-identical to what generation produced.
 Its numbers are not comparable with a full run.
 """
@@ -356,7 +363,133 @@ def verify(read, n, is_docked, updated=frozenset()):
     return len(ids)
 
 
-def measure_serial(variant, root, n, quick):
+# --- Cold reads ---------------------------------------------------------------------
+
+def drop_cache(root):
+    """Evict every file under `root` from the page cache. fsync first: DONTNEED only drops clean pages."""
+    for p in Path(root).rglob("*"):
+        if p.is_file():
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+
+
+def sectors_read(dev):
+    """Sectors the kernel has read from block device `dev` so far (field 6 of /proc/diskstats); None if it is not listed."""
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                fields = line.split()
+                if fields[2] == dev:
+                    return int(fields[5])
+    except OSError:
+        pass
+    return None
+
+
+def cold(root, variant, dev, fn, fresh=True):
+    """One measure with nothing cached: evict the files, then run `fn(reader)` on a new reader, closed afterwards
+    (`fn(None)` when `fresh` is False: the measure starts its own readers or processes).
+    Returns (what fn returned, MB the device read meanwhile or None)."""
+    drop_cache(root)
+    before = sectors_read(dev)
+    r = Reader(variant, root) if fresh else None
+    try:
+        out = fn(r)
+    finally:
+        if r:
+            r.close()
+    after = sectors_read(dev)
+    return out, None if None in (before, after) else round((after - before) * 512 / 1e6, 1)
+
+
+# --- Reads, shared by the warm and the cold runs ------------------------------------
+
+TOP = "SELECT id FROM molecules WHERE mw < 450 AND logp < 4 ORDER BY score LIMIT 1000"
+
+
+def latency(r, mols, is_docked):
+    """p50 and p99 (us) of reading all the payloads of one molecule, over `mols`."""
+    lat = []
+    for m in mols:
+        t = time.perf_counter()
+        [r.read(m, k) for k in kinds_for(m, is_docked)]
+        lat.append((time.perf_counter() - t) * 1e6)
+    return percentiles(lat)
+
+
+def query_top(r):  # serial: (seconds, the top 1000 ids)
+    return timed(lambda: [row[0] for row in r.con.execute(TOP)])
+
+
+def sql_s(query):
+    return lambda r: timed(lambda: r.con.execute(query).fetchall())[0]
+
+
+def serial_reads(n, top, docked):
+    """The serial reads after the top query, as (metric, fn(reader) -> seconds): warm they share one reader,
+    cold each gets its own."""
+    docked_top = [i for i in top if i in docked]
+    return [
+        ("read_top1000_current_s", lambda r: timed(lambda: [r.read(i, "current") for i in top])[0]),
+        ("read_top_poses_s", lambda r: timed(lambda: [r.read(i, "pose") for i in docked_top])[0]),
+        ("stream_all_current_s", lambda r: timed(lambda: sum(len(r.read(i, "current")) for i in range(n)))[0]),
+        # ordering / filtering on the index (no payloads touched)
+        ("sort_unindexed_logp_top1000_s", sql_s("SELECT id FROM molecules WHERE mw < 500 ORDER BY logp DESC LIMIT 1000")),
+        ("count_filter_s", sql_s("SELECT count(*) FROM molecules WHERE mw BETWEEN 300 AND 400 AND logp < 3")),
+        ("page_by_score_offset_s", sql_s("SELECT id FROM molecules WHERE score IS NOT NULL ORDER BY score"
+                                         " LIMIT 200 OFFSET %d" % (n // 10))),
+    ]
+
+
+def open_and_get_mol_x(variant, root, n, is_docked):
+    """Access molecule X: a fresh reader and the first molecule. Returns (ms, the reader, which the caller closes)."""
+    t = time.perf_counter()
+    r = Reader(variant, root)
+    x = n // 2
+    [r.read(x, k) for k in kinds_for(x, is_docked)]
+    return (time.perf_counter() - t) * 1e3, r
+
+
+def serial_pool(variant, root, chunks):
+    ctx = get_context("spawn")
+    t = time.perf_counter()
+    with ctx.Pool(8, initializer=_init, initargs=(variant, str(root))) as pool:
+        pool.map(_read_many, chunks)
+    return time.perf_counter() - t
+
+
+def top_batch(r):  # parallel
+    t = time.perf_counter()
+    top = [i for (i,) in r.con.execute(TOP)]
+    r.get_many([key(i, "current") for i in top])
+    return time.perf_counter() - t
+
+
+def stream_batches(r, n):  # parallel
+    t = time.perf_counter()
+    for s in range(0, n, 10_000):
+        r.get_many([key(i, "current") for i in range(s, min(n, s + 10_000))])
+    return time.perf_counter() - t
+
+
+def loky_read(variant, root, keys, workers):  # parallel: the workers start here, after any cache drop
+    ex = get_reusable_executor(max_workers=workers, timeout=30)
+    try:
+        ex.submit(_noop).result()
+        t = time.perf_counter()
+        list(ex.map(_read_keys, [variant] * workers, [str(root)] * workers, [keys[i::workers] for i in range(workers)]))
+        return time.perf_counter() - t
+    finally:
+        ex.shutdown(wait=True, kill_workers=True)
+
+
+# --- Modes --------------------------------------------------------------------------
+
+def measure_serial(variant, root, n, quick, dev=None):
     docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
     is_docked = docked.__contains__
     res = {"n": n}
@@ -370,41 +503,17 @@ def measure_serial(variant, root, n, quick):
     reader = r2 = None
     try:
         reader = Reader(variant, root)
-        q = ("SELECT id FROM molecules WHERE mw < 450 AND logp < 4 ORDER BY score LIMIT 1000")
-        res["query_top1000_s"], top = timed(lambda: [r[0] for r in reader.con.execute(q)])
-        res["read_top1000_current_s"], _ = timed(lambda: [reader.read(i, "current") for i in top])
-        docked_top = [i for i in top if i in docked]
-        res["read_top_poses_s"], _ = timed(lambda: [reader.read(i, "pose") for i in docked_top])
-        res["stream_all_current_s"], _ = timed(lambda: sum(len(reader.read(i, "current")) for i in range(n)))
-
-        # ordering / filtering on the index (no payloads touched)
-        res["sort_unindexed_logp_top1000_s"], _ = timed(lambda: reader.con.execute(
-            "SELECT id FROM molecules WHERE mw < 500 ORDER BY logp DESC LIMIT 1000").fetchall())
-        res["count_filter_s"], _ = timed(lambda: reader.con.execute(
-            "SELECT count(*) FROM molecules WHERE mw BETWEEN 300 AND 400 AND logp < 3").fetchall())
-        res["page_by_score_offset_s"], _ = timed(lambda: reader.con.execute(
-            "SELECT id FROM molecules WHERE score IS NOT NULL ORDER BY score LIMIT 200 OFFSET %d" % (n // 10)).fetchall())
-        # access molecule X: fresh reader, first molecule, then 2000 random molecules with all their payloads
-        t = time.perf_counter()
-        r2 = Reader(variant, root)
-        x = n // 2
-        [r2.read(x, k) for k in kinds_for(x, is_docked)]
-        res["open_and_get_mol_x_ms"] = (time.perf_counter() - t) * 1e3
+        res["query_top1000_s"], top = query_top(reader)
+        reads = serial_reads(n, top, docked)
+        for name, fn in reads:
+            res[name] = fn(reader)
+        res["open_and_get_mol_x_ms"], r2 = open_and_get_mol_x(variant, root, n, is_docked)
         mols = random.Random(5).sample(range(n), min(2000, n))
-        lat = []
-        for m in mols:
-            t = time.perf_counter()
-            [r2.read(m, k) for k in kinds_for(m, is_docked)]
-            lat.append((time.perf_counter() - t) * 1e6)
-        res["get_mol_p50_us"], res["get_mol_p99_us"] = percentiles(lat)
+        res["get_mol_p50_us"], res["get_mol_p99_us"] = latency(r2, mols, is_docked)
         rng = random.Random(3)
         keys = [(m, rng.choice(["original", "current", "pdbqt"])) for m in (rng.randrange(n) for _ in range(80_000))]
         chunks = [keys[i::8] for i in range(8)]
-        ctx = get_context("spawn")
-        t = time.perf_counter()
-        with ctx.Pool(8, initializer=_init, initargs=(variant, str(root))) as pool:
-            pool.map(_read_many, chunks)
-        res["parallel_8x10k_random_s"] = time.perf_counter() - t
+        res["parallel_8x10k_random_s"] = serial_pool(variant, root, chunks)
 
         # mutation: re-prepare 5000 'current' payloads
         upd = rng.sample(range(n), min(5000, n))
@@ -423,6 +532,20 @@ def measure_serial(variant, root, n, quick):
             vol.fh.close()
         con.close()
 
+        # the same reads with nothing cached: each one evicts the files and reads through a new reader
+        for r in (reader, r2):
+            r.close()
+        (res["query_top1000_s_cold"], _), _ = cold(root, variant, dev, query_top)
+        for name, fn in reads:
+            res[name + "_cold"], mb = cold(root, variant, dev, fn)
+            if name == "stream_all_current_s":
+                res["stream_all_current_cold_disk_mb"] = mb
+        (res["open_and_get_mol_x_ms_cold"], rx), _ = cold(root, variant, dev, lambda _: open_and_get_mol_x(variant, root, n, is_docked), fresh=False)
+        rx.close()
+        (res["get_mol_p50_us_cold"], res["get_mol_p99_us_cold"]), _ = cold(root, variant, dev, lambda r: latency(r, mols, is_docked))
+        res["parallel_8x10k_random_s_cold"], res["parallel_8x10k_random_cold_disk_mb"] = cold(
+            root, variant, dev, lambda _: serial_pool(variant, root, chunks), fresh=False)
+
         if quick:  # after the mutation: it covers both the imported and the re-prepared bytes
             check = Reader(variant, root)
             try:
@@ -436,7 +559,7 @@ def measure_serial(variant, root, n, quick):
     return res
 
 
-def measure_parallel(variant, root, n, workers, quick):
+def measure_parallel(variant, root, n, workers, quick, dev=None):
     (root / "volumes").mkdir(parents=True)
     res = {"n": n, "workers": workers}
     res["import_s"] = import_parallel(variant, root, n, workers)
@@ -444,42 +567,34 @@ def measure_parallel(variant, root, n, workers, quick):
     res["files"] = sum(len(f) for _, _, f in os.walk(root))
     res["size_mb"] = round(dir_size(root) / 1e6)
 
+    mols = random.Random(5).sample(range(n), min(2000, n))
     r = Reader(variant, root)
     try:
-        mols = random.Random(5).sample(range(n), min(2000, n))
-        lat = []
-        for m in mols:
-            t = time.perf_counter()
-            [r.get(key(m, k)) for k in kinds_for(m, docked_hash)]
-            lat.append((time.perf_counter() - t) * 1e6)
-        p50, p99 = percentiles(lat)
+        p50, p99 = latency(r, mols, docked_hash)
         res["get_mol_p50_us"], res["get_mol_p99_us"] = round(p50, 1), round(p99, 1)
-
-        t = time.perf_counter()
-        top = [i for (i,) in r.con.execute("SELECT id FROM molecules WHERE mw < 450 AND logp < 4 ORDER BY score LIMIT 1000")]
-        r.get_many([key(i, "current") for i in top])
-        res["top1000_batch_s"] = time.perf_counter() - t
-
-        t = time.perf_counter()
-        for s in range(0, n, 10_000):
-            r.get_many([key(i, "current") for i in range(s, min(n, s + 10_000))])
-        res["stream_all_current_s"] = time.perf_counter() - t
-
+        res["top1000_batch_s"] = top_batch(r)
+        res["stream_all_current_s"] = stream_batches(r, n)
         rng = random.Random(3)
         keys = [key(rng.randrange(n), rng.choice(["original", "current", "pdbqt"])) for _ in range(20_000 * workers)]
-        ex = get_reusable_executor(max_workers=workers, timeout=30)
-        try:
-            ex.submit(_noop).result()
-            t = time.perf_counter()
-            list(ex.map(_read_keys, [variant] * workers, [str(root)] * workers, [keys[i::workers] for i in range(workers)]))
-            res[f"parallel_{workers}x20k_random_s"] = time.perf_counter() - t
-        finally:
-            ex.shutdown(wait=True, kill_workers=True)
-
-        if quick:
-            res["verified_ids"] = verify(r.read, n, docked_hash)
+        random_read = f"parallel_{workers}x20k_random"
+        res[random_read + "_s"] = loky_read(variant, root, keys, workers)
     finally:
         r.close()
+
+    # the same reads with nothing cached: each one evicts the files and reads through a new reader
+    (p50, p99), _ = cold(root, variant, dev, lambda r: latency(r, mols, docked_hash))
+    res["get_mol_p50_us_cold"], res["get_mol_p99_us_cold"] = round(p50, 1), round(p99, 1)
+    res["top1000_batch_s_cold"], _ = cold(root, variant, dev, top_batch)
+    res["stream_all_current_s_cold"], res["stream_all_current_cold_disk_mb"] = cold(root, variant, dev, lambda r: stream_batches(r, n))
+    res[random_read + "_s_cold"], res[random_read + "_cold_disk_mb"] = cold(
+        root, variant, dev, lambda _: loky_read(variant, root, keys, workers), fresh=False)
+
+    if quick:
+        check = Reader(variant, root)
+        try:
+            res["verified_ids"] = verify(check.read, n, docked_hash)
+        finally:
+            check.close()
     return res
 
 
@@ -513,6 +628,13 @@ def disk_info(path):
         return {"device": device, "fstype": out[1], "model": _block_model(Path(device).resolve().name)}
     except (OSError, IndexError, subprocess.SubprocessError):
         return None
+
+
+def diskstats_name(disk):
+    """The name /proc/diskstats gives the device of `disk_info`, e.g. nvme0n1p3; None for tmpfs, overlay, network."""
+    if disk and disk["device"].startswith("/dev/"):
+        return Path(disk["device"]).resolve().name
+    return None
 
 
 def mean_molecule_bytes():
@@ -556,6 +678,7 @@ def main(argv=None):
             "commit": _git("rev-parse", "--short", "HEAD") + ("+dirty" if _git("status", "--porcelain", "-uno") else ""),
             "machine": {"hostname": socket.gethostname(), "cpus": os.cpu_count(), "kernel": os.uname().release},
             "disk": disk_info(data_dir)}
+    dev = diskstats_name(meta["disk"])
 
     for variant in variants:
         need = int(n * mean_molecule_bytes() * (1.3 if variant == "RT" else 1.0))  # SQLite blobs weigh ~1.3x volumes
@@ -568,9 +691,9 @@ def main(argv=None):
         root.mkdir()
         try:
             if args.mode == "serial":
-                res = measure_serial(variant, root, n, args.quick)
+                res = measure_serial(variant, root, n, args.quick, dev)
             else:
-                res = measure_parallel(variant, root, n, args.workers, args.quick)
+                res = measure_parallel(variant, root, n, args.workers, args.quick, dev)
         finally:
             if not args.keep:
                 shutil.rmtree(root, ignore_errors=True)
