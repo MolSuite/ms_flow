@@ -4,15 +4,18 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import zlib
 from contextlib import closing
 from pathlib import Path
 
 import pytest
 
+from benchmarks.refactor_optimization import workers
 from ms_flow.core.database.project import ProjectStore
-from ms_flow.engine import File
+from ms_flow.engine import Engine, File, Flow, job, task
 from ms_flow.payloads import Payload, scratch_file, with_payloads
 from ms_flow.query import QuerySpec, Rows
+from ms_flow.sinks import table_sink
 
 
 def structure(n: int) -> bytes:
@@ -125,3 +128,37 @@ def test_reading_every_payload_keeps_memory_bounded(project):  # I8
 
     assert peak_mb(500) < 64
     assert peak_mb(100_000) > 300, "the measure would not see a source that holds everything"
+
+
+@job(task=task()(workers.uses_payloads), output=table_sink(
+    "seen", columns=("n", "got_bytes", "crc", "receptor_path", "receptor_text")))
+def far_reads(params, project):
+    receptor = project.payloads.materialize(params["receptor"], params["directory"], suffix=".pdbqt")
+    for row in with_payloads(project, Rows(project, QuerySpec(table="ligands", filters={"n__lt": 30})),
+                             {"structure_payload_id": "structure"}):
+        yield {"n": row["n"], "structure": row["structure"], "receptor": receptor}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", ["ray", "remote"])
+def test_a_task_far_away_gets_bytes_and_one_copy_of_the_receptor(project, tmp_path, name):
+    from test_payloads_jobs import _executor
+
+    add_ligands(project, 30)
+    with project.get_session() as session:
+        (receptor,) = project.payloads.put(session, [Payload(b"ATOM receptor\n", kind="pdbqt", series="receptors")])
+        session.commit()
+    with closing(sqlite3.connect(project.db_path)) as conn, conn:
+        conn.execute("CREATE TABLE seen (n INT, got_bytes INT, crc INT, receptor_path TEXT, receptor_text TEXT)")
+    here = tmp_path / "materialized"
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register(name, _executor(name, tmp_path))
+        job_id = Flow(engine, project).submit(far_reads, {"receptor": receptor, "directory": str(here)}, executor=name)
+        ended = engine.wait(job_id, 180)
+        assert ended.status == "completed", ended.error
+    with closing(sqlite3.connect(project.db_path)) as conn:
+        seen = conn.execute("SELECT n, got_bytes, crc, receptor_path, receptor_text FROM seen ORDER BY n").fetchall()
+    assert [(n, got, crc) for n, got, crc, _, _ in seen] == [(n, 1, zlib.crc32(structure(n))) for n in range(30)]
+    assert {text for *_, text in seen} == {"ATOM receptor\n"}
+    paths = {path for _, _, _, path, _ in seen}
+    assert len(paths) == 1 and paths != {str(here / f"{receptor}.pdbqt")}, "one copy, read where the task ran"
