@@ -341,6 +341,12 @@ class PayloadStore:
             raise KeyError(f"unknown payload ids: {missing[:10]}")
         return {i: self._read(i, located[i]) for i in sorted(located, key=located.__getitem__)}
 
+    def iter_bytes(self, ids: Iterable[int], window: int = READ_WINDOW):
+        """`(id, bytes)` for each id, `window` ids at a time, each window in (volume, offset) order: to export."""
+        ids = iter(ids)
+        while batch := list(islice(ids, window)):
+            yield from self.get_many(batch).items()
+
     def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str = ""):
         """The payload as the file `<directory>/<id><suffix>`, written once: what a job hands its
         tasks as a `File` (a receptor), which executors without the disk carry once per job."""

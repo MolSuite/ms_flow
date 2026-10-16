@@ -53,6 +53,14 @@ def test_a_source_with_payloads_gives_each_row_its_bytes_and_keeps_what_its_rows
     assert [row["structure"] for row in plain] == [structure(n) for n in range(3)]
 
 
+def test_iter_bytes_streams_every_id_once_in_bounded_windows(project):
+    data = add_ligands(project, 50)
+    got = list(project.payloads.iter_bytes(reversed(range(1, 51)), window=8))
+    assert sorted(got) == [(n + 1, data[n]) for n in range(50)]
+    first = [pid for pid, _ in got[:8]]
+    assert first == sorted(first)  # a window is read in (volume, offset) order
+
+
 def test_materialize_writes_the_file_once_and_names_it_as_a_file(project, tmp_path):
     add_ligands(project, 3)
     path = project.payloads.materialize(2, tmp_path / "job", suffix=".sdf")
