@@ -34,11 +34,24 @@ def rows(project, sql):
         return conn.execute(sql).fetchall()
 
 
-def run(project, job, params=None):
+def run(project, job, params=None, status="completed"):
     with Engine(cpus=4, mem_mb=0) as engine:
         engine.register("thread", ThreadExecutor(4))
         job_id = Flow(engine, project).submit(job, params, executor="thread")
-        assert engine.wait(job_id, 60).status == "completed"
+        ended = engine.wait(job_id, 60)
+        assert ended.status == status, ended.error
+        return ended
+
+
+def assert_clean(project, referenced):
+    """Every payload is referenced once, and every volume ends where its last payload does: nothing half."""
+    assert rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(referenced,)]
+    ends = rows(project, f"SELECT v.id, COALESCE(MAX(p.\"offset\" + 16 + p.length), 32) FROM ms_volumes v"
+                         " LEFT JOIN ms_payloads p ON p.volume_id = v.id GROUP BY v.id")
+    assert {project.payloads.path(vid).stat().st_size for vid, _ in ends} and all(
+        project.payloads.path(vid).stat().st_size == end for vid, end in ends)
+    assert sorted(path.name for path in project.payloads.directory.iterdir()) == sorted(
+        project.payloads.path(vid).name for vid, _ in ends)
 
 
 @task()
@@ -128,3 +141,23 @@ def test_every_executor_leaves_the_same_rows_and_bytes(tmp_path):
         project.dispose()
     assert seen["process"] == [(n, workers.structure(n)["structure_payload_id"].data) for n in range(30)]
     assert seen["thread"] == seen["ray"] == seen["remote"] == seen["process"]
+
+
+@task()
+def fails_on_fives(n: int) -> dict:
+    if n % 5 == 0:
+        raise RuntimeError("no structure")
+    return ligand(n)
+
+
+@job(task=fails_on_fives, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+def some_fail(params, project):
+    yield from range(params["n"])
+
+
+def test_a_task_that_fails_leaves_nothing(project):  # F1
+    ended = run(project, some_fail, {"n": 20}, status="completed_with_errors")
+    assert ended.chunks_failed == 4
+    assert sorted(n for (n,) in rows(project, "SELECT n FROM ligands")) == [n for n in range(20) if n % 5]
+    assert_clean(project, 16)
+
