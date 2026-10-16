@@ -42,3 +42,74 @@ def test_payload_tables_exist_with_autoincrement_and_enforced_fk(project):
     with pytest.raises(sqlite3.IntegrityError):  # a payload still referenced
         conn.execute("DELETE FROM ms_payloads WHERE id = 1")
     conn.close()
+
+
+# -- V1-2 writer ------------------------------------------------------------
+
+import struct
+import zlib
+
+from ms_flow import payloads as P
+from ms_flow.payloads import Payload, PayloadStore
+
+
+def _put(store, project, items):
+    with project.get_session() as session:
+        ids = store.put(session, items)
+        session.commit()
+    return ids
+
+
+def _rows(project, sql, params=()):
+    with project.engine.connect() as c:
+        return c.exec_driver_sql(sql, params).fetchall()
+
+
+def test_put_writes_volume_header_and_needles(project):
+    store = PayloadStore(project)
+    ids = _put(store, project, [Payload(b"abc", kind="sdf", series="ligands"), Payload(b"", series="ligands")])
+    store.close()
+    (vid, off, length, crc, kind), second = _rows(
+        project, 'SELECT volume_id, "offset", length, crc32, kind FROM ms_payloads ORDER BY id'
+    )
+    raw = store.path(vid).read_bytes()
+    magic, version, _, header_vid, series = struct.unpack_from("<5sBHQ16s", raw)
+    assert (magic, version, header_vid, series.rstrip(b"\0")) == (b"MSVOL", 1, vid, b"ligands")
+    assert struct.unpack_from("<IIIHH", raw, off) == (zlib.crc32(b"abc"), 3, 3, 0, 0)
+    assert raw[off + 16 : off + 16 + length] == b"abc" and crc == zlib.crc32(b"abc") and kind == "sdf"
+    assert second[1] == off + 16 + 3 and second[2] == 0  # a 0-byte payload is a bare needle
+    assert len(raw) == second[1] + 16
+    assert _rows(project, "SELECT state, size FROM ms_volumes") == [("active", len(raw))]
+    assert len(ids) == 2 and ids[1] == ids[0] + 1
+
+
+def test_volume_switches_at_size_and_large_payload_goes_alone(project, monkeypatch):
+    monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 2 * (16 + 10))
+    store = PayloadStore(project)
+    _put(store, project, [Payload(b"x" * 10)] * 3 + [Payload(b"y" * 500), Payload(b"z" * 10)])
+    store.close()
+    placed = _rows(project, 'SELECT volume_id, "offset", length FROM ms_payloads ORDER BY id')
+    assert [(v, n) for v, _, n in placed] == [(1, 10), (1, 10), (2, 10), (3, 500), (4, 10)]
+    stored = [store.path(v).read_bytes()[o + 16 : o + 16 + n] for v, o, n in placed]
+    assert stored == [b"x" * 10] * 3 + [b"y" * 500, b"z" * 10]
+    assert _rows(project, "SELECT id, state FROM ms_volumes ORDER BY id") == [
+        (1, "sealed"), (2, "sealed"), (3, "sealed"), (4, "active")
+    ]
+
+
+def test_one_active_volume_per_series(project):
+    store = PayloadStore(project)
+    _put(store, project, [Payload(b"a", series="ligands"), Payload(b"b", series="poses"), Payload(b"c", series="ligands")])
+    store.close()
+    assert _rows(project, "SELECT volume_id FROM ms_payloads ORDER BY id") == [(1,), (2,), (1,)]
+    assert _rows(project, "SELECT series FROM ms_volumes ORDER BY id") == [("ligands",), ("poses",)]
+
+
+def test_volume_file_left_by_a_dead_transaction_is_never_reused(project):
+    store = PayloadStore(project)
+    store.directory.mkdir()
+    store.path(1).write_bytes(b"leftover")
+    _put(store, project, [Payload(b"a")])
+    store.close()
+    assert _rows(project, "SELECT id FROM ms_volumes") == [(2,)]
+    assert store.path(1).read_bytes() == b"leftover"
