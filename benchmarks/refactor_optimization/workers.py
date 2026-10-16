@@ -79,7 +79,7 @@ def store_chunk(bounds):
     """`bench_volumes` PJ: the molecules `[start, stop)` as rows with their `Payload`s."""
     from benchmarks.refactor_optimization import bench_volumes
 
-    return bench_volumes.store_rows(*bounds)
+    return bench_volumes.store_rows(*bounds)  # (start, stop, config)
 
 
 def packs_with_dictionary(element: dict) -> dict:
