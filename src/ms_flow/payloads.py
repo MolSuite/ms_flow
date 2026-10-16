@@ -464,8 +464,57 @@ class PayloadStore:
         cache = _codecs.__dict__.setdefault("decompressors", {})
         key = (self.directory, dict_id)
         if key not in cache:
-            cache[key] = zstandard.ZstdDecompressor()
+            dict_data = None
+            if dict_id:
+                path = self.directory / "dicts" / f"{dict_id}.zdict"
+                try:
+                    dict_data = zstandard.ZstdCompressionDict(path.read_bytes())
+                except FileNotFoundError:
+                    raise PayloadCorrupt(payload_id, f"its zstd dictionary {path} is missing") from None
+            cache[key] = zstandard.ZstdDecompressor(dict_data=dict_data)
         return cache[key]
+
+    # -- dictionaries ----------------------------------------------------
+
+    def train_dictionary(self, series: str, samples: int = DICT_SAMPLES, size: int = DICT_SIZE):
+        """Train a zstd dictionary on `samples` payloads spread over `series` (the head of a
+        library is not like the rest of it) and make it the series' current one: a `File`."""
+        import random
+
+        from ms_flow.engine.files import File
+
+        with self.engine.connect() as conn:
+            ids = [r[0] for r in conn.exec_driver_sql(
+                "SELECT p.id FROM ms_payloads p JOIN ms_volumes v ON v.id = p.volume_id WHERE v.series = ?",
+                (series,))]
+        if len(ids) < 100:
+            raise ValueError(f"series {series!r} has {len(ids)} payloads; a dictionary needs a few thousand")
+        picked = sorted(random.Random(0).sample(ids, min(samples, len(ids))))
+        data = [b for _, b in self.iter_bytes(picked)]
+        with self.engine.begin() as conn:
+            dict_id = conn.exec_driver_sql(
+                "INSERT INTO ms_payload_dicts (series, samples, created_at) VALUES (?, ?, ?)",
+                (series, len(data), datetime.now().isoformat(" "))).lastrowid
+            trained = _zstd().train_dictionary(size, data, dict_id=dict_id)
+            path = self.directory / "dicts" / f"{dict_id}.zdict"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(path.name + ".part")
+            with open(part, "wb") as file:
+                file.write(trained.as_bytes())
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(part, path)
+            _fsync_dir(path.parent)
+        return File(path)
+
+    def dictionary(self, series: str):
+        """The current zstd dictionary of `series` as a `File`, or None if it has none yet."""
+        from ms_flow.engine.files import File
+
+        with self.engine.connect() as conn:
+            row = conn.exec_driver_sql(
+                "SELECT max(id) FROM ms_payload_dicts WHERE series = ?", (series,)).scalar()
+        return None if row is None else File(self.directory / "dicts" / f"{row}.zdict")
 
     def _open(self, volume_id: int) -> list:
         with self._fd_lock:
