@@ -46,6 +46,19 @@ NEEDLE = _NEEDLE.size
 _IOV_MAX = 1024
 _datasync = getattr(os, "fdatasync", os.fsync)  # macOS has no fdatasync
 
+# Crash tests (V2-9): `MSFLOW_PAYLOADS_FAULT=<point>[:<n>]` kills the process the n-th time a
+# write reaches `appended` (bytes in, not synced), `synced` (not committed) or `committed`.
+_FAULT_POINT, _, _FAULT_AT = os.environ.get("MSFLOW_PAYLOADS_FAULT", "").partition(":")
+_fault_seen = 0
+
+
+def _fault(point: str) -> None:
+    global _fault_seen
+    if point == _FAULT_POINT:
+        _fault_seen += 1
+        if _fault_seen >= int(_FAULT_AT or 1):
+            os._exit(137)
+
 
 class PayloadCorrupt(Exception):
     """The stored bytes of a payload are missing, truncated or fail their checksum."""
@@ -186,12 +199,14 @@ class PayloadStore:
                 except OSError as error:  # a full disk: the caller's rollback cuts what got in
                     raise OSError(error.errno, f"cannot write payloads to {self.path(volume.id)}: "
                                                f"{error.strerror}") from error
+            _fault("appended")
             for volume in pending:
                 _datasync(volume.fd)
                 cursor.execute("UPDATE ms_volumes SET size = ? WHERE id = ?", (volume.end, volume.id))
             if tx.dir_dirty:  # a new volume file must survive a crash too
                 _fsync_dir(self.directory)
                 tx.dir_dirty = False
+            _fault("synced")
             ids = []
             for row in placed:
                 cursor.execute(
@@ -223,6 +238,7 @@ class PayloadStore:
             for tx in self._transactions.values():
                 if tx.session is session:
                     tx.committed = True
+        _fault("committed")
 
     def _after_transaction_end(self, session: Any, transaction: Any) -> None:
         with self._lock:

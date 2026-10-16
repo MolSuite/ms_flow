@@ -245,3 +245,63 @@ def test_a_full_disk_fails_the_elements_clearly_and_leaves_nothing_half(project)
     assert_clean(project, written)
     assert all(project.payloads.get(pid) == bytes([n]) * 100_000
                for n, pid in rows(project, "SELECT n, structure_payload_id FROM ligands"))
+
+
+@task()
+def slow_ligand(n: int) -> dict:
+    import time
+
+    time.sleep(0.05)  # results in many groups, and the 4th past the journal's first write (every 50 ms)
+    return ligand(n)
+
+
+@job(task=slow_ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+def resumable(params, project):
+    """Skips the ligands already stored: the idempotency an app owes a job that may run again (F5)."""
+    with closing(sqlite3.connect(project.db_path)) as conn:
+        done = {n for (n,) in conn.execute("SELECT n FROM ligands")}
+    yield from (n for n in range(params["n"]) if n not in done)
+
+
+_KILLED = """
+import sys
+sys.path[:0] = sys.argv[3].split(":")
+from ms_flow.core.database.project import ProjectStore
+from ms_flow.engine import Engine, Flow, ThreadExecutor
+import test_payloads_jobs as here
+
+project = ProjectStore.open_at(sys.argv[1])
+with Engine(cpus=2, mem_mb=0) as engine:
+    engine.attach("project", sys.argv[2])
+    engine.register("thread", ThreadExecutor(2))
+    engine.wait(Flow(engine, project).submit(here.resumable, {"n": 60}, executor="thread", journal="project",
+                                             key="cut"), 60)
+print("never killed")
+"""
+
+
+@pytest.mark.parametrize("point", ["appended", "synced", "committed"])
+def test_a_writer_killed_anywhere_opens_clean_and_resumes_to_one_payload_per_row(project, tmp_path, point):  # F3-F5
+    import os
+    import subprocess
+
+    journal = tmp_path / "executor.db"
+    path = os.pathsep.join([str(Path(__file__).parent), *sys.path])
+    out = subprocess.run([sys.executable, "-c", _KILLED, str(project.db_path), str(journal), path],
+                         env={**os.environ, "MSFLOW_PAYLOADS_FAULT": f"{point}:4"}, capture_output=True, text=True,
+                         timeout=120)
+    assert out.returncode == 137, out.stdout + out.stderr
+
+    committed = rows(project, "SELECT COUNT(*) FROM ligands")[0][0]
+    assert 0 < committed < 60
+    assert_clean(project, committed)  # the uncommitted tail of the killed writer is cut on open
+
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.attach("project", journal)
+        engine.register("thread", ThreadExecutor(2))
+        again = engine.wait(Flow(engine, project).resume("cut", journal="project"), 60)
+        assert again.status == "completed", again.error
+    assert rows(project, "SELECT COUNT(*), COUNT(DISTINCT n) FROM ligands") == [(60, 60)]
+    assert_clean(project, 60)
+    got = project.payloads.get_many([pid for _, pid in rows(project, "SELECT n, structure_payload_id FROM ligands")])
+    assert sorted(got.values()) == sorted(structure(n) for n in range(60))
