@@ -23,6 +23,7 @@ from ms_flow.core.database.project_records import (
     ProjectStoreCapabilities,
 )
 from ms_flow.core.database.sqlite_utils import compile_count, compile_select, normalize_identifier
+from ms_flow.payloads import Payload
 
 
 class SessionProvider(Protocol):
@@ -601,6 +602,15 @@ class _ProjectStoreSqliteOps:
             self._graph_table_cache[cache_key] = cached
         return cached
 
+    def _put_payloads(self, session, rows: Iterator[dict[str, Any]]) -> None:
+        """Swap each `Payload` in `rows` for the id it gets, stored in the transaction of the rows:
+        its bytes are on disk before the rows commit, and gone again if they don't (I1, I2)."""
+        found = [(row, key) for row in rows for key, value in row.items() if isinstance(value, Payload)]
+        if found:
+            ids = self._db.payloads.put(session, [row[key] for row, key in found])
+            for (row, key), payload_id in zip(found, ids):
+                row[key] = payload_id
+
     def bulk_insert_rows(self, request: ProjectBulkInsertRequest) -> ProjectBulkInsertResult:
         rows = [dict(row) for row in request.rows]
         if not rows:
@@ -631,6 +641,7 @@ class _ProjectStoreSqliteOps:
                 )
 
             try:
+                self._put_payloads(session, iter(rows))
                 if request.write_mode == "upsert":
                     if model is None:
                         raise DataContractError("write_mode='upsert' requires a model_path.")
@@ -744,6 +755,7 @@ class _ProjectStoreSqliteOps:
                 )
 
             try:
+                self._put_payloads(session, (row for rows in graph_payload.values() for row in rows))
                 ref_maps: dict[str, dict[str, Any]] = {node_name: {} for node_name in nodes_by_name}
                 inserted_counts: dict[str, int] = {}
                 pending_deferred: list[tuple[dict[str, Any], str, str]] = []

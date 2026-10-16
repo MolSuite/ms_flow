@@ -243,7 +243,7 @@ def volumes_view(records: list[dict]) -> dict:
                     pct = 100 * (b / a - 1)
                     row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
             drift["rows"].append(row)
-    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records)}
+    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref)}
 
 
 def _fsync_cost(records: list[dict]) -> list[dict]:
@@ -258,6 +258,22 @@ def _fsync_cost(records: list[dict]) -> list[dict]:
             fsync = pct(d["PS"], d["PSN"]) if d["PS"] and d["PSN"] else pct(v["PS"], v["PSN"])
             out.append({"label": rec["label"], **v, "fsync_pct": fsync, "vs_ht_pct": pct(v["PS"], v["HT"]),
                         "vs_ht_durable_pct": pct(d["PS"], d["HT"]), "flag": fsync > VOL_MARGIN_PCT})
+    return out
+
+
+def _job_cost(records: list[dict], ref: dict | None) -> list[dict]:
+    """V2-12: per run with PJ, the import through a real job against VP of VOL_BASE (the criterion) and of the same run."""
+    pct = lambda a, b: round(100 * (a / b - 1), 1) if a and b else None
+    base = ((ref or {}).get("variants") or {}).get("parallel/VP", {}).get("import_s")
+    out = []
+    for rec in records:
+        pj, vp = (rec["variants"].get(f"parallel/{k}", {}) for k in ("PJ", "VP"))
+        if pj.get("import_s"):
+            vs_base = pct(pj["import_s"], base)
+            out.append({"label": rec["label"], "PJ": pj["import_s"], "PJ_durable": pj.get("durable_s"), "VP_base": base,
+                        "vs_base_pct": vs_base, "VP": vp.get("import_s"), "vs_vp_pct": pct(pj["import_s"], vp.get("import_s")),
+                        "vs_vp_durable_pct": pct(pj.get("durable_s"), vp.get("durable_s")),
+                        "flag": vs_base is not None and vs_base > VOL_MARGIN_PCT})
     return out
 
 
@@ -291,6 +307,9 @@ def _self_check() -> None:
                "serial/HT": {**new["serial/HT"], "durable_s": 0.5}}
     (cost,) = volumes_view([vrec("v1", "2026-11-01", durable)])["fsync"]
     assert (cost["fsync_pct"], cost["vs_ht_pct"], cost["vs_ht_durable_pct"], cost["flag"]) == (5.0, -99.2, 110.0, False)
+    jobbed = {"parallel/PJ": {"import_s": 150.0, "durable_s": 160.0}, "parallel/VP": {"import_s": 125.0, "durable_s": 160.0}}
+    (cost,) = volumes_view([vrec("v2", "2026-11-02", jobbed), vrec(VOL_BASE, "2026-10-15", {"parallel/VP": {"import_s": 120.0}})])["job"]
+    assert (cost["vs_base_pct"], cost["vs_vp_pct"], cost["vs_vp_durable_pct"], cost["flag"]) == (25.0, 20.0, 0.0, True)
 
 
 _self_check()
@@ -439,13 +458,14 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <h2>Volumes</h2>
   <p class="sub"><code>bench_volumes.py</code> stores molecule payloads two ways and times the same reads on both: SQLite blobs
     (<b>RT</b>) against append-only volumes (serial: <b>HT</b> no fsync, <b>H</b> fsync per shard; parallel: <b>VP</b> the parent
-    writes, <b>VC</b> one segment per chunk; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
+    writes, <b>VC</b> one segment per chunk, <b>PJ</b> a real ms_flow job whose rows carry <code>Payload</code>s; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
     without it). <b>Warm</b> reads run right after the import, with the data in the page cache;
     <b>cold</b> ones run after <code>fsync</code> and <code>posix_fadvise(DONTNEED)</code> on every file, so they come from the disk.
     A blank cell was not measured (the 2026-10-15 run has no cold reads). Plan: <a href="08-plan-volumenes.md">08-plan-volumenes.md</a>.</p>
   <div class="scroll" id="volumes"></div>
   <div class="scroll" id="drift"></div>
   <div class="scroll" id="fsync"></div>
+  <div class="scroll" id="job"></div>
 </div>
 
 <div class="card">
@@ -568,6 +588,15 @@ function volumes(host, drift) {
     + '<p class="note">fsync cost: PS against PSN of the same run, import + sync when the run has it. Red: the fsync costs more than 10 % of the import, the limit of V1 (then D3 is revisited). HT never syncs, so its import s ends in the page cache; import + sync compares both on the disk.</p>';
 }
 
+function jobs() {
+  const c = D.volumes.job, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
+  document.getElementById('job').innerHTML = !c.length ? '' : `<h3>Through a job (V2)</h3><table><tr><th class="l">Run</th><th class="b">PJ import s</th>`
+    + `<th>VP import s, ${esc(D.volumes.base)}</th><th>PJ vs it</th><th>VP import s, same run</th><th>PJ vs it</th><th>PJ import + sync s</th><th>PJ vs VP, import + sync</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td class="b">${f(r.PJ)}</td><td>${f(r.VP_base)}</td><td class="${r.flag ? 'bad' : 'muted'}">${pc(r.vs_base_pct)}</td>`
+      + `<td>${f(r.VP)}</td><td>${pc(r.vs_vp_pct)}</td><td>${f(r.PJ_durable)}</td><td>${pc(r.vs_vp_durable_pct)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">PJ: the import as an ms_flow job (<code>Flow</code>, <code>ProcessExecutor</code>, <code>table_sink</code>), with the group fsync of every commit. Red: more than 10 % over VP of the base run, the limit of V2-12. VP never syncs: import + sync compares both on the disk.</p>';
+}
+
 function table(host) {
   host.innerHTML = '<table style="font-size:12px"><tr><th>Step</th><th>PR</th><th class="l">Commit</th><th class="l">Date</th>'
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
@@ -594,7 +623,7 @@ chart(document.getElementById('chart'));
 checks(document.getElementById('checks'));
 findings(document.getElementById('findings'));
 table(document.getElementById('table'));
-if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); }
+if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); }
 document.getElementById('how').innerHTML = D.metrics.map(m => `<p class="note"><b>${m.title.replace(/ \(.*/, '')}.</b> ${m.what.replace(/`([^`]+)`/g, '<code>$1</code>')}</p>`).join('');
 </script>
 </body>

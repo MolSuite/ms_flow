@@ -23,6 +23,8 @@ parallel: `--workers` loky processes produce the payloads and one parent writes 
   VP  volumes, the parent appends the bytes that come back with each result
   VC  volumes, each worker writes one segment file per chunk and the parent keeps the references
   RT  SQLite blobs, the parent inserts
+  PJ  a real ms_flow job: `Flow` on a `ProcessExecutor`, the task returns rows with `Payload`s and the `table_sink`
+      stores them through PayloadStore, group fsync included (V2-12). Import only; its reads are V3
 
 `durable_s` is `import_s` plus the `sync` right after it: the time until the import is on the disk. Variants that never
 sync (HT, PSN) otherwise finish in the page cache whenever the data fits in RAM.
@@ -64,7 +66,7 @@ VOL_MAX = 256 << 20
 FLUSH_EVERY = 16  # results per index commit in the parallel import, as ms_flow output_flush_every
 DOCKED_FRACTION = 0.2
 SPARE = 1_500_000_000  # bytes that must stay free after a variant
-VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT")}
+VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT", "PJ")}
 # The payloads come from this pool; seeded, so every process (a loky worker, a test) produces the same bytes.
 _POOL = random.Random(0).randbytes(32768).hex().encode()
 
@@ -279,12 +281,10 @@ def import_parallel(variant, root, n, workers):
 
 # --- Reader -------------------------------------------------------------------------
 
-def measure_store(variant, root, n, quick):
-    """PS/PSN: the import through PayloadStore, the way a job's writer will do it."""
-    from ms_flow import payloads
+def store_project(root):
+    """PS/PSN/PJ: a real project.db whose `molecules` table references `ms_payloads`, as an app declares it."""
     from ms_flow.core.database import ProjectStore
 
-    docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
     project = ProjectStore.open_at(root / "project.db")
     with project.engine.begin() as c:
         c.exec_driver_sql("CREATE TABLE molecules(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL, "
@@ -292,6 +292,81 @@ def measure_store(variant, root, n, quick):
         c.exec_driver_sql("CREATE INDEX ix_score ON molecules(score)")
         for k in KINDS:
             c.exec_driver_sql(f"CREATE INDEX ix_{k} ON molecules({k}_payload_id)")
+    return project
+
+
+def verify_store(project, store, n, is_docked):
+    """--quick: 200 random molecules have exactly the payloads they should, byte-identical."""
+    mols = random.Random(4).sample(range(n), min(200, n))
+    with project.engine.connect() as c:
+        refs = {r[0]: r[1:] for r in c.exec_driver_sql("SELECT id, " + ", ".join(f"{k}_payload_id" for k in KINDS)
+                                                         + " FROM molecules")}
+    assert len(refs) == n
+    for i in mols:
+        for k, pid in zip(KINDS, refs[i]):
+            assert (pid is not None) == (k in kinds_for(i, is_docked))
+            assert pid is None or store.get(pid) == payload(i, k), (i, k)
+    return len(mols)
+
+
+def store_rows(start, stop):
+    """PJ, in a worker: the rows of one chunk, each with its `Payload`s, as an AMDockVS task would return them."""
+    from ms_flow.payloads import Payload
+
+    rng = random.Random(start)
+    rows = []
+    for i in range(start, stop):
+        row = {"id": i, "mw": rng.uniform(150, 700), "logp": rng.uniform(-2, 7),
+               "score": rng.uniform(-12, -3) if docked_hash(i) else None}
+        for k in KINDS:
+            row[f"{k}_payload_id"] = None
+        for k in kinds_for(i, docked_hash):
+            row[f"{k}_payload_id"] = Payload(payload(i, k), kind=k, series="poses" if k == "pose" else "ligands")
+        rows.append(row)
+    return rows
+
+
+def measure_job(root, n, workers, quick):
+    """PJ: the import as a job of the engine writes it (V2-12)."""
+    from ms_flow.engine import Engine, Flow, ProcessExecutor, job, task
+    from ms_flow.sinks import table_sink
+
+    from benchmarks.refactor_optimization import workers as tasks
+
+    store_chunk = task()(tasks.store_chunk)
+    project = store_project(root)
+    output = table_sink("molecules", columns=("id", "mw", "logp", "score", *(f"{k}_payload_id" for k in KINDS)))
+    chunks = job(task=store_chunk, output=output)(
+        lambda params, project: [(i, min(i + CHUNK, n)) for i in range(0, n, CHUNK)])
+    try:
+        with Engine(cpus=workers, mem_mb=0) as engine:
+            engine.register("process", ProcessExecutor(workers))
+            flow = Flow(engine, project)
+            warm = flow.submit(job(task=store_chunk)(lambda params, project: [(0, 0)] * workers))
+            engine.wait(warm, 120)  # workers up before the clock starts
+            t = time.perf_counter()
+            ended = engine.wait(flow.submit(chunks), 3600)
+            elapsed = time.perf_counter() - t
+            assert ended.status == "completed", ended.error
+        with project.engine.connect() as c:
+            c.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+        res = {"n": n, "workers": workers, "import_s": elapsed}
+        res["durable_s"] = res["import_s"] + timed_sync()
+        if quick:
+            res["verified_ids"] = verify_store(project, project.payloads, n, docked_hash)
+    finally:
+        project.dispose()
+    res["files"] = sum(len(f) for _, _, f in os.walk(root))  # closed: no -wal/-shm
+    res["size_mb"] = round(dir_size(root) / 1e6)
+    return res
+
+
+def measure_store(variant, root, n, quick):
+    """PS/PSN: the import through PayloadStore, the way a job's writer will do it."""
+    from ms_flow import payloads
+
+    docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
+    project = store_project(root)
     real_sync = payloads._datasync
     if variant == "PSN":
         payloads._datasync = lambda fd: None
@@ -315,15 +390,7 @@ def measure_store(variant, root, n, quick):
         res = {"n": n, "import_s": time.perf_counter() - t}
         res["durable_s"] = res["import_s"] + timed_sync()
         if quick:
-            mols = random.Random(4).sample(range(n), min(200, n))
-            with project.engine.connect() as c:
-                refs = {r[0]: r[1:] for r in c.exec_driver_sql("SELECT id, " + ", ".join(f"{k}_payload_id" for k in KINDS)
-                                                                 + " FROM molecules")}
-            for i in mols:
-                for k, pid in zip(KINDS, refs[i]):
-                    assert (pid is not None) == (k in kinds_for(i, docked.__contains__))
-                    assert pid is None or store.get(pid) == payload(i, k), (i, k)
-            res["verified_ids"] = len(mols)
+            res["verified_ids"] = verify_store(project, store, n, docked.__contains__)
     finally:
         store.close()
         payloads._datasync = real_sync
@@ -760,6 +827,8 @@ def main(argv=None):
         try:
             if variant in ("PS", "PSN"):
                 res = measure_store(variant, root, n, args.quick)
+            elif variant == "PJ":
+                res = measure_job(root, n, args.workers, args.quick)
             elif args.mode == "serial":
                 res = measure_serial(variant, root, n, args.quick, dev)
             else:
