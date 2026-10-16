@@ -293,3 +293,59 @@ def test_corrupt_bytes_raise_payload_corrupt_never_return_data(project):
     with pytest.raises(P.PayloadCorrupt, match="missing"):
         store.get(ids[0])
     store.close()
+
+
+# -- V1-8 two writers and a reader, in three processes (F15) ----------------
+
+_WRITER = """
+import sys
+from ms_flow.core.database import ProjectStore
+from ms_flow.payloads import Payload, PayloadStore
+project = ProjectStore.open_at(sys.argv[1])
+store = PayloadStore(project)
+name = sys.argv[2]
+for txn in range(300):
+    keep = txn % 3 != 2
+    tag = "ok" if keep else "rolled-back"
+    texts = [f"{name}:{txn}:{i}:{tag}" for i in range(5)]
+    with project.get_session() as session:
+        store.put(session, [Payload(t.encode(), kind=t) for t in texts])
+        session.commit() if keep else session.rollback()
+"""
+
+_READER = """
+import sys
+from ms_flow.core.database import ProjectStore
+from ms_flow.payloads import PayloadStore
+project = ProjectStore.open_at(sys.argv[1])
+store = PayloadStore(project)
+seen, partial = 0, set()
+while seen < 2 * 200 * 5:
+    with project.engine.connect() as c:
+        kinds = dict(c.exec_driver_sql("SELECT id, kind FROM ms_payloads").fetchall())
+    for pid, data in store.get_many(kinds).items():
+        assert data == kinds[pid].encode() and kinds[pid].endswith(":ok"), (pid, data)
+    seen = len(kinds)
+    partial.add(seen)
+print(len(partial))
+"""
+
+
+def test_two_writing_processes_and_a_reader_see_only_committed_bytes(project):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code, str(project.db_path), *extra], env=env, stdout=subprocess.PIPE)
+        for code, extra in ((_READER, ()), (_WRITER, ("a",)), (_WRITER, ("b",)))
+    ]
+    assert [p.wait(timeout=120) for p in procs] == [0, 0, 0]
+    assert int(procs[0].stdout.read()) > 2  # the reader ran while the writers wrote
+    rows = _rows(project, "SELECT volume_id, kind FROM ms_payloads")
+    assert len(rows) == 2 * 200 * 5
+    owners = {}
+    for volume_id, kind in rows:
+        owners.setdefault(volume_id, set()).add(kind.split(":")[0])
+    assert all(len(names) == 1 for names in owners.values())  # one writer per volume (I3)
+    store = PayloadStore(project)
+    kinds = dict(_rows(project, "SELECT id, kind FROM ms_payloads"))
+    assert {pid: data.decode() for pid, data in store.get_many(kinds).items()} == kinds
+    store.close()
