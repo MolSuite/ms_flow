@@ -161,3 +161,26 @@ def test_a_task_that_fails_leaves_nothing(project):  # F1
     assert sorted(n for (n,) in rows(project, "SELECT n FROM ligands")) == [n for n in range(20) if n % 5]
     assert_clean(project, 16)
 
+
+@task()
+def no_number_on_fives(n: int) -> dict:
+    return {**ligand(n), "n": None if n % 5 == 0 else n}
+
+
+@job(task=no_number_on_fives, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+def some_rejected(params, project):
+    yield from range(params["n"])
+
+
+def test_a_write_that_fails_leaves_the_volume_as_it_was_and_no_rows(project):  # F2
+    ended = run(project, some_rejected, {"n": 20}, status="completed_with_errors")
+    assert ended.chunks_failed == 4 and "NOT NULL" in ended.error
+    assert_clean(project, 16)
+
+    before = {path.name: path.stat().st_size for path in project.payloads.directory.iterdir()}
+    bad = {"ligands": {"$ref": "l", "n": 1, "structure_payload_id": Payload(b"x" * 1000, series="ligands")},
+           "poses": {"ligand_id": 999_999, "rank": 0, "pose_payload_id": Payload(b"y" * 1000, series="poses")}}
+    with pytest.raises(Exception, match="FOREIGN KEY"):  # the second node fails after the first one is in
+        project.persist_output_spec(docking.__job__["output"], bad)
+    assert {path.name: path.stat().st_size for path in project.payloads.directory.iterdir()} == before
+    assert_clean(project, 16)  # and the "poses" volume made for this write is gone
