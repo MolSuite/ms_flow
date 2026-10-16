@@ -79,4 +79,12 @@ def store_chunk(bounds):
     """`bench_volumes` PJ: the molecules `[start, stop)` as rows with their `Payload`s."""
     from benchmarks.refactor_optimization import bench_volumes
 
-    return bench_volumes.store_rows(*bounds)
+    return bench_volumes.store_rows(*bounds)  # (start, stop, config)
+
+
+def packs_with_dictionary(element: dict) -> dict:
+    """A row whose payload uses the job's zstd dictionary, a `File` (`tests/test_payloads_codecs.py`)."""
+    from ms_flow.payloads import Payload
+
+    data = element["data"]
+    return {"n": element["n"], "structure_payload_id": Payload(data, series="ligands", dictionary=element["dictionary"])}
