@@ -269,3 +269,27 @@ def test_edges_empty_exact_fit_one_over_and_oversize(project, monkeypatch):
     assert store.get_many(reversed(ids)) == dict(zip(ids, blobs))
     assert store.get(ids[0]) == b""
     store.close()
+
+
+# -- V1-7 checksums --------------------------------------------------------
+
+
+def test_corrupt_bytes_raise_payload_corrupt_never_return_data(project):
+    store = PayloadStore(project)
+    ids = _put(store, project, [Payload(b"first"), Payload(b"second"), Payload(b"third")])
+    store.close()
+    offsets = dict(_rows(project, 'SELECT id, "offset" FROM ms_payloads'))
+    path = store.path(1)
+    raw = bytearray(path.read_bytes())
+    raw[offsets[ids[0]] + 16] ^= 0x01  # one bit of the bytes
+    raw[offsets[ids[1]] + 4] ^= 0x01  # the stored length in the needle header
+    path.write_bytes(bytes(raw[: offsets[ids[2]] + 16 + 2]))  # the last needle cut short
+    for pid, reason in zip(ids, ("checksum", "checksum", "truncated")):
+        with pytest.raises(P.PayloadCorrupt, match=reason) as caught:
+            store.get(pid)
+        assert caught.value.payload_id == pid
+    store.close()  # an open descriptor still reads an unlinked file (F12)
+    path.unlink()
+    with pytest.raises(P.PayloadCorrupt, match="missing"):
+        store.get(ids[0])
+    store.close()
