@@ -289,7 +289,7 @@ Hecho cuando: V4-6 a V4-9 pasan.
 Cada serie elige su codec; cada aguja dice con cuál se guardó (el campo `codec` de su cabecera y de `ms_payloads`), así que en un mismo volumen pueden convivir varios y cambiar de codec no obliga a reescribir nada. Se comprime en el worker, cuando el `Payload` se serializa para volver al padre: el padre solo escribe bytes.
 
 - [x] **V5-1** Medir con una muestra de la librería de 33M (SDF) y con PDBQT de AMDockVS: ratio y velocidad por aguja con zstd sin diccionario, con diccionario entrenado por serie (10 000 muestras) y con zlib (biblioteca estándar) como referencia.
-  Resultado (2026-10-16, un núcleo; datos y scripts en `.bench_runs/codecs_V5-1/`, pasan a `results/` e informe con la rama de V5, mejor de 3; zstandard 0.25 / libzstd 1.5.7, lz4 4.4.5 en un `site` temporal, nada instalado en MSDD_312):
+  Resultado (2026-10-16, un núcleo; datos y scripts en `.bench_runs/codecs_V5-1/` (fuera de git: muestras de la librería; el informe recoge V5-8, que los usa), mejor de 3; zstandard 0.25 / libzstd 1.5.7, lz4 4.4.5 en un `site` temporal, nada instalado en MSDD_312):
 
   | Datos | zlib-6 | zstd-3 | zstd-3 + diccionario | lz4 |
   |---|---|---|---|---|
@@ -298,15 +298,32 @@ Cada serie elige su codec; cada aguja dice con cuál se guardó (el campo `codec
   | Poses Vina reales (5,6 KB) | 4,3× · 67 / 350 | 4,3× · 293 / 816 | **5,2×** · 330 / 997 | 2,7× · 772 / 2725 |
 
   (ratio · compresión / descompresión por núcleo). Leer una aguja de 3 KB con zstd + diccionario cuesta 2-4 µs. El diccionario es lo que cuenta: más ratio y además más rápido que zstd solo. zlib con diccionario precargado (`zdict`) queda peor que zstd sin él. lz4 pierde un 40 % de ratio y no hace falta: zstd ya va 7× por encima de lo que escribe el disco (42 MB/s). Entrenar con las primeras agujas de una serie da un 15 % menos que con una muestra repartida (las cabezas de un SDF no son representativas). Los PDBQT y la mayoría de las poses son generados (ETKDG + meeko, Vina con exhaustiveness 1); las 100 reales confirman el diccionario entrenado con ellos.
-- [ ] **V5-2** Cerrar D7 con esos números (ver la tabla de decisiones).
-- [ ] **V5-3** Registro de codecs en `payloads.py`: `0 none`, `1 zlib` (biblioteca estándar, siempre), `2 zstd`, `3 zstd-dict`. Cada uno es una pareja comprimir/descomprimir y un nivel; añadir otro (lz4) es una entrada más, no se construye hasta que haga falta. Leer una aguja con un codec que el proceso no tiene da un error claro que dice qué instalar.
-- [ ] **V5-4** Elección por serie: `PayloadStore(codecs={"ligands": "zstd-dict", "poses": "zstd"}, default=...)`, guardada en el proyecto (tabla `ms_payload_series`: serie, codec, nivel, diccionario activo). Por defecto `zstd` si está y `zlib` si no. Un `Payload` puede forzar el suyo (`Payload(..., codec="none")` para lo que ya viene comprimido).
-- [ ] **V5-5** Comprimir en el worker: `Payload.__reduce__` comprime con el codec de su serie antes de cruzar el proceso, y el padre escribe los bytes tal cual. El job lleva al worker la configuración de codecs y, si hay, el diccionario como `File` (una vez por job, como el receptor de V3).
-- [ ] **V5-6** Diccionarios: `volumes/dicts/<dict_id>.zdict` + tabla `ms_payload_dicts` (id, serie, creado, muestras). Se entrenan con una muestra repartida de la serie (10 000 agujas) cuando la serie las tiene; antes, sus agujas van con `zstd` sin diccionario. El id del diccionario va dentro del marco zstd, así que leer no necesita la tabla. Un diccionario se borra solo cuando ninguna aguja lo usa.
+- [x] **V5-2** Cerrar D7 con esos números (ver la tabla de decisiones).
+- [x] **V5-3** Registro de codecs en `payloads.py`: `0 none`, `1 zlib` (biblioteca estándar, siempre), `2 zstd`, `3 zstd-dict`. Cada uno es una pareja comprimir/descomprimir y un nivel; añadir otro (lz4) es una entrada más, no se construye hasta que haga falta. Leer una aguja con un codec que el proceso no tiene da un error claro que dice qué instalar.
+- [x] **V5-4** Elección por serie: `PayloadStore(codecs={"ligands": "zstd-dict", "poses": "zstd"}, default=...)`, guardada en el proyecto (tabla `ms_payload_series`: serie, codec, nivel, diccionario activo). Por defecto `zstd` si está y `zlib` si no. Un `Payload` puede forzar el suyo (`Payload(..., codec="none")` para lo que ya viene comprimido).
+- [x] **V5-5** Comprimir en el worker: `Payload.__reduce__` comprime con el codec de su serie antes de cruzar el proceso, y el padre escribe los bytes tal cual. El job lleva al worker la configuración de codecs y, si hay, el diccionario como `File` (una vez por job, como el receptor de V3).
+- [x] **V5-6** Diccionarios: `volumes/dicts/<dict_id>.zdict` + tabla `ms_payload_dicts` (id, serie, creado, muestras). Se entrenan con una muestra repartida de la serie (10 000 agujas) cuando la serie las tiene; antes, sus agujas van con `zstd` sin diccionario. El id del diccionario va dentro del marco zstd, así que leer no necesita la tabla. Un diccionario se borra solo cuando ninguna aguja lo usa.
 - [ ] **V5-7** Recomprimir al compactar (V4): las agujas que copia la compactación pasan al codec y al diccionario activos de su serie.
-- [ ] **V5-8** Tests: ida y vuelta con cada codec y mezcla de codecs en un volumen; un proceso sin `zstandard` lee zlib y falla claro con zstd; un diccionario que falta → error claro en `check`; la compresión ocurre en el worker (el padre recibe bytes ya comprimidos); el banco PJ de 700k con `zstd-dict` y con SDF reales queda en el informe frente a `none`.
+- [x] **V5-8** Tests: ida y vuelta con cada codec y mezcla de codecs en un volumen; un proceso sin `zstandard` lee zlib y falla claro con zstd; un diccionario que falta → error claro en `check`; la compresión ocurre en el worker (el padre recibe bytes ya comprimidos); el banco PJ de 700k con `zstd-dict` y con SDF reales queda en el informe frente a `none`.
 
 Hecho cuando: V5-8 pasa y el banco PJ con compresión queda medido frente al de V2-12.
+
+Resultado (2026-10-16, `results/volumes_V5-8.json`, 100k con registros reales de V5-1 en cada worker, 14 workers, lectura en frío tras desalojar la caché; diccionarios entrenados con registros aparte de los guardados):
+
+| Variante | Codec | Importar + sync | Guardado | Ratio | Fuente de job en frío | Exportar en frío |
+|---|---|---|---|---|---|---|
+| PJ | none | 7,10 s | 974 MB | 1,0× | 11,46 s | 2,44 s |
+| PJZ | zstd | 4,30 s (−39 %) | 225 MB | 4,3× | 3,29 s (−71 %) | 1,21 s |
+| PJD | zstd + diccionario | 4,27 s (−40 %) | 166 MB | 5,9× | 2,91 s (−75 %) | 0,97 s |
+
+Comprimir en los workers sale gratis: el padre escribe 6 veces menos y la importación a disco baja un 40 %. Leer en frío baja en proporción a lo que se lee del disco (179 MB frente a 910 MB). Los dos diccionarios ocupan 0,2 MB; las agujas de entrenamiento (15 MB) se guardan aparte, como haría la app. A 100k y no a 700k por lo que pidió Mario (bancos más cortos, siempre a disco); V2-12 a 700k fue PJ none.
+
+Desvíos frente a lo escrito arriba:
+- El codec lo elige cada `Payload` (`Payload(..., codec="zstd")`, por defecto `zstd`), no una configuración `codecs={}` del almacén guardada en una tabla `ms_payload_series`: la app construye los `Payload` y ya sabe la serie, y así no hay estado que sincronizar entre el padre y los workers. Para usar el diccionario, el job pasa `store.dictionary(serie)` (un `File`) a sus tasks, que lo ponen en `Payload(..., dictionary=...)`.
+- `zstd-dict` no es un codec 3 aparte: es el codec 2 con el id del diccionario dentro del marco zstd, que es lo que lee el lector.
+- `zstandard` es dependencia del núcleo, no opcional (Mario: «no importa si hay que tener una dependencia más si tiene valor real»). Por eso no hay test de «un proceso sin `zstandard`»; si falta, `_zstd()` da un error que dice qué instalar.
+- El diccionario que falta da `PayloadCorrupt` al leer; en `check` entra con V4-1.
+- V5-7 (recomprimir al compactar) va con V4-3.
 
 ### V6 — Segmentos que escribe la task (condicional)
 
@@ -414,7 +431,7 @@ flowchart LR
 | V2 Escribir desde jobs | ☑ (V2-12 se mide en tiempo a disco: −2 % frente a VP) | `feat/payload-volumes-v2` / #7 |
 | V3 Leer | ☑ (todo en frío: fuente de job 24,9 s, exportar 19,6 s, VP 29,2 s) | `feat/payload-volumes-v3` |
 | V4 Mantenimiento | ☐ | |
-| V5 Compresión | ◐ (V5-1 medido; plan rehecho para varios codecs) | |
+| V5 Compresión | ☑ salvo V5-7, que va con V4 (100k: 5,9× con diccionario, importar a disco −40 %, leer en frío −75 %) | `feat/payload-volumes-v5` |
 | V6 Segmentos (condicional) | ☐ | |
 | V7 Escala y docs | ☐ | |
 | A0 Esquema | ☐ | |
@@ -446,7 +463,7 @@ Abiertas, con lo que se propone:
 | D4 | Qué se queda como fichero | Lo que es por ejecución y no por entidad: mapas de autogrid (caché), parquet de clustering, modelos de QSAR |
 | D5 | Receptores | También en volúmenes (serie `receptors`); se materializan para las herramientas |
 | D6 | Cuándo se compacta | Automático sin jobs activos con más del 50 % de bytes muertos, y un botón |
-| D7 | Varios codecs, elegidos por serie; por defecto zstd, con diccionario para las series de moléculas | Medido en V5-1: zstd + diccionario da 7,9× en SDF y 4,7-5,2× en PDBQT, frente a 5,5× y 3,5-4,3× de zlib-6, y es más rápido. zlib queda siempre (biblioteca estándar) para quien no tenga zstd. En 3.12, zstd es el paquete `zstandard` (dependencia opcional `ms_flow[zstd]`, pendiente del OK de Mario para MSDD_312); en 3.14 está en la biblioteca estándar (`compression.zstd`). lz4 no: pierde un 40 % de ratio y la velocidad de zstd ya sobra |
+| D7 | (**cerrada 2026-10-16**, V5-2) Varios codecs, elegido por `Payload`; por defecto zstd, con diccionario para las series de moléculas | Medido en V5-1: zstd + diccionario da 7,9× en SDF y 4,7-5,2× en PDBQT, frente a 5,5× y 3,5-4,3× de zlib-6, y es más rápido. zlib queda siempre (biblioteca estándar) para quien no tenga zstd. En 3.12, zstd es el paquete `zstandard` (dependencia del núcleo desde V5, aceptado por Mario el 2026-10-16); en 3.14 está en la biblioteca estándar (`compression.zstd`). lz4 no: pierde un 40 % de ratio y la velocidad de zstd ya sobra |
 | D8 | Segmentos escritos por la task | Solo si V0-4 lo pide |
 | D9 | Proyectos anteriores | Se rechazan con un mensaje |
 | D10 | Formas preparadas | Tabla `prepared_inputs(molecule_id, engine, payload_id)` en vez de rutas en `metadata` |
