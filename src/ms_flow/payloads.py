@@ -22,6 +22,7 @@ import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - Windows
 VOLUME_SIZE = 1 << 30  # a payload larger than this goes alone in its own volume
 MAX_OPEN_FDS = 256  # volumes a reader keeps open
 LOCATE_CHUNK = 900  # ids per location query, under SQLite's variable limit
+READ_WINDOW = 500  # ids read at once by `with_payloads` and `iter_bytes`
 
 MAGIC = b"MSVOL"
 VERSION = 1
@@ -405,6 +407,37 @@ class PayloadStore:
                 if entry[1] == 0:
                     os.close(entry[0])
             self._fds.clear()
+
+
+class _WithPayloads:
+    def __init__(self, store: PayloadStore, rows: Iterable[dict], fields: dict[str, str], window: int):
+        self._store, self._rows, self._fields, self._window = store, rows, dict(fields), window
+
+    def __getattr__(self, name: str):
+        if name in ("open", "remaining", "reads"):  # only what `rows` has: the engine asks with hasattr
+            return getattr(self.__dict__["_rows"], name)
+        raise AttributeError(name)
+
+    def __iter__(self):
+        rows = iter(self._rows)
+        while batch := list(islice(rows, self._window)):
+            ids = {row[column] for row in batch for column in self._fields if row.get(column) is not None}
+            found = self._store.get_many(ids) if ids else {}
+            for row in batch:
+                yield {**row, **{key: found.get(row.get(column)) for column, key in self._fields.items()}}
+
+
+def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], window: int = READ_WINDOW):
+    """A job's source whose rows carry the bytes of their payloads, so a task gets bytes and never a path.
+
+    `fields` maps an id column to the key that gets its bytes (`{"current_payload_id": "ligand"}`;
+    a NULL id gives `None`). Rows are read `window` at a time in (volume, offset) order, so at most
+    that many hold bytes here, and the engine reads only its window ahead (I8). What `rows` knows
+    (`open`, `remaining`, `reads` of `ms_flow.query.Rows`) passes through.
+    """
+    from ms_flow.core.database import resolve_project_store
+
+    return _WithPayloads(resolve_project_store(project).payloads, rows, fields, window)
 
 
 def _write_all(fd: int, buffers: list, offset: int) -> None:
