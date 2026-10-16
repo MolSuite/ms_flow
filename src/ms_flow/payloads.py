@@ -181,7 +181,11 @@ class PayloadStore:
                 placed.append((volume.id, volume.end, size, size, CODEC_NONE, crc, payload.kind))
                 volume.end += NEEDLE + size
             for volume, (offset, buffers) in pending.items():
-                _write_all(volume.fd, buffers, offset)
+                try:
+                    _write_all(volume.fd, buffers, offset)
+                except OSError as error:  # a full disk: the caller's rollback cuts what got in
+                    raise OSError(error.errno, f"cannot write payloads to {self.path(volume.id)}: "
+                                               f"{error.strerror}") from error
             for volume in pending:
                 _datasync(volume.fd)
                 cursor.execute("UPDATE ms_volumes SET size = ? WHERE id = ?", (volume.end, volume.id))

@@ -203,3 +203,45 @@ def test_the_bytes_are_synced_before_their_rows_commit(project, monkeypatch):  #
     assert all(group.startswith("ss") for group in groups[:-1])  # the ligands and the poses volume
     assert groups[0] == "ssd"  # their files were new: the directory too
     assert rows(project, "SELECT COUNT(*) FROM poses") == [(60,)]
+
+
+_FULL_DISK = """
+import json, resource, signal, sys
+sys.path[:0] = sys.argv[2].split(":")
+from ms_flow.core.database.project import ProjectStore
+import test_payloads_jobs as here
+
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # a write past the limit fails with EFBIG instead of a kill
+resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, resource.RLIM_INFINITY))
+project = ProjectStore.open_at(sys.argv[1])
+ended = here.run(project, here.big, {"n": 40}, status="completed_with_errors")
+print(json.dumps({"failed": ended.chunks_failed, "error": ended.error}))
+"""
+
+
+@task()
+def big_ligand(n: int) -> dict:
+    return {"n": n, "structure_payload_id": Payload(bytes([n]) * 100_000, series="ligands")}
+
+
+@job(task=big_ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+def big(params, project):
+    yield from range(params["n"])
+
+
+def test_a_full_disk_fails_the_elements_clearly_and_leaves_nothing_half(project):  # F7
+    import json
+    import os
+    import subprocess
+
+    path = os.pathsep.join([str(Path(__file__).parent), *sys.path])
+    out = subprocess.run([sys.executable, "-c", _FULL_DISK, str(project.db_path), path], capture_output=True,
+                         text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    ended = json.loads(out.stdout.splitlines()[-1])
+    written = rows(project, "SELECT COUNT(*) FROM ligands")[0][0]
+    assert 0 < written < 40 and ended["failed"] == 40 - written  # a 1 MB file fits ten of them
+    assert "cannot write payloads to" in ended["error"] and "File too large" in ended["error"]
+    assert_clean(project, written)
+    assert all(project.payloads.get(pid) == bytes([n]) * 100_000
+               for n, pid in rows(project, "SELECT n, structure_payload_id FROM ligands"))
