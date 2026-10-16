@@ -420,7 +420,7 @@ Abiertas, con lo que se propone:
 | # | Qué | Propuesta |
 |---|---|---|
 | D1 | Nombre (**aceptada 2026-10-16**) | Módulo `ms_flow.payloads`, clase `PayloadStore`, ficheros `volumes/*.vol`. «vshard» choca con la biblioteca de Tarantool, pero solo importaría si fuera un nombre público |
-| D2 | Cómo referencia la app | FK `INTEGER` a `ms_payloads.id`; nunca la ubicación en la fila de la app |
+| D2 | Cómo referencia la app (**aceptada 2026-10-16**) | FK `INTEGER` a `ms_payloads.id`; nunca la ubicación en la fila de la app |
 | D3 | Durabilidad (**aceptada 2026-10-16**) | fsync por grupo antes de confirmar. Si V1-9 cuesta más del 10 %, se mide un modo de importación masiva sin fsync que, si se corta, pide reimportar |
 | D4 | Qué se queda como fichero | Lo que es por ejecución y no por entidad: mapas de autogrid (caché), parquet de clustering, modelos de QSAR |
 | D5 | Receptores | También en volúmenes (serie `receptors`); se materializan para las herramientas |
