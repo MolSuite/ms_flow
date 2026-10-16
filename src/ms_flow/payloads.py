@@ -16,10 +16,13 @@ import `Payload` in workers.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
+import tempfile
 import threading
 import zlib
 from collections import OrderedDict
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
@@ -451,6 +454,24 @@ def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], wi
     from ms_flow.core.database import resolve_project_store
 
     return _WithPayloads(resolve_project_store(project).payloads, rows, fields, window)
+
+
+@contextmanager
+def scratch_file(data: bytes, suffix: str = ""):
+    """`data` as a temporary file, for a program that only reads paths: in /dev/shm when it is
+    there and has room for it, in the system's temporary folder if not. Deleted on leaving."""
+    directory = None
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        if shutil.disk_usage("/dev/shm").free > 2 * len(data):  # ponytail: room now, not while it is written
+            directory = "/dev/shm"
+    fd, name = tempfile.mkstemp(suffix=suffix, prefix="msflow-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+        yield Path(name)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(name)
 
 
 def _write_all(fd: int, buffers: list, offset: int) -> None:

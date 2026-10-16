@@ -1,6 +1,8 @@
 """Reading payloads: jobs get bytes in their elements, programs get files, exports get a stream (V3)."""
 import os
+import shutil
 import sqlite3
+import tempfile
 from contextlib import closing
 from pathlib import Path
 
@@ -8,7 +10,7 @@ import pytest
 
 from ms_flow.core.database.project import ProjectStore
 from ms_flow.engine import File
-from ms_flow.payloads import Payload, with_payloads
+from ms_flow.payloads import Payload, scratch_file, with_payloads
 from ms_flow.query import QuerySpec, Rows
 
 
@@ -58,3 +60,16 @@ def test_materialize_writes_the_file_once_and_names_it_as_a_file(project, tmp_pa
     inode = os.stat(path).st_ino
     assert project.payloads.materialize(2, tmp_path / "job", suffix=".sdf") == path and os.stat(path).st_ino == inode
     assert sorted(p.name for p in (tmp_path / "job").iterdir()) == ["2.sdf"]  # no partial left
+
+
+def test_a_scratch_file_goes_to_dev_shm_when_it_fits_and_is_gone_after(monkeypatch):
+    with scratch_file(b"ATOM", suffix=".pdbqt") as path:
+        assert path.read_bytes() == b"ATOM" and path.suffix == ".pdbqt"
+        if os.access("/dev/shm", os.W_OK):
+            assert path.parent == Path("/dev/shm")
+    assert not path.exists()
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: shutil._ntuple_diskusage(1, 1, 0))
+    with pytest.raises(RuntimeError), scratch_file(b"ATOM") as path:
+        assert path.parent == Path(tempfile.gettempdir())  # no room in /dev/shm
+        raise RuntimeError
+    assert not path.exists()
