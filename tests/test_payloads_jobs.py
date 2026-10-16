@@ -221,7 +221,7 @@ print(json.dumps({"failed": ended.chunks_failed, "error": ended.error}))
 
 @task()
 def big_ligand(n: int) -> dict:
-    return {"n": n, "structure_payload_id": Payload(bytes([n]) * 100_000, series="ligands")}
+    return {"n": n, "structure_payload_id": Payload(bytes([n]) * 100_000, series="ligands", codec="none")}  # fills the disk
 
 
 @job(task=big_ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))

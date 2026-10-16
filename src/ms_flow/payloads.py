@@ -9,6 +9,11 @@ Volume: a 32-byte header (`MSVOL`, version, volume id, series), then needles.
 Needle: a 16-byte header (crc32, stored length, raw length, codec, flags), then
 the bytes. A volume has one writer and only grows; a sealed volume never changes.
 
+Each payload says its codec (`none`, `zlib`, `zstd`), so volumes mix them. A
+`Payload` compresses itself when it is pickled, i.e. in the worker that made it:
+the writer only appends bytes. A zstd frame names its dictionary (`dicts/<id>.zdict`,
+trained per series with `PayloadStore.train_dictionary`), so reading needs no table.
+
 POSIX only (pread/pwritev). Nothing here imports SQL at module level: tasks
 import `Payload` in workers.
 """
@@ -43,7 +48,13 @@ READ_WINDOW = 500  # ids read at once by `with_payloads` and `iter_bytes`
 
 MAGIC = b"MSVOL"
 VERSION = 1
-CODEC_NONE = 0
+CODEC_NONE, CODEC_ZLIB, CODEC_ZSTD = 0, 1, 2
+CODECS = {"none": CODEC_NONE, "zlib": CODEC_ZLIB, "zstd": CODEC_ZSTD}
+DEFAULT_CODEC = "zstd"
+ZLIB_LEVEL = 6
+ZSTD_LEVEL = 3
+DICT_SIZE = 112_640  # zstd's default dictionary size
+DICT_SAMPLES = 10_000
 _VOLUME_HEADER = struct.Struct("<5sBHQ16s")  # magic, version, reserved, volume id, series
 _NEEDLE = struct.Struct("<IIIHH")  # crc32, stored length, raw length, codec, flags
 HEADER = _VOLUME_HEADER.size
@@ -75,11 +86,57 @@ class PayloadCorrupt(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Payload:
-    """Bytes to store. `series` groups payloads with the same lifetime in the same volumes."""
+    """Bytes to store. `series` groups payloads with the same lifetime in the same volumes.
+
+    `codec` is `none`, `zlib` or `zstd`; `dictionary` is the path of a zstd dictionary
+    (`PayloadStore.dictionary(series)`, a `File` a job hands its tasks). `raw_length` is set
+    once `data` holds the compressed bytes: pickling compresses, so it happens in the worker.
+    """
 
     data: bytes
     kind: str = ""
     series: str = "default"
+    codec: str = DEFAULT_CODEC
+    dictionary: str | None = None
+    raw_length: int | None = None
+
+    def packed(self) -> Payload:
+        """This payload with `data` compressed by its codec (itself if it already is)."""
+        if self.raw_length is not None:
+            return self
+        if self.codec not in CODECS:
+            raise ValueError(f"unknown codec {self.codec!r}; one of {sorted(CODECS)}")
+        return Payload(_compress(self.codec, self.data, self.dictionary), self.kind, self.series, self.codec,
+                       None, len(self.data))
+
+    def __reduce__(self):
+        packed = self.packed()
+        return Payload, (packed.data, packed.kind, packed.series, packed.codec, None, packed.raw_length)
+
+
+_codecs = threading.local()  # zstd (de)compressors are not thread-safe: one set per thread
+
+
+def _zstd():
+    try:
+        import zstandard
+    except ImportError:  # pragma: no cover - a declared dependency
+        raise RuntimeError("zstd payloads need the zstandard package: pip install zstandard") from None
+    return zstandard
+
+
+def _compress(codec: str, data: bytes, dictionary: str | None) -> bytes:
+    if codec == "none":
+        return bytes(data)
+    if codec == "zlib":
+        return zlib.compress(data, ZLIB_LEVEL)
+    cache = _codecs.__dict__.setdefault("compressors", {})
+    key = os.fspath(dictionary) if dictionary else None
+    if key not in cache:
+        zstandard = _zstd()
+        dict_data = zstandard.ZstdCompressionDict(Path(key).read_bytes()) if key else None
+        cache[key] = zstandard.ZstdCompressor(level=ZSTD_LEVEL, dict_data=dict_data)
+    return cache[key].compress(data)
 
 
 class _Volume:
@@ -188,15 +245,16 @@ class PayloadStore:
             pending: dict[_Volume, list] = {}
             placed = []
             for payload in payloads:
-                data = payload.data
+                payload = payload.packed()  # done already when it came from a worker
+                data, codec = payload.data, CODECS[payload.codec]
                 size = len(data)
                 volume = self._volume_for(tx, cursor, payload.series, NEEDLE + size)
                 crc = zlib.crc32(data)
                 pending.setdefault(volume, [volume.end, []])[1] += (
-                    _NEEDLE.pack(crc, size, size, CODEC_NONE, 0),
+                    _NEEDLE.pack(crc, size, payload.raw_length, codec, 0),
                     data,
                 )
-                placed.append((volume.id, volume.end, size, size, CODEC_NONE, crc, payload.kind))
+                placed.append((volume.id, volume.end, size, payload.raw_length, codec, crc, payload.kind))
                 volume.end += NEEDLE + size
             for volume, (offset, buffers) in pending.items():
                 try:
@@ -392,9 +450,22 @@ class PayloadStore:
         data = memoryview(buffer)[NEEDLE:]
         if _NEEDLE.unpack_from(buffer)[:4] != (crc, length, raw_length, codec) or zlib.crc32(data) != crc:
             raise PayloadCorrupt(payload_id, f"checksum mismatch in volume {volume_id}")
-        if codec != CODEC_NONE:
-            raise PayloadCorrupt(payload_id, f"unknown codec {codec}")
-        return bytes(data)
+        if codec == CODEC_NONE:
+            return bytes(data)
+        if codec == CODEC_ZLIB:
+            return zlib.decompress(data)
+        if codec == CODEC_ZSTD:
+            return self._decompressor(payload_id, data).decompress(data, max_output_size=raw_length)
+        raise PayloadCorrupt(payload_id, f"unknown codec {codec}")
+
+    def _decompressor(self, payload_id: int, data) -> Any:
+        zstandard = _zstd()
+        dict_id = zstandard.get_frame_parameters(data).dict_id
+        cache = _codecs.__dict__.setdefault("decompressors", {})
+        key = (self.directory, dict_id)
+        if key not in cache:
+            cache[key] = zstandard.ZstdDecompressor()
+        return cache[key]
 
     def _open(self, volume_id: int) -> list:
         with self._fd_lock:
