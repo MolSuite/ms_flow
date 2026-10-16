@@ -5,6 +5,7 @@
 Reads every `results/*.json` written by `bench.py`, orders them by date and writes
 `docs/03-impacto.html`. Nothing here rejects a step: the page
 only shows what moved. Every metric is lower-is-better.
+The `results/volumes_*.json` files of `bench_volumes.py` are not steps: they fill the "Volumes" section.
 """
 from __future__ import annotations
 
@@ -196,11 +197,79 @@ def summarize(records: list[dict]) -> list[dict]:
     return steps
 
 
+VOL_BASE = "2026-10-15"  # the hand-run the volumes plan (08) must reproduce
+VOL_MARGIN_PCT = 10.0  # "Hecho cuando" of V0
+VOL_COLS = (("import_s", "import s"), ("size_mb", "size MB"), ("files", "files"), ("get_mol_p50_us", "get_mol p50 µs"),
+            ("get_mol_p99_us", "get_mol p99 µs"), ("stream_all_current_s", "stream all s"),
+            ("stream_all_current_s_cold", "stream all s, cold"), ("random_s", "random read s"),
+            ("random_s_cold", "random read s, cold"), ("update_5000_s", "update 5000 s"))
+VOL_DRIFT = (("import_s", "import s"), ("stream_all_current_s", "stream all s"))
+
+
+def _vol_cell(v: dict, col: str):
+    if col.startswith("random"):  # parallel_<w>x<k>_random_s[_cold]: the name carries the worker count
+        return next((v[k] for k in sorted(v) if k.startswith("parallel_") and k.endswith(col[len("random"):])), None)
+    return v.get(col)
+
+
+def volumes_view(records: list[dict]) -> dict:
+    """One table per mode (a row per run and variant, oldest first) and the drift of the newest run against VOL_BASE."""
+    records = sorted(records, key=lambda r: r["recorded_at"])
+    modes: dict[str, list] = {}
+    for rec in records:
+        for key, v in sorted(rec["variants"].items()):
+            mode, name = key.split("/", 1)
+            info = [rec["label"], f"commit {rec.get('commit') or 'unknown'}", f"n={v.get('n')}"]
+            if v.get("workers"):
+                info.append(f"{v['workers']} workers")
+            info += [x for x in ((rec.get("disk") or {}).get("model"), rec.get("note")) if x]
+            modes.setdefault(mode, []).append(
+                {"label": rec["label"], "variant": name, "n": v.get("n"), "info": " · ".join(info),
+                 "cells": {c: _vol_cell(v, c) for c, _ in VOL_COLS}})
+    out = {}
+    for mode in sorted(modes, key=lambda m: m != "serial"):
+        cols = [c for c in VOL_COLS if mode == "serial" or c[0] != "update_5000_s"]
+        out[mode] = {"cols": cols, "rows": modes[mode]}
+    ref = next((r for r in records if r["label"] == VOL_BASE), None)
+    new = next((r for r in reversed(records) if r["label"] != VOL_BASE), None)
+    drift = None
+    if ref and new:
+        drift = {"base": VOL_BASE, "label": new["label"], "margin": VOL_MARGIN_PCT, "cols": VOL_DRIFT, "rows": []}
+        for key in sorted(ref["variants"].keys() & new["variants"].keys()):
+            row = {"variant": key}
+            for m, _ in VOL_DRIFT:
+                a, b = ref["variants"][key].get(m), new["variants"][key].get(m)
+                if a and b is not None:
+                    pct = 100 * (b / a - 1)
+                    row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
+            drift["rows"].append(row)
+    return {"modes": out, "base": VOL_BASE, "drift": drift}
+
+
 def _self_check() -> None:
     rec = lambda label, v: {"label": label, "commit": "x", "recorded_at": "2026-01-01", "metrics": {"a": {"values": v, "unit": "ms"}}}
     a = [s["m"]["a"] for s in summarize([rec("0", [10.0]), rec("1", [5.0]), rec("2", [5.1]), rec("3", [8.0])])]
     assert [c.get("kind") for c in a] == [None, "improves", "noise", "worsens"]
     assert round(a[1]["cum"]) == -50 and round(a[3]["step"]) == 29
+
+    vrec = lambda label, at, variants: {"label": label, "recorded_at": at, "commit": None, "variants": variants}
+    old = {"serial/HT": {"n": 9, "import_s": 100.0, "stream_all_current_s": 40.0},
+           "parallel/VP": {"n": 9, "workers": 14, "parallel_14x20k_random_s": 0.6}}
+    new = {"serial/HT": {"n": 9, "import_s": 120.0, "stream_all_current_s": 41.0, "update_5000_s": 0.3, "parallel_8x10k_random_s": 0.5,
+                         "parallel_8x10k_random_s_cold": 0.9, "parallel_8x10k_random_cold_disk_mb": 5.0},
+           "serial/PS": {"n": 9, "import_s": 1.0}}
+    v = volumes_view([vrec("v1", "2026-11-01", new), vrec(VOL_BASE, "2026-10-15", old)])
+    assert list(v["modes"]) == ["serial", "parallel"]
+    assert [(r["label"], r["variant"]) for r in v["modes"]["serial"]["rows"]] == [(VOL_BASE, "HT"), ("v1", "HT"), ("v1", "PS")]
+    assert "update_5000_s" not in [c for c, _ in v["modes"]["parallel"]["cols"]]
+    cells = v["modes"]["serial"]["rows"][1]["cells"]
+    assert (cells["random_s"], cells["random_s_cold"], cells["update_5000_s"]) == (0.5, 0.9, 0.3)
+    assert v["modes"]["parallel"]["rows"][0]["cells"]["random_s"] == 0.6
+    d = v["drift"]
+    assert d["label"] == "v1" and [r["variant"] for r in d["rows"]] == ["serial/HT"]
+    assert d["rows"][0]["import_s"] == {"was": 100.0, "now": 120.0, "pct": 20.0, "flag": True}
+    assert d["rows"][0]["stream_all_current_s"]["pct"] == 2.5 and not d["rows"][0]["stream_all_current_s"]["flag"]
+    assert volumes_view([vrec(VOL_BASE, "2026-10-15", old)])["drift"] is None
 
 
 _self_check()
@@ -212,7 +281,8 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=_DEST)
     args = ap.parse_args()
 
-    records = sorted((json.loads(p.read_text()) for p in args.results.glob("*.json")), key=lambda r: r["recorded_at"])
+    paths = [p for p in args.results.glob("*.json") if not p.name.startswith("volumes_")]
+    records = sorted((json.loads(p.read_text()) for p in paths), key=lambda r: r["recorded_at"])
     quick = [r["label"] for r in records if r.get("quick")]
     if quick:
         print(f"skipped --quick runs, not comparable: {', '.join(quick)}")
@@ -220,6 +290,7 @@ def main() -> None:
     if not records:
         raise SystemExit(f"no results in {args.results}")
 
+    volumes = [json.loads(p.read_text()) for p in sorted(args.results.glob("volumes_*.json"))]
     data = {
         "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "repo": REPO,
         "machine": records[0]["machine"], "sizes": {**records[0]["sizes"], **records[-1]["sizes"]},
@@ -228,6 +299,7 @@ def main() -> None:
         "charted": CHARTED,
         "targets": TARGETS,
         "checks": [dict(zip(("key", "title", "what", "task"), c)) for c in CHECKS],
+        "volumes": volumes_view(volumes) if volumes else None,
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(PAGE.replace("/*DATA*/", json.dumps(data, separators=(",", ":")).replace("</", "<\\/")))
@@ -265,6 +337,7 @@ body { margin: 0; }
   font: 14px/1.45 system-ui, sans-serif; padding: 24px; min-height: 100vh; box-sizing: border-box; }
 h1 { font-size: 20px; margin: 0 0 4px; }
 h2 { font-size: 15px; margin: 0 0 2px; }
+h3 { font-size: 13px; margin: 14px 0 4px; }
 a { color: var(--series-1); }
 .sub { color: var(--text-secondary); margin: 0 0 16px; max-width: 1100px; }
 .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
@@ -339,6 +412,17 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <h2>Table</h2>
   <p class="sub">Median of the repeats; the range is in the tooltip of each cell. Green: the value meets the design target of the last row.</p>
   <div class="scroll" id="table"></div>
+</div>
+
+<div class="card" id="volumes-card" hidden>
+  <h2>Volumes</h2>
+  <p class="sub"><code>bench_volumes.py</code> stores molecule payloads two ways and times the same reads on both: SQLite blobs
+    (<b>RT</b>) against append-only volumes (serial: <b>HT</b> no fsync, <b>H</b> fsync per shard; parallel: <b>VP</b> the parent
+    writes, <b>VC</b> one segment per chunk). <b>Warm</b> reads run right after the import, with the data in the page cache;
+    <b>cold</b> ones run after <code>fsync</code> and <code>posix_fadvise(DONTNEED)</code> on every file, so they come from the disk.
+    A blank cell was not measured (the 2026-10-15 run has no cold reads). Plan: <a href="08-plan-volumenes.md">08-plan-volumenes.md</a>.</p>
+  <div class="scroll" id="volumes"></div>
+  <div class="scroll" id="drift"></div>
 </div>
 
 <div class="card">
@@ -440,6 +524,21 @@ function findings(host) {
     : '<p class="note">Nothing: every check passes and no step raised a cost beyond noise.</p>';
 }
 
+function volumes(host, drift) {
+  const f = v => v == null ? '' : Number.isInteger(v) ? v.toLocaleString('en') : num(v);
+  host.innerHTML = Object.entries(D.volumes.modes).map(([mode, t]) => `<h3>${esc(mode)}</h3><table><tr><th class="l">Run</th><th class="l">Variant</th><th>n</th>`
+    + t.cols.map(([, title], i) => `<th${i ? '' : ' class="b"'}>${title}</th>`).join('') + '</tr>'
+    + t.rows.map(r => `<tr><td class="l" title="${esc(r.info)}">${esc(r.label)}</td><td class="l">${esc(r.variant)}</td><td>${f(r.n)}</td>`
+      + t.cols.map(([k], i) => `<td class="${i ? '' : 'b'}" title="${r.cells[k] ?? ''}">${f(r.cells[k])}</td>`).join('') + '</tr>').join('') + '</table>').join('');
+  const d = D.volumes.drift;
+  drift.innerHTML = `<h3>Against ${esc(D.volumes.base)}</h3>` + (!d ? '<p class="note">No other run yet: its drift shows here once a run with another label exists.</p>'
+    : `<table><tr><th class="l">Variant</th>` + d.cols.map(([, title]) => `<th class="b">${title}, ${esc(d.base)}</th><th>${esc(d.label)}</th><th>Δ</th>`).join('') + '</tr>'
+      + d.rows.map(r => `<tr><td class="l">${esc(r.variant)}</td>` + d.cols.map(([k]) => { const c = r[k];
+        return c ? `<td class="b">${f(c.was)}</td><td>${f(c.now)}</td><td class="${c.flag ? 'bad' : 'muted'}">${c.pct > 0 ? '+' : c.pct < 0 ? '−' : ''}${Math.abs(c.pct).toFixed(1)} %</td>`
+          : '<td class="b"></td><td></td><td></td>'; }).join('') + '</tr>').join('') + '</table>'
+      + `<p class="note">Warm reads. Red: more than ${d.margin} % away from ${esc(d.base)}, the margin V0 asks to reproduce; a variant only in one of the two runs is not listed.</p>`);
+}
+
 function table(host) {
   host.innerHTML = '<table style="font-size:12px"><tr><th>Step</th><th>PR</th><th class="l">Commit</th><th class="l">Date</th>'
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
@@ -466,6 +565,7 @@ chart(document.getElementById('chart'));
 checks(document.getElementById('checks'));
 findings(document.getElementById('findings'));
 table(document.getElementById('table'));
+if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); }
 document.getElementById('how').innerHTML = D.metrics.map(m => `<p class="note"><b>${m.title.replace(/ \(.*/, '')}.</b> ${m.what.replace(/`([^`]+)`/g, '<code>$1</code>')}</p>`).join('');
 </script>
 </body>
