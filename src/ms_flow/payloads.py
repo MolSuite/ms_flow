@@ -111,9 +111,45 @@ class PayloadStore:
         self._hooked: weakref.WeakSet = weakref.WeakSet()
         self._fds: OrderedDict[int, list] = OrderedDict()  # volume id -> [fd, users, evicted]
         self._fd_lock = threading.Lock()
+        self._recover()
 
     def path(self, volume_id: int) -> Path:
         return self.directory / f"{volume_id:09d}.vol"
+
+    def _recover(self) -> None:
+        """F3/F4: seal the active volumes of dead writers, cut back to their committed bytes.
+
+        A writer holds a lock on each volume it owns, so a volume we can lock has none. Its
+        tail past the last committed needle was never committed: it goes.
+        """
+        # ponytail: always seals; adopt the volume instead if partial volumes pile up
+        if fcntl is None or not self.directory.is_dir():
+            return
+        with self.engine.begin() as conn:
+            active = conn.exec_driver_sql("SELECT id FROM ms_volumes WHERE state = 'active'").fetchall()
+            for (volume_id,) in active:
+                try:
+                    fd = os.open(self.path(volume_id), os.O_RDWR)
+                except FileNotFoundError:  # check() reports it
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:  # a live writer owns it
+                        continue
+                    (end,) = conn.exec_driver_sql(
+                        f'SELECT COALESCE(MAX("offset" + {NEEDLE} + length), {HEADER})'
+                        " FROM ms_payloads WHERE volume_id = ?",
+                        (volume_id,),
+                    ).fetchone()
+                    if os.fstat(fd).st_size > end:
+                        os.ftruncate(fd, end)
+                        os.fsync(fd)
+                    conn.exec_driver_sql(
+                        "UPDATE ms_volumes SET state = 'sealed', size = ? WHERE id = ?", (end, volume_id)
+                    )
+                finally:
+                    os.close(fd)
 
     # -- writing ---------------------------------------------------------
 

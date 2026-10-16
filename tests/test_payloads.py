@@ -208,3 +208,47 @@ def test_rollback_truncates_reused_volume_and_removes_new_ones(project, monkeypa
     assert _rows(project, 'SELECT volume_id, "offset" FROM ms_payloads WHERE id=?', (second,)) == [(1, size)]
     assert store.get_many([first, second]) == {first: b"aaaa", second: b"dddd"}
     store.close()
+
+
+# -- V1-5 recovery at open -------------------------------------------------
+
+import subprocess
+import sys
+import textwrap
+
+
+def _run(code, *args):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    return subprocess.run([sys.executable, "-c", textwrap.dedent(code), *map(str, args)], env=env)
+
+
+def test_open_cuts_the_uncommitted_tail_of_a_dead_writer(project):
+    done = _run(
+        """
+        import os, sys
+        from ms_flow.core.database import ProjectStore
+        from ms_flow.payloads import Payload, PayloadStore
+        project = ProjectStore.open_at(sys.argv[1])
+        store = PayloadStore(project)
+        with project.get_session() as session:
+            store.put(session, [Payload(b"committed")])
+            session.commit()
+        session = project.get_session()
+        store.put(session, [Payload(b"x" * 1000)])  # synced, never committed
+        os._exit(137)
+        """,
+        project.db_path,
+    )
+    assert done.returncode == 137
+    volume = project.db_path.parent / "volumes" / "000000001.vol"
+    assert volume.stat().st_size > 1000
+    live = PayloadStore(project)
+    end = P.HEADER + 16 + len(b"committed")
+    assert volume.stat().st_size == end
+    (kept,) = _put(live, project, [Payload(b"live")])
+    PayloadStore(project).close()  # another writer opening leaves the live one alone
+    assert _rows(project, "SELECT id, state, size FROM ms_volumes ORDER BY id") == [
+        (1, "sealed", end), (2, "active", P.HEADER + 16 + 4)
+    ]
+    assert live.get(kept) == b"live" and live.get(1) == b"committed"
+    live.close()
