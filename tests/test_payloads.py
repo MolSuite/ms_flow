@@ -252,3 +252,20 @@ def test_open_cuts_the_uncommitted_tail_of_a_dead_writer(project):
     ]
     assert live.get(kept) == b"live" and live.get(1) == b"committed"
     live.close()
+
+
+# -- V1-6 edges ------------------------------------------------------------
+
+
+def test_edges_empty_exact_fit_one_over_and_oversize(project, monkeypatch):
+    monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 16 + 100)
+    store = PayloadStore(project)
+    blobs = [b"", b"e" * 84, b"f" * 100, b"g" * 101, b"h"]
+    ids = _put(store, project, [Payload(b) for b in blobs])
+    # "" and 84 bytes fill volume 1 exactly; 100 fits a fresh volume exactly;
+    # 101 is larger than any volume and goes alone; "h" opens the next one.
+    assert _rows(project, "SELECT volume_id FROM ms_payloads ORDER BY id") == [(1,), (1,), (2,), (3,), (4,)]
+    assert store.path(1).stat().st_size == P.VOLUME_SIZE == store.path(2).stat().st_size
+    assert store.get_many(reversed(ids)) == dict(zip(ids, blobs))
+    assert store.get(ids[0]) == b""
+    store.close()
