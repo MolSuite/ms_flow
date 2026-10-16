@@ -10,6 +10,7 @@ Refactor del motor de ms_flow: el banco de pruebas, lo que midió cada paso y lo
 | [docs/04-auditoria-tasks-jobs.md](docs/04-auditoria-tasks-jobs.md) | Auditoría del diseño de tasks y jobs contra el uso real en AMDockVS |
 | [docs/05-diseno-tasks-jobs.md](docs/05-diseno-tasks-jobs.md) | Diseño de tasks y jobs sobre el motor nuevo, estado de cada pieza y restos del motor viejo |
 | [docs/06-diseno-ejecutor-remoto.md](docs/06-diseno-ejecutor-remoto.md) | Propuesta del ejecutor remoto: Ray dentro del job del HPC, runner de `ms_flow` y decisiones abiertas |
+| [docs/08-plan-volumenes.md](docs/08-plan-volumenes.md) | Plan de los volúmenes para payloads por entidad: invariantes, fallos y recuperación, hitos V0-V7 (`ms_flow`) y A0-A8 (AMDockVS) con sus tareas |
 | `bench.py` | Mide el coste de orquestación y las comprobaciones de robustez; escribe `results/<paso>.json` |
 | `report.py` | Lee `results/*.json` y escribe el informe |
 | `workers.py` | Funciones de chunk del banco de pruebas |
