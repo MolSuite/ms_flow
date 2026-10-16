@@ -150,3 +150,61 @@ def test_reader_keeps_at_most_max_open_fds(project, monkeypatch):
         assert store.get_many(ids) == {pid: bytes([i]) for i, pid in enumerate(ids)}
         assert len(store._fds) == 2 and len(os.listdir("/proc/self/fd")) == before + 2
     store.close()
+
+
+# -- V1-4 put inside the caller's transaction --------------------------------
+
+
+def test_put_syncs_bytes_and_new_files_before_returning(project, monkeypatch):
+    synced = []
+    monkeypatch.setattr(P, "_datasync", lambda fd: synced.append(("file", fd)))
+    monkeypatch.setattr(P, "_fsync_dir", lambda d: synced.append(("dir", d)))
+    store = PayloadStore(project)
+    with project.get_session() as session:
+        store.put(session, [Payload(b"a", series="s1"), Payload(b"b", series="s2")])
+        assert sorted(kind for kind, _ in synced) == ["dir", "file", "file"]
+        synced.clear()
+        store.put(session, [Payload(b"c", series="s1")])
+        assert [kind for kind, _ in synced] == ["file"]  # same file, no new directory entry
+        session.commit()
+    store.close()
+
+
+def test_payload_rows_commit_and_roll_back_with_the_app_rows(project):
+    conn = _app_table(project.db_path)
+    conn.close()
+    store = PayloadStore(project)
+    with project.get_session() as session:
+        (pid,) = store.put(session, [Payload(b"kept")])
+        session.connection().exec_driver_sql("INSERT INTO app_items (structure_payload_id) VALUES (?)", (pid,))
+        session.commit()
+    with project.get_session() as session:
+        (lost,) = store.put(session, [Payload(b"lost")])
+        session.connection().exec_driver_sql("INSERT INTO app_items (structure_payload_id) VALUES (?)", (lost,))
+        session.rollback()
+    assert _rows(project, "SELECT structure_payload_id FROM app_items") == [(pid,)]
+    assert _rows(project, "SELECT id FROM ms_payloads") == [(pid,)]
+    with pytest.raises(KeyError):
+        store.get(lost)
+    assert store.get(pid) == b"kept"
+    store.close()
+
+
+def test_rollback_truncates_reused_volume_and_removes_new_ones(project, monkeypatch):
+    monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 2 * (16 + 4))
+    store = PayloadStore(project)
+    (first,) = _put(store, project, [Payload(b"aaaa")])
+    size = store.path(1).stat().st_size
+    for end in ("rollback", "close"):
+        session = project.get_session()
+        store.put(session, [Payload(b"bbbb"), Payload(b"cccc")])  # fills volume 1, seals it, opens another
+        assert len(list(store.directory.iterdir())) == 2
+        session.rollback() if end == "rollback" else session.close()
+        session.close()
+        assert [p.name for p in store.directory.iterdir()] == ["000000001.vol"]
+        assert store.path(1).stat().st_size == size
+        assert _rows(project, "SELECT id, state, size FROM ms_volumes") == [(1, "active", size)]
+    (second,) = _put(store, project, [Payload(b"dddd")])  # the volume is reused where it was
+    assert _rows(project, 'SELECT volume_id, "offset" FROM ms_payloads WHERE id=?', (second,)) == [(1, size)]
+    assert store.get_many([first, second]) == {first: b"aaaa", second: b"dddd"}
+    store.close()

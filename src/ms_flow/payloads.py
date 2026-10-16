@@ -25,6 +25,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from ms_flow.core.data.shard import _fsync_dir
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -42,6 +44,7 @@ _NEEDLE = struct.Struct("<IIIHH")  # crc32, stored length, raw length, codec, fl
 HEADER = _VOLUME_HEADER.size
 NEEDLE = _NEEDLE.size
 _IOV_MAX = 1024
+_datasync = getattr(os, "fdatasync", os.fsync)  # macOS has no fdatasync
 
 
 class PayloadCorrupt(Exception):
@@ -73,10 +76,27 @@ class _Volume:
         self.end = end
 
 
+class _Transaction:
+    """What one caller transaction wrote; undone unless it commits."""
+
+    __slots__ = ("session", "committed", "leased", "start", "created", "retired", "dir_dirty")
+
+    def __init__(self, session: Any):
+        self.session = session
+        self.committed = False
+        self.leased: dict[str, _Volume] = {}  # series -> the volume this transaction appends to
+        self.start: dict[_Volume, int] = {}  # volume -> its end before this transaction
+        self.created: set[_Volume] = set()
+        self.retired: list[_Volume] = []  # sealed in this transaction
+        self.dir_dirty = False
+
+
 class PayloadStore:
     """Writes and reads the payloads of one project."""
 
     def __init__(self, project: Any):
+        import weakref
+
         from ms_flow.core.database import ProjectStore, resolve_project_store
 
         if isinstance(project, (str, os.PathLike)):
@@ -85,8 +105,10 @@ class PayloadStore:
             store = resolve_project_store(project)
         self.engine = store.engine
         self.directory = Path(store.db_path).parent / "volumes"
-        self._active: dict[str, _Volume] = {}
-        self._retired: list[_Volume] = []  # sealed by this writer; closed once their bytes are written
+        self._lock = threading.Lock()  # guards _free and _transactions; never held during I/O
+        self._free: dict[str, list[_Volume]] = {}  # active volumes no open transaction is appending to
+        self._transactions: dict[Any, _Transaction] = {}  # root SessionTransaction -> its writes
+        self._hooked: weakref.WeakSet = weakref.WeakSet()
         self._fds: OrderedDict[int, list] = OrderedDict()  # volume id -> [fd, users, evicted]
         self._fd_lock = threading.Lock()
 
@@ -96,18 +118,25 @@ class PayloadStore:
     # -- writing ---------------------------------------------------------
 
     def put(self, session: Any, payloads: Iterable[Payload]) -> list[int]:
-        """Store `payloads` inside the caller's transaction; return their ids, in order."""
+        """Store `payloads` inside the caller's transaction; return their ids, in order.
+
+        The bytes are on disk (fdatasync) when this returns, so the caller's commit never
+        points to lost bytes. If that transaction does not commit, the volumes go back to
+        the size they had before it.
+        """
         payloads = list(payloads)
         if not payloads:
             return []
-        cursor = session.connection().connection.dbapi_connection.cursor()
+        connection = session.connection()  # begins the caller's transaction
+        tx = self._transaction(session)
+        cursor = connection.connection.dbapi_connection.cursor()
         try:
             pending: dict[_Volume, list] = {}
             placed = []
             for payload in payloads:
                 data = payload.data
                 size = len(data)
-                volume = self._volume_for(cursor, payload.series, NEEDLE + size)
+                volume = self._volume_for(tx, cursor, payload.series, NEEDLE + size)
                 crc = zlib.crc32(data)
                 pending.setdefault(volume, [volume.end, []])[1] += (
                     _NEEDLE.pack(crc, size, size, CODEC_NONE, 0),
@@ -117,7 +146,12 @@ class PayloadStore:
                 volume.end += NEEDLE + size
             for volume, (offset, buffers) in pending.items():
                 _write_all(volume.fd, buffers, offset)
+            for volume in pending:
+                _datasync(volume.fd)
                 cursor.execute("UPDATE ms_volumes SET size = ? WHERE id = ?", (volume.end, volume.id))
+            if tx.dir_dirty:  # a new volume file must survive a crash too
+                _fsync_dir(self.directory)
+                tx.dir_dirty = False
             ids = []
             for row in placed:
                 cursor.execute(
@@ -129,20 +163,71 @@ class PayloadStore:
             return ids
         finally:
             cursor.close()
-            for volume in self._retired:
-                os.close(volume.fd)
-            self._retired.clear()
 
-    def _volume_for(self, cursor, series: str, need: int) -> _Volume:
-        volume = self._active.get(series)
+    def _transaction(self, session: Any) -> _Transaction:
+        from sqlalchemy import event
+
+        root = session.get_transaction()
+        with self._lock:
+            tx = self._transactions.get(root)
+            if tx is None:
+                if session not in self._hooked:
+                    event.listen(session, "after_commit", self._after_commit)
+                    event.listen(session, "after_transaction_end", self._after_transaction_end)
+                    self._hooked.add(session)
+                tx = self._transactions[root] = _Transaction(session)
+            return tx
+
+    def _after_commit(self, session: Any) -> None:
+        with self._lock:
+            for tx in self._transactions.values():
+                if tx.session is session:
+                    tx.committed = True
+
+    def _after_transaction_end(self, session: Any, transaction: Any) -> None:
+        with self._lock:
+            tx = self._transactions.pop(transaction, None)
+        if tx is None:
+            return
+        keep = []
+        if tx.committed:
+            for volume in tx.retired:
+                os.close(volume.fd)
+            keep = list(tx.leased.values())
+        else:  # rollback, a failed commit, or close() without commit (F2)
+            for volume, start in tx.start.items():
+                if volume in tx.created:  # its ms_volumes row is gone: the file is nobody's
+                    os.close(volume.fd)
+                    self.path(volume.id).unlink(missing_ok=True)
+                else:  # its row is back to what it was, active
+                    os.ftruncate(volume.fd, start)
+                    volume.end = start
+                    keep.append(volume)
+        with self._lock:
+            for volume in keep:
+                self._free.setdefault(volume.series, []).append(volume)
+
+    def _volume_for(self, tx: _Transaction, cursor, series: str, need: int) -> _Volume:
+        volume = tx.leased.get(series)
+        if volume is None:
+            with self._lock:
+                free = self._free.get(series)
+                volume = free.pop() if free else None
+            if volume is not None:
+                tx.start[volume] = volume.end
+                tx.leased[series] = volume
         if volume is not None and volume.end > HEADER and volume.end + need > VOLUME_SIZE:
             cursor.execute(
                 "UPDATE ms_volumes SET state = 'sealed', size = ? WHERE id = ?", (volume.end, volume.id)
             )
-            self._retired.append(volume)
+            tx.retired.append(volume)
             volume = None
         if volume is None:
-            volume = self._active[series] = self._create(cursor, series)
+            volume = self._create(cursor, series)
+            tx.created.add(volume)
+            tx.start[volume] = HEADER
+            tx.leased[series] = volume
+            tx.dir_dirty = True
         return volume
 
     def _create(self, cursor, series: str) -> _Volume:
@@ -237,9 +322,12 @@ class PayloadStore:
                 os.close(entry[0])
 
     def close(self) -> None:
-        for volume in self._active.values():
+        """Close files. Call it with no transaction of this store open."""
+        with self._lock:
+            volumes = [v for free in self._free.values() for v in free]
+            self._free.clear()
+        for volume in volumes:
             os.close(volume.fd)
-        self._active.clear()
         with self._fd_lock:
             for entry in self._fds.values():
                 entry[2] = True
