@@ -2,6 +2,7 @@
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from contextlib import closing
 from pathlib import Path
@@ -81,3 +82,46 @@ def test_a_scratch_file_goes_to_dev_shm_when_it_fits_and_is_gone_after(monkeypat
         assert path.parent == Path(tempfile.gettempdir())  # no room in /dev/shm
         raise RuntimeError
     assert not path.exists()
+
+
+# The peak is VmHWM after resetting it: ru_maxrss survives exec, so it would start at pytest's own.
+_READ_ALL = """
+import sys
+sys.path[:0] = sys.argv[2].split(":")
+from ms_flow.core.database.project import ProjectStore
+from ms_flow.payloads import with_payloads
+from ms_flow.query import QuerySpec, Rows
+
+def status(key):
+    return next(int(line.split()[1]) for line in open("/proc/self/status") if line.startswith(key))
+
+project = ProjectStore.open_at(sys.argv[1])
+source = with_payloads(project, Rows(project, QuerySpec(table="ligands")), {"structure_payload_id": "structure"},
+                       window=int(sys.argv[3]))
+next(iter(project.payloads.iter_bytes([1])))
+open("/proc/self/clear_refs", "w").write("5")
+before = status("VmRSS:")
+total = sum(len(row["structure"] or b"") for row in source)
+total += sum(len(data) for _, data in project.payloads.iter_bytes(range(1, 100_001)))
+print(total, status("VmHWM:") - before)
+"""
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not os.path.exists("/proc/self/clear_refs"), reason="needs Linux's peak RSS reset")
+def test_reading_every_payload_keeps_memory_bounded(project):  # I8
+    import subprocess
+
+    add_ligands(project, 100_000, size=4096)  # 400 MB, read twice
+    path = os.pathsep.join(sys.path)
+
+    def peak_mb(window):
+        out = subprocess.run([sys.executable, "-c", _READ_ALL, str(project.db_path), path, str(window)],
+                             capture_output=True, text=True, timeout=300)
+        assert out.returncode == 0, out.stderr
+        total, grown_kb = map(int, out.stdout.split())
+        assert total == 2 * 100_000 * 4096
+        return grown_kb // 1024
+
+    assert peak_mb(500) < 64
+    assert peak_mb(100_000) > 300, "the measure would not see a source that holds everything"
