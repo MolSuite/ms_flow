@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -113,3 +114,39 @@ def test_volume_file_left_by_a_dead_transaction_is_never_reused(project):
     store.close()
     assert _rows(project, "SELECT id FROM ms_volumes") == [(2,)]
     assert store.path(1).read_bytes() == b"leftover"
+
+
+# -- V1-3 reader ------------------------------------------------------------
+
+
+def test_get_and_get_many_round_trip_in_location_order(project, monkeypatch):
+    monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 3 * (16 + 8))
+    store = PayloadStore(project)
+    blobs = [f"blob{i:04d}".encode() for i in range(10)]
+    ids = _put(store, project, [Payload(b, series="s") for b in blobs])
+    assert store.get(ids[3]) == blobs[3]
+    reads = []
+    real = P.os.pread
+    monkeypatch.setattr(P.os, "pread", lambda fd, n, off: reads.append(off) or real(fd, n, off))
+    asked = [ids[9], ids[0], ids[5], ids[0], ids[2]]  # unordered, one repeated
+    got = store.get_many(asked)
+    assert got == {i: blobs[ids.index(i)] for i in asked}
+    assert len(reads) == 4  # each id read once
+    located = [_rows(project, 'SELECT volume_id, "offset" FROM ms_payloads WHERE id=?', (i,))[0] for i in got]
+    assert located == sorted(located)
+    with pytest.raises(KeyError):
+        store.get_many([ids[0], 10_000])
+    store.close()
+
+
+def test_reader_keeps_at_most_max_open_fds(project, monkeypatch):
+    monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 16 + 1)  # one payload per volume
+    monkeypatch.setattr(P, "MAX_OPEN_FDS", 2)
+    store = PayloadStore(project)
+    ids = _put(store, project, [Payload(bytes([i])) for i in range(6)])
+    store.close()
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(2):
+        assert store.get_many(ids) == {pid: bytes([i]) for i, pid in enumerate(ids)}
+        assert len(store._fds) == 2 and len(os.listdir("/proc/self/fd")) == before + 2
+    store.close()
