@@ -1,6 +1,6 @@
 # 08 — Plan: volúmenes para los payloads por entidad
 
-Estado: **aprobado por Mario, 2026-10-16. Nada construido.** La dirección se acordó el 2026-10-15, después de los bancos de pruebas. Va primero en `ms_flow` (hitos V0-V7) y, cuando esté, en AMDockVS (hitos A0-A8). Cada tarea sigue la regla del README: una rama, un PR y su medida.
+Estado: **aprobado por Mario, 2026-10-16. V0 hecho salvo V0-4 (rama `feat/payload-volumes`).** La dirección se acordó el 2026-10-15, después de los bancos de pruebas. Va primero en `ms_flow` (hitos V0-V7) y, cuando esté, en AMDockVS (hitos A0-A8). Cada tarea sigue la regla del README: una rama, un PR y su medida.
 
 ## Lo que dijo Mario
 
@@ -210,13 +210,15 @@ Una casilla es una tarea; un hito está hecho cuando se cumple su línea «Hecho
 
 ### V0 — Banco de pruebas y línea base
 
-- [ ] **V0-1** Traer `bench2.py` y `bench3.py` a `benchmarks/refactor_optimization/bench_volumes.py`. Variantes: SQLite blobs (afinado), volúmenes con escritura en el padre y volúmenes por segmento. LMDB y RocksDB quedan fuera.
-- [ ] **V0-2** Lecturas con la caché fría: `posix_fadvise(POSIX_FADV_DONTNEED)` sobre cada fichero antes de cada medida de lectura. No necesita sudo.
-- [ ] **V0-3** Línea base en el disco actual: `results/volumes_baseline.json`.
+- [x] **V0-1** Traer `bench2.py` y `bench3.py` a `benchmarks/refactor_optimization/bench_volumes.py`. Variantes: SQLite blobs (afinado), volúmenes con escritura en el padre y volúmenes por segmento. LMDB y RocksDB quedan fuera.
+- [x] **V0-2** Lecturas con la caché fría: `posix_fadvise(POSIX_FADV_DONTNEED)` sobre cada fichero antes de cada medida de lectura. No necesita sudo.
+- [x] **V0-3** Línea base en el disco actual: `results/volumes_baseline.json`.
 - [ ] **V0-4** Repetir V0-3 en el disco nuevo. Esa medida decide V6.
-- [ ] **V0-5** Sección «Volumes» en `report.py`.
+- [x] **V0-5** Sección «Volumes» en `report.py`.
 
 Hecho cuando: las medidas reproducen las del 2026-10-15 con un margen del 10 %, y las lecturas en frío están en el informe.
+
+Resultado (2026-10-16, `results/volumes_baseline.json`, mismo disco; los volúmenes con 13 GB libres, como el 2026-10-15, y RT con 21 GB): la importación de los volúmenes se reproduce (HT −3 %, H +8 %, VP −5 %); VC sale un 14 % y RT un 12 % (serie) y un 35 % (paralelo) más rápidos, RT probablemente por el disco menos lleno. Las lecturas «en caliente» del 2026-10-15 no se reproducen (leer todo: 5 s hoy contra 32-49 s), porque aquel día los datos estaban en parte fuera de la caché; las de frío son las que valen: leer todo 32-43 s en volúmenes contra 72 s en RT, una molécula (p50) 370-630 µs contra 410-730 µs. V0-4 queda pendiente del disco nuevo.
 
 ### V1 — Formato y almacén, en un solo proceso
 
@@ -386,7 +388,7 @@ flowchart LR
 
 | Hito | Estado | Rama / PR |
 |---|---|---|
-| V0 Banco y línea base | ☐ | |
+| V0 Banco y línea base | ◐ (falta V0-4, disco nuevo) | `feat/payload-volumes` |
 | V1 Formato y almacén | ☐ | |
 | V2 Escribir desde jobs | ☐ | |
 | V3 Leer | ☐ | |
