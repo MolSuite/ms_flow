@@ -1,0 +1,48 @@
+{
+  "label": "V2-12",
+  "commit": "de9b646+dirty",
+  "machine": {
+    "hostname": "mario-LabPC",
+    "cpus": 16,
+    "kernel": "6.8.0-138-generic"
+  },
+  "disk": {
+    "device": "/dev/nvme0n1p3",
+    "fstype": "ext4",
+    "model": "XPG SPECTRIX S40G"
+  },
+  "recorded_at": "2026-10-16T21:35:52+00:00",
+  "mode": "parallel",
+  "n": 700000,
+  "workers": 14,
+  "variants": {
+    "parallel/PJ": {
+      "n": 700000,
+      "workers": 14,
+      "import_s": 215.753,
+      "durable_s": 215.783,
+      "files": 10,
+      "size_mb": 9194
+    },
+    "parallel/VP": {
+      "n": 700000,
+      "workers": 14,
+      "import_s": 117.609,
+      "durable_s": 220.828,
+      "files": 35,
+      "size_mb": 9047,
+      "get_mol_p50_us": 36.6,
+      "get_mol_p99_us": 70.7,
+      "top1000_batch_s": 0.004,
+      "stream_all_current_s": 1.984,
+      "parallel_14x20k_random_s": 0.519,
+      "get_mol_p50_us_cold": 422.8,
+      "get_mol_p99_us_cold": 791.9,
+      "top1000_batch_s_cold": 0.117,
+      "stream_all_current_s_cold": 28.834,
+      "stream_all_current_cold_disk_mb": 8782.7,
+      "parallel_14x20k_random_s_cold": 4.125,
+      "parallel_14x20k_random_cold_disk_mb": 1895.7
+    }
+  }
+}

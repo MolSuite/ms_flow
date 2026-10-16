@@ -55,7 +55,7 @@ def test_parallel_variants_join_the_serial_run_of_the_same_label(tmp_path):
     (results / "volumes_t.json").write_text(json.dumps({"variants": {"serial/HT": {"n": 1}, "parallel/RT": {"n": 1}}}))
     record = run(tmp_path, "parallel", "--workers", "2")
     assert record["mode"] == "parallel" and record["workers"] == 2
-    assert set(record["variants"]) == {"serial/HT", "parallel/VP", "parallel/VC", "parallel/RT"}
+    assert set(record["variants"]) == {"serial/HT", "parallel/VP", "parallel/VC", "parallel/RT", "parallel/PJ"}
     assert record["variants"]["serial/HT"] == {"n": 1}  # the other mode is kept
     assert record["variants"]["parallel/RT"]["n"] == 3000  # the same variant is replaced
     for name in ("parallel/VP", "parallel/VC", "parallel/RT"):
@@ -63,6 +63,9 @@ def test_parallel_variants_join_the_serial_run_of_the_same_label(tmp_path):
         check_cold(record["variants"][name], PARALLEL_READS, "parallel_2x20k_random")
         assert "parallel_2x20k_random_s" in record["variants"][name]
     assert record["variants"]["parallel/VC"]["files"] == 4  # project.db and one segment per chunk of 1000
+    job = record["variants"]["parallel/PJ"]  # a real ms_flow job: import only, its reads are V3
+    assert job["verified_ids"] == 200 and job["durable_s"] >= job["import_s"] > 0
+    assert job["files"] == 3  # project.db, a "ligands" and a "poses" volume
 
 
 def test_variant_that_does_not_fit_is_refused_before_it_runs(tmp_path):

@@ -237,18 +237,20 @@ Hecho cuando: V1-6 a V1-8 pasan, V1-9 está en el informe y el coste del fsync p
 
 ### V2 — Escribir desde jobs (bytes en el resultado)
 
-- [ ] **V2-1** Tipo `Payload(data, kind, series)`: se serializa con pickle sin copias extra.
-- [ ] **V2-2** `_Table.write` (`engine/flow.py`) cambia cada `Payload` de las filas por un id, en tablas y grafos.
-- [ ] **V2-3** `persist_output_spec` recibe las filas de `ms_payloads` y las inserta en la misma transacción que las de la app (I2).
-- [ ] **V2-4** Un fsync de los volúmenes tocados antes de confirmar el grupo (I1), y truncado al inicio del grupo si `write` falla (F2).
-- [ ] **V2-5** Mismo job de prueba en los ejecutores de proceso, hilo, Ray con `shared=False` (en local) y `RemoteExecutor` con `Remote(host=None)`: `project.db` y los bytes, idénticos en los cuatro.
-- [ ] **V2-6** Reanudar: un job muerto a mitad que se reanuda deja el mismo número de payloads que entidades; `check` limpio.
-- [ ] **V2-7** F1: una task que falla no deja nada.
-- [ ] **V2-8** F2: un `write` que falla deja el volumen del tamaño anterior y ninguna fila.
-- [ ] **V2-9** F3-F5: puntos de inyección (`MSFLOW_PAYLOADS_FAULT=<punto>` → `os._exit(137)`), un subproceso por punto; después, abrir, `check` y reanudar.
-- [ ] **V2-10** F6: el orden fsync → commit queda comprobado (los dos se registran con monkeypatch).
-- [ ] **V2-11** F7: `RLIMIT_FSIZE` y `SIGXFSZ` ignorada → el job falla con un mensaje claro y nada a medias.
-- [ ] **V2-12** Banco: 14 workers a 700k, comparado con los 134 s de «volúmenes, escribe el padre».
+- [x] **V2-1** Tipo `Payload(data, kind, series)`: se serializa con pickle sin copias extra.
+- [x] **V2-2** `_Table.write` (`engine/flow.py`) cambia cada `Payload` de las filas por un id, en tablas y grafos.
+- [x] **V2-3** `persist_output_spec` recibe las filas de `ms_payloads` y las inserta en la misma transacción que las de la app (I2).
+- [x] **V2-4** Un fsync de los volúmenes tocados antes de confirmar el grupo (I1), y truncado al inicio del grupo si `write` falla (F2).
+- [x] **V2-5** Mismo job de prueba en los ejecutores de proceso, hilo, Ray con `shared=False` (en local) y `RemoteExecutor` con `Remote(host=None)`: `project.db` y los bytes, idénticos en los cuatro.
+- [x] **V2-6** Reanudar: un job muerto a mitad que se reanuda deja el mismo número de payloads que entidades; `check` limpio.
+- [x] **V2-7** F1: una task que falla no deja nada.
+- [x] **V2-8** F2: un `write` que falla deja el volumen del tamaño anterior y ninguna fila.
+- [x] **V2-9** F3-F5: puntos de inyección (`MSFLOW_PAYLOADS_FAULT=<punto>` → `os._exit(137)`), un subproceso por punto; después, abrir, `check` y reanudar.
+- [x] **V2-10** F6: el orden fsync → commit queda comprobado (los dos se registran con monkeypatch).
+- [x] **V2-11** F7: `RLIMIT_FSIZE` y `SIGXFSZ` ignorada → el job falla con un mensaje claro y nada a medias.
+- [x] **V2-12** Banco: 14 workers a 700k, comparado con los 134 s de «volúmenes, escribe el padre».
+  Resultado (2026-10-16, `results/volumes_V2-12.json`, variante PJ: `Flow` + `ProcessExecutor(14)` + `table_sink` con `Payload`): PJ 215,8 s de importación (215,8 s con `sync`). VP de la misma corrida: 117,6 s de importación, 220,8 s con `sync`. En disco, PJ queda un 2,3 % por debajo de VP; contando solo `import_s`, queda un 61 % por encima de los 134 s, porque VP nunca hace fsync y sus 9 GB se quedan en la caché de páginas (lo mismo que HT en V1-9). El criterio literal no se cumple; el de tiempo a disco, sí.
+  Desvíos: el cambio de `Payload` por id vive en `bulk_insert_rows` / `insert_graph` (donde está la transacción), no en `_Table.write`. El diario del motor escribe cada 50 ms: un proceso muerto antes pierde el registro del job y no hay nada que reanudar (el test de V2-9 mata en la 4.ª escritura).
 
 Hecho cuando: V2-5 a V2-11 pasan y V2-12 queda dentro del 10 % de 134 s en el disco actual.
 
@@ -391,7 +393,7 @@ flowchart LR
 |---|---|---|
 | V0 Banco y línea base | ◐ (falta V0-4, disco nuevo) | `feat/payload-volumes` |
 | V1 Formato y almacén | ☑ (PS +20 % frente a HT en disco, ver V1-9) | `feat/payload-volumes-v1` |
-| V2 Escribir desde jobs | ☐ | |
+| V2 Escribir desde jobs | ◐ (V2-12: −2 % frente a VP en disco, +61 % frente a 134 s solo importación; decide Mario) | `feat/payload-volumes-v2` |
 | V3 Leer | ☐ | |
 | V4 Mantenimiento | ☐ | |
 | V5 Compresión | ☐ | |
