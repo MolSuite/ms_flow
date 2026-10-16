@@ -349,3 +349,15 @@ def test_two_writing_processes_and_a_reader_see_only_committed_bytes(project):
     kinds = dict(_rows(project, "SELECT id, kind FROM ms_payloads"))
     assert {pid: data.decode() for pid, data in store.get_many(kinds).items()} == kinds
     store.close()
+
+
+# -- D2: app references are found from the schema --------------------------
+
+
+def test_referencing_columns_come_from_the_app_schema(project):
+    conn = _app_table(project.db_path)
+    conn.execute("CREATE TABLE poses (id INTEGER PRIMARY KEY, pose_payload_id INTEGER REFERENCES ms_payloads(id), n INTEGER)")
+    conn.close()
+    store = PayloadStore(project)
+    assert sorted(store.referencing_columns()) == [("app_items", "structure_payload_id"), ("poses", "pose_payload_id")]
+    store.close()

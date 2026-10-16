@@ -287,6 +287,21 @@ class PayloadStore:
         os.pwrite(fd, _VOLUME_HEADER.pack(MAGIC, VERSION, 0, volume_id, label), 0)
         return _Volume(volume_id, series, fd, HEADER)
 
+    def referencing_columns(self) -> list[tuple[str, str]]:
+        """(table, column) of every app column that holds payload ids.
+
+        Read from the schema (`PRAGMA foreign_key_list`): an app declares
+        `REFERENCES ms_payloads(id)` and registers nothing with ms_flow.
+        """
+        with self.engine.connect() as conn:
+            tables = [r[0] for r in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'table'")]
+            return [
+                (table, fk[3])
+                for table in tables
+                for fk in conn.exec_driver_sql(f'PRAGMA foreign_key_list("{table}")')
+                if fk[2] == "ms_payloads"
+            ]
+
     # -- reading ---------------------------------------------------------
 
     def get(self, payload_id: int) -> bytes:
