@@ -16,10 +16,16 @@ serial: one writer, 1000 molecules per commit (the `bench2.py` of 2026-10-15)
   HT  volumes, no fsync: the same durability as RT
   H   volumes, fsync of the volume before each commit
   RT  SQLite blobs (Ringtail-like), tuned: synchronous=OFF
+  PS  ms_flow.payloads.PayloadStore in a real project.db: put + molecule rows + commit per 1000 molecules,
+      fdatasync of the touched volumes per commit (D3). Import only (V1-9); its reads are V3
+  PSN PS with the fdatasync skipped: PS - PSN is what the group fsync costs
 parallel: `--workers` loky processes produce the payloads and one parent writes (the `bench3.py` of 2026-10-15)
   VP  volumes, the parent appends the bytes that come back with each result
   VC  volumes, each worker writes one segment file per chunk and the parent keeps the references
   RT  SQLite blobs, the parent inserts
+
+`durable_s` is `import_s` plus the `sync` right after it: the time until the import is on the disk. Variants that never
+sync (HT, PSN) otherwise finish in the page cache whenever the data fits in RAM.
 
 The read metrics are measured twice. The plain ones are warm, as on 2026-10-15: the files were just written, so SQLite
 and the volumes sit in the page cache. The `_cold` ones come after, each preceded by `fsync` + `posix_fadvise(DONTNEED)`
@@ -58,7 +64,7 @@ VOL_MAX = 256 << 20
 FLUSH_EVERY = 16  # results per index commit in the parallel import, as ms_flow output_flush_every
 DOCKED_FRACTION = 0.2
 SPARE = 1_500_000_000  # bytes that must stay free after a variant
-VARIANTS = {"serial": ("HT", "H", "RT"), "parallel": ("VP", "VC", "RT")}
+VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT")}
 # The payloads come from this pool; seeded, so every process (a loky worker, a test) produces the same bytes.
 _POOL = random.Random(0).randbytes(32768).hex().encode()
 
@@ -273,6 +279,60 @@ def import_parallel(variant, root, n, workers):
 
 # --- Reader -------------------------------------------------------------------------
 
+def measure_store(variant, root, n, quick):
+    """PS/PSN: the import through PayloadStore, the way a job's writer will do it."""
+    from ms_flow import payloads
+    from ms_flow.core.database import ProjectStore
+
+    docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
+    project = ProjectStore.open_at(root / "project.db")
+    with project.engine.begin() as c:
+        c.exec_driver_sql("CREATE TABLE molecules(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL, "
+                          + ", ".join(f"{k}_payload_id INTEGER REFERENCES ms_payloads(id)" for k in KINDS) + ")")
+        c.exec_driver_sql("CREATE INDEX ix_score ON molecules(score)")
+        for k in KINDS:
+            c.exec_driver_sql(f"CREATE INDEX ix_{k} ON molecules({k}_payload_id)")
+    real_sync = payloads._datasync
+    if variant == "PSN":
+        payloads._datasync = lambda fd: None
+    store = payloads.PayloadStore(project)
+    rng = random.Random(1)
+    insert = f"INSERT INTO molecules VALUES (?,?,?,?,{','.join('?' * len(KINDS))})"
+    try:
+        t = time.perf_counter()
+        for start in range(0, n, SHARD):
+            ids = range(start, min(n, start + SHARD))
+            wanted = [(i, k) for i in ids for k in kinds_for(i, docked.__contains__)]
+            got = dict(zip(wanted, store.put(session := project.get_session(), [
+                payloads.Payload(payload(i, k), kind=k, series="poses" if k == "pose" else "ligands") for i, k in wanted])))
+            rows = [(i, rng.uniform(150, 700), rng.uniform(-2, 7), rng.uniform(-12, -3), *(got.get((i, k)) for k in KINDS))
+                    for i in ids]
+            session.connection().connection.dbapi_connection.executemany(insert, rows)
+            session.commit()
+            session.close()
+        with project.engine.connect() as c:
+            c.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+        res = {"n": n, "import_s": time.perf_counter() - t}
+        res["durable_s"] = res["import_s"] + timed_sync()
+        if quick:
+            mols = random.Random(4).sample(range(n), min(200, n))
+            with project.engine.connect() as c:
+                refs = {r[0]: r[1:] for r in c.exec_driver_sql("SELECT id, " + ", ".join(f"{k}_payload_id" for k in KINDS)
+                                                                 + " FROM molecules")}
+            for i in mols:
+                for k, pid in zip(KINDS, refs[i]):
+                    assert (pid is not None) == (k in kinds_for(i, docked.__contains__))
+                    assert pid is None or store.get(pid) == payload(i, k), (i, k)
+            res["verified_ids"] = len(mols)
+    finally:
+        store.close()
+        payloads._datasync = real_sync
+        project.dispose()
+    res["files"] = sum(len(files) for _, _, files in os.walk(root))
+    res["size_mb"] = round(dir_size(root) / 1e6)
+    return res
+
+
 class Reader:
     """Both modes: key -> bytes, from SQLite blobs or from volumes through (vol, off, len)."""
 
@@ -335,6 +395,14 @@ def _read_keys(variant, root, keys):  # parallel loky task: integer keys
 
 
 # --- Measurements -------------------------------------------------------------------
+
+def timed_sync():
+    """Seconds to flush what the import left in the page cache: without it, an import that never syncs
+    looks as fast as the RAM, not the disk."""
+    t = time.perf_counter()
+    subprocess.run(["sync"])
+    return time.perf_counter() - t
+
 
 def timed(fn):
     t = time.perf_counter()
@@ -495,7 +563,7 @@ def measure_serial(variant, root, n, quick, dev=None):
     res = {"n": n}
 
     res["import_s"] = import_serial(variant, root, n, docked)
-    subprocess.run(["sync"])
+    res["durable_s"] = res["import_s"] + timed_sync()
     res["files"] = sum(len(files) for _, _, files in os.walk(root))
     res["size_mb"] = round(dir_size(root) / 1e6)
     res["du_mb"] = int(subprocess.run(["du", "-sm", str(root)], capture_output=True, text=True).stdout.split()[0])
@@ -563,7 +631,7 @@ def measure_parallel(variant, root, n, workers, quick, dev=None):
     (root / "volumes").mkdir(parents=True)
     res = {"n": n, "workers": workers}
     res["import_s"] = import_parallel(variant, root, n, workers)
-    subprocess.run(["sync"])
+    res["durable_s"] = res["import_s"] + timed_sync()
     res["files"] = sum(len(f) for _, _, f in os.walk(root))
     res["size_mb"] = round(dir_size(root) / 1e6)
 
@@ -690,7 +758,9 @@ def main(argv=None):
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir()
         try:
-            if args.mode == "serial":
+            if variant in ("PS", "PSN"):
+                res = measure_store(variant, root, n, args.quick)
+            elif args.mode == "serial":
                 res = measure_serial(variant, root, n, args.quick, dev)
             else:
                 res = measure_parallel(variant, root, n, args.workers, args.quick, dev)

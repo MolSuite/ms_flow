@@ -199,7 +199,7 @@ def summarize(records: list[dict]) -> list[dict]:
 
 VOL_BASE = "2026-10-15"  # the hand-run the volumes plan (08) must reproduce
 VOL_MARGIN_PCT = 10.0  # "Hecho cuando" of V0
-VOL_COLS = (("import_s", "import s"), ("size_mb", "size MB"), ("files", "files"), ("get_mol_p50_us", "get_mol p50 µs"),
+VOL_COLS = (("import_s", "import s"), ("durable_s", "import + sync s"), ("size_mb", "size MB"), ("files", "files"), ("get_mol_p50_us", "get_mol p50 µs"),
             ("get_mol_p99_us", "get_mol p99 µs"), ("stream_all_current_s", "stream all s"),
             ("stream_all_current_s_cold", "stream all s, cold"), ("random_s", "random read s"),
             ("random_s_cold", "random read s, cold"), ("update_5000_s", "update 5000 s"))
@@ -243,7 +243,22 @@ def volumes_view(records: list[dict]) -> dict:
                     pct = 100 * (b / a - 1)
                     row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
             drift["rows"].append(row)
-    return {"modes": out, "base": VOL_BASE, "drift": drift}
+    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records)}
+
+
+def _fsync_cost(records: list[dict]) -> list[dict]:
+    """V1-9: per run with PS and PSN, what the group fsync adds to the import, and PS against HT of the same run."""
+    out = []
+    for rec in records:
+        v = {k: rec["variants"].get(f"serial/{k}", {}).get("import_s") for k in ("PS", "PSN", "HT")}
+        d = {k: rec["variants"].get(f"serial/{k}", {}).get("durable_s") for k in ("PS", "PSN", "HT")}
+        if v["PS"] and v["PSN"]:
+            pct = lambda a, b: round(100 * (a / b - 1), 1) if a and b else None
+            # PSN without a sync ends partly in the page cache: on disk time when the run has it
+            fsync = pct(d["PS"], d["PSN"]) if d["PS"] and d["PSN"] else pct(v["PS"], v["PSN"])
+            out.append({"label": rec["label"], **v, "fsync_pct": fsync, "vs_ht_pct": pct(v["PS"], v["HT"]),
+                        "vs_ht_durable_pct": pct(d["PS"], d["HT"]), "flag": fsync > VOL_MARGIN_PCT})
+    return out
 
 
 def _self_check() -> None:
@@ -270,6 +285,12 @@ def _self_check() -> None:
     assert d["rows"][0]["import_s"] == {"was": 100.0, "now": 120.0, "pct": 20.0, "flag": True}
     assert d["rows"][0]["stream_all_current_s"]["pct"] == 2.5 and not d["rows"][0]["stream_all_current_s"]["flag"]
     assert volumes_view([vrec(VOL_BASE, "2026-10-15", old)])["drift"] is None
+    (cost,) = volumes_view([vrec("v1", "2026-11-01", {**new, "serial/PSN": {"n": 9, "import_s": 0.8}})])["fsync"]
+    assert (cost["fsync_pct"], cost["vs_ht_pct"], cost["vs_ht_durable_pct"], cost["flag"]) == (25.0, -99.2, None, True)
+    durable = {**new, "serial/PS": {"import_s": 1.0, "durable_s": 1.05}, "serial/PSN": {"import_s": 0.8, "durable_s": 1.0},
+               "serial/HT": {**new["serial/HT"], "durable_s": 0.5}}
+    (cost,) = volumes_view([vrec("v1", "2026-11-01", durable)])["fsync"]
+    assert (cost["fsync_pct"], cost["vs_ht_pct"], cost["vs_ht_durable_pct"], cost["flag"]) == (5.0, -99.2, 110.0, False)
 
 
 _self_check()
@@ -418,11 +439,13 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <h2>Volumes</h2>
   <p class="sub"><code>bench_volumes.py</code> stores molecule payloads two ways and times the same reads on both: SQLite blobs
     (<b>RT</b>) against append-only volumes (serial: <b>HT</b> no fsync, <b>H</b> fsync per shard; parallel: <b>VP</b> the parent
-    writes, <b>VC</b> one segment per chunk). <b>Warm</b> reads run right after the import, with the data in the page cache;
+    writes, <b>VC</b> one segment per chunk; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
+    without it). <b>Warm</b> reads run right after the import, with the data in the page cache;
     <b>cold</b> ones run after <code>fsync</code> and <code>posix_fadvise(DONTNEED)</code> on every file, so they come from the disk.
     A blank cell was not measured (the 2026-10-15 run has no cold reads). Plan: <a href="08-plan-volumenes.md">08-plan-volumenes.md</a>.</p>
   <div class="scroll" id="volumes"></div>
   <div class="scroll" id="drift"></div>
+  <div class="scroll" id="fsync"></div>
 </div>
 
 <div class="card">
@@ -537,6 +560,12 @@ function volumes(host, drift) {
         return c ? `<td class="b">${f(c.was)}</td><td>${f(c.now)}</td><td class="${c.flag ? 'bad' : 'muted'}">${c.pct > 0 ? '+' : c.pct < 0 ? '−' : ''}${Math.abs(c.pct).toFixed(1)} %</td>`
           : '<td class="b"></td><td></td><td></td>'; }).join('') + '</tr>').join('') + '</table>'
       + `<p class="note">Warm reads. Red: more than ${d.margin} % away from ${esc(d.base)}, the margin V0 asks to reproduce; a variant only in one of the two runs is not listed.</p>`);
+  const c = D.volumes.fsync, pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
+  document.getElementById('fsync').innerHTML = !c.length ? '' : '<h3>Group fsync (D3)</h3><table><tr><th class="l">Run</th><th class="b">PS import s</th>'
+    + '<th>PSN import s</th><th>fsync cost</th><th>HT import s</th><th>PS vs HT</th><th>PS vs HT, import + sync</th></tr>'
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td class="b">${f(r.PS)}</td><td>${f(r.PSN)}</td><td class="${r.flag ? 'bad' : 'muted'}">${pc(r.fsync_pct)}</td>`
+      + `<td>${f(r.HT)}</td><td>${pc(r.vs_ht_pct)}</td><td>${pc(r.vs_ht_durable_pct)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">fsync cost: PS against PSN of the same run, import + sync when the run has it. Red: the fsync costs more than 10 % of the import, the limit of V1 (then D3 is revisited). HT never syncs, so its import s ends in the page cache; import + sync compares both on the disk.</p>';
 }
 
 function table(host) {
