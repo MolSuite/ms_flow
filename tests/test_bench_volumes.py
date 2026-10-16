@@ -36,9 +36,12 @@ def test_serial_variants_read_back_what_was_written(tmp_path):
     record = run(tmp_path, "serial")
     assert record["mode"] == "serial" and record["n"] == 3000 and record["workers"] is None
     assert record["machine"]["cpus"] and record["commit"]
-    assert set(record["variants"]) == {"serial/HT", "serial/H", "serial/RT"}
+    assert set(record["variants"]) == {"serial/HT", "serial/H", "serial/RT", "serial/PS", "serial/PSN"}
     for res in record["variants"].values():
-        assert res["verified_ids"] == 200
+        assert res["verified_ids"] == 200 and res["durable_s"] >= res["import_s"] > 0
+    for name in ("serial/PS", "serial/PSN"):  # import only; their reads are V3
+        assert record["variants"].pop(name)["files"] == 3  # project.db, a "ligands" and a "poses" volume
+    for res in record["variants"].values():
         check_cold(res, SERIAL_READS, "parallel_8x10k_random")
         assert res["import_s"] > 0 and res["update_5000_s"] > 0 and res["get_mol_p99_us"] >= res["get_mol_p50_us"]
     assert record["variants"]["serial/RT"]["files"] == 1  # blobs live in project.db

@@ -1,0 +1,67 @@
+{
+  "label": "V1-9",
+  "commit": "bd2103c+dirty",
+  "machine": {
+    "hostname": "mario-LabPC",
+    "cpus": 16,
+    "kernel": "6.8.0-138-generic"
+  },
+  "disk": {
+    "device": "/dev/nvme0n1p3",
+    "fstype": "ext4",
+    "model": "XPG SPECTRIX S40G"
+  },
+  "recorded_at": "2026-10-16T20:48:50+00:00",
+  "mode": "serial",
+  "n": 700000,
+  "workers": null,
+  "variants": {
+    "serial/PS": {
+      "n": 700000,
+      "import_s": 261.742,
+      "durable_s": 261.773,
+      "files": 10,
+      "size_mb": 9202
+    },
+    "serial/PSN": {
+      "n": 700000,
+      "import_s": 235.028,
+      "durable_s": 243.219,
+      "files": 10,
+      "size_mb": 9202
+    },
+    "serial/HT": {
+      "n": 700000,
+      "import_s": 121.387,
+      "durable_s": 218.248,
+      "files": 35,
+      "size_mb": 9099,
+      "du_mb": 8678,
+      "query_top1000_s": 0.008,
+      "read_top1000_current_s": 0.019,
+      "read_top_poses_s": 0.004,
+      "stream_all_current_s": 5.34,
+      "sort_unindexed_logp_top1000_s": 0.055,
+      "count_filter_s": 0.045,
+      "page_by_score_offset_s": 0.001,
+      "open_and_get_mol_x_ms": 0.397,
+      "get_mol_p50_us": 24.23,
+      "get_mol_p99_us": 44.041,
+      "parallel_8x10k_random_s": 0.259,
+      "update_5000_s": 1.241,
+      "query_top1000_s_cold": 0.253,
+      "read_top1000_current_s_cold": 0.226,
+      "read_top_poses_s_cold": 0.088,
+      "stream_all_current_s_cold": 34.395,
+      "stream_all_current_cold_disk_mb": 8700.9,
+      "sort_unindexed_logp_top1000_s_cold": 0.525,
+      "count_filter_s_cold": 0.517,
+      "page_by_score_offset_s_cold": 0.098,
+      "open_and_get_mol_x_ms_cold": 67.063,
+      "get_mol_p50_us_cold": 368.255,
+      "get_mol_p99_us_cold": 693.98,
+      "parallel_8x10k_random_s_cold": 1.861,
+      "parallel_8x10k_random_cold_disk_mb": 606.7
+    }
+  }
+}

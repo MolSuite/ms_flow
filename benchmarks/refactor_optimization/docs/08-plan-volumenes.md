@@ -222,15 +222,16 @@ Resultado (2026-10-16, `results/volumes_baseline.json`, mismo disco; los volúme
 
 ### V1 — Formato y almacén, en un solo proceso
 
-- [ ] **V1-1** Modelos `ms_volumes` y `ms_payloads` en `core/database/project_models.py`.
-- [ ] **V1-2** El módulo (D1) con el formato de aguja, el escritor de volumen (`O_EXCL`, cambio de volumen al llegar al tamaño, uno activo por serie) y la asignación de ids en `ms_volumes`.
-- [ ] **V1-3** Lector: `pread` de la longitud exacta, comprobación de la cabecera, caché LRU de descriptores (tope de 256), `get_many` ordenado por (volumen, offset) y en lotes.
-- [ ] **V1-4** `put(session, payloads)`: añadir, fsync y filas de `ms_payloads` dentro de la transacción de quien llama.
-- [ ] **V1-5** Truncado de la cola de los volúmenes `active` al abrir (F3).
-- [ ] **V1-6** Tests: ida y vuelta; payload de 0 bytes; payload justo en el límite y mayor que el volumen; cambio de volumen; tope de descriptores; `get_many` con ids repetidos y desordenados.
-- [ ] **V1-7** Test de crc32: cambiar un byte → `PayloadCorrupt` (I7).
-- [ ] **V1-8** Test con dos procesos que escriben a la vez (F15) y un tercero que lee: solo ve lo confirmado.
-- [ ] **V1-9** Banco: un escritor a 700k, igual o mejor que «volúmenes, sin fsync» con fsync por grupo.
+- [x] **V1-1** Modelos `ms_volumes` y `ms_payloads` en `core/database/project_models.py`.
+- [x] **V1-2** El módulo (D1) con el formato de aguja, el escritor de volumen (`O_EXCL`, cambio de volumen al llegar al tamaño, uno activo por serie) y la asignación de ids en `ms_volumes`.
+- [x] **V1-3** Lector: `pread` de la longitud exacta, comprobación de la cabecera, caché LRU de descriptores (tope de 256), `get_many` ordenado por (volumen, offset) y en lotes.
+- [x] **V1-4** `put(session, payloads)`: añadir, fsync y filas de `ms_payloads` dentro de la transacción de quien llama.
+- [x] **V1-5** Truncado de la cola de los volúmenes `active` al abrir (F3).
+- [x] **V1-6** Tests: ida y vuelta; payload de 0 bytes; payload justo en el límite y mayor que el volumen; cambio de volumen; tope de descriptores; `get_many` con ids repetidos y desordenados.
+- [x] **V1-7** Test de crc32: cambiar un byte → `PayloadCorrupt` (I7).
+- [x] **V1-8** Test con dos procesos que escriben a la vez (F15) y un tercero que lee: solo ve lo confirmado.
+- [x] **V1-9** Banco: un escritor a 700k, igual o mejor que «volúmenes, sin fsync» con fsync por grupo.
+  Resultado (2026-10-16, `results/volumes_V1-9.json`, importación + `sync`): PS 261,8 s, PSN 243,2 s, HT 218,2 s. El fsync por grupo cuesta un 7,6 % (D3 se sostiene). PS queda un 20 % por encima de HT, pero no por el fsync: PSN ya está un 11 % por encima (project.db real y las filas de `ms_payloads`). Contando solo `import_s`, HT marca 121 s porque nunca hace `sync` y sus 9 GB se quedan en la caché de páginas.
 
 Hecho cuando: V1-6 a V1-8 pasan, V1-9 está en el informe y el coste del fsync por grupo es como mucho un 10 % del tiempo de importación (si no, se revisa D3).
 
@@ -389,7 +390,7 @@ flowchart LR
 | Hito | Estado | Rama / PR |
 |---|---|---|
 | V0 Banco y línea base | ◐ (falta V0-4, disco nuevo) | `feat/payload-volumes` |
-| V1 Formato y almacén | ☐ | |
+| V1 Formato y almacén | ☑ (PS +20 % frente a HT en disco, ver V1-9) | `feat/payload-volumes-v1` |
 | V2 Escribir desde jobs | ☐ | |
 | V3 Leer | ☐ | |
 | V4 Mantenimiento | ☐ | |
