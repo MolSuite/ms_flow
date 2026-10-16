@@ -184,3 +184,22 @@ def test_a_write_that_fails_leaves_the_volume_as_it_was_and_no_rows(project):  #
         project.persist_output_spec(docking.__job__["output"], bad)
     assert {path.name: path.stat().st_size for path in project.payloads.directory.iterdir()} == before
     assert_clean(project, 16)  # and the "poses" volume made for this write is gone
+
+
+def test_the_bytes_are_synced_before_their_rows_commit(project, monkeypatch):  # F6: the order I1 needs
+    from sqlalchemy import event
+
+    from ms_flow import payloads
+
+    log = []
+    sync, sync_dir = payloads._datasync, payloads._fsync_dir
+    monkeypatch.setattr(payloads, "_datasync", lambda fd: (log.append("sync"), sync(fd)))
+    monkeypatch.setattr(payloads, "_fsync_dir", lambda path: (log.append("dir"), sync_dir(path)))
+    event.listen(project.engine, "commit", lambda conn: log.append("commit"))
+    run(project, docking, {"n": 30})
+
+    groups = "".join(entry[0] for entry in log).split("c")  # each commit and what came before it
+    assert log[-1] == "commit" and groups[-1] == ""
+    assert all(group.startswith("ss") for group in groups[:-1])  # the ligands and the poses volume
+    assert groups[0] == "ssd"  # their files were new: the directory too
+    assert rows(project, "SELECT COUNT(*) FROM poses") == [(60,)]
