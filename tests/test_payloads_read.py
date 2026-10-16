@@ -2,10 +2,12 @@
 import os
 import sqlite3
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
 from ms_flow.core.database.project import ProjectStore
+from ms_flow.engine import File
 from ms_flow.payloads import Payload, with_payloads
 from ms_flow.query import QuerySpec, Rows
 
@@ -47,3 +49,12 @@ def test_a_source_with_payloads_gives_each_row_its_bytes_and_keeps_what_its_rows
     plain = with_payloads(project, iter(got[:3]), {"structure_payload_id": "structure"})
     assert not hasattr(plain, "open") and not hasattr(plain, "remaining")  # the engine asks with hasattr
     assert [row["structure"] for row in plain] == [structure(n) for n in range(3)]
+
+
+def test_materialize_writes_the_file_once_and_names_it_as_a_file(project, tmp_path):
+    add_ligands(project, 3)
+    path = project.payloads.materialize(2, tmp_path / "job", suffix=".sdf")
+    assert type(path) is File and Path(path).name == "2.sdf" and Path(path).read_bytes() == structure(1)
+    inode = os.stat(path).st_ino
+    assert project.payloads.materialize(2, tmp_path / "job", suffix=".sdf") == path and os.stat(path).st_ino == inode
+    assert sorted(p.name for p in (tmp_path / "job").iterdir()) == ["2.sdf"]  # no partial left

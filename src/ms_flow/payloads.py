@@ -338,6 +338,19 @@ class PayloadStore:
             raise KeyError(f"unknown payload ids: {missing[:10]}")
         return {i: self._read(i, located[i]) for i in sorted(located, key=located.__getitem__)}
 
+    def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str = ""):
+        """The payload as the file `<directory>/<id><suffix>`, written once: what a job hands its
+        tasks as a `File` (a receptor), which executors without the disk carry once per job."""
+        from ms_flow.engine.files import File
+
+        path = Path(directory) / f"{int(payload_id)}{suffix}"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+            part.write_bytes(self.get(payload_id))
+            os.replace(part, path)
+        return File(path)
+
     def _locate(self, ids: list[int]) -> dict[int, tuple]:
         found = {}
         with self.engine.connect() as conn:
