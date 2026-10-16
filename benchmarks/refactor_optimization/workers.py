@@ -54,3 +54,11 @@ def flaky(payload: dict) -> dict:
         if len(tries.read()) <= payload["fails"]:
             raise RuntimeError("not yet")
     return {"ok": 1}
+
+
+def structure(payload: int) -> dict:
+    """A row with the bytes of a molecule, the way a task hands them to a sink (`tests/test_payloads_jobs.py`)."""
+    from ms_flow.payloads import Payload
+
+    data = f"molecule {payload}\n".encode() * (payload % 7 + 1)
+    return {"n": payload, "structure_payload_id": Payload(data, kind="sdf", series="ligands")}

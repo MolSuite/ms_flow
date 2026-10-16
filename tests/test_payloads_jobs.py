@@ -1,11 +1,14 @@
 """Payloads written from jobs: a task returns `Payload`s in its rows and the sink stores them (V2)."""
 import sqlite3
+import sys
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
+from benchmarks.refactor_optimization import workers
 from ms_flow.core.database.project import ProjectStore
-from ms_flow.engine import Engine, Flow, ThreadExecutor, job, task
+from ms_flow.engine import Engine, Flow, ProcessExecutor, ThreadExecutor, job, task
 from ms_flow.payloads import Payload
 from ms_flow.sinks import graph_sink, table_sink
 
@@ -84,3 +87,44 @@ def test_a_graph_sink_stores_the_payloads_of_every_node(project):
     series = rows(project, "SELECT v.series, COUNT(*) FROM ms_payloads p JOIN ms_volumes v ON v.id = p.volume_id"
                            " GROUP BY v.series ORDER BY v.series")
     assert series == [("ligands", 20), ("poses", 40)]
+
+
+@job(task=task()(workers.structure), output=table_sink("ligands", columns=("n", "structure_payload_id")))
+def anywhere(params, project):
+    yield from range(params["n"])
+
+
+def _executor(name, tmp_path):
+    if name == "process":
+        return ProcessExecutor(2)
+    if name == "thread":
+        return ThreadExecutor(2)
+    if name == "ray":
+        pytest.importorskip("ray")
+        from ms_flow.engine import RayExecutor
+        return RayExecutor(num_cpus=2, shared=False)
+    from ms_flow.remote import RemoteExecutor
+    root = Path(__file__).resolve().parents[1]
+    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, shared=False,
+                          setup=f"export PYTHONPATH={root}:{root / 'src'}", poll_s=0.2, part_seconds=0.1)
+
+
+@pytest.mark.slow
+def test_every_executor_leaves_the_same_rows_and_bytes(tmp_path):
+    seen = {}
+    for name in ("process", "thread", "ray", "remote"):
+        project = ProjectStore.open_at(tmp_path / name / "project.db")
+        with closing(sqlite3.connect(project.db_path)) as conn, conn:
+            conn.execute("CREATE TABLE ligands (id INTEGER PRIMARY KEY, n INT NOT NULL,"
+                         " structure_payload_id INTEGER REFERENCES ms_payloads(id))")
+        with Engine(cpus=2, mem_mb=0) as engine:
+            engine.register(name, _executor(name, tmp_path / name))
+            job_id = Flow(engine, project).submit(anywhere, {"n": 30}, executor=name)
+            assert engine.wait(job_id, 180).status == "completed", name
+        stored = rows(project, "SELECT n, structure_payload_id FROM ligands ORDER BY n")
+        got = project.payloads.get_many([pid for _, pid in stored])
+        seen[name] = [(n, got[pid]) for n, pid in stored]
+        assert rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(30,)], name
+        project.dispose()
+    assert seen["process"] == [(n, workers.structure(n)["structure_payload_id"].data) for n in range(30)]
+    assert seen["thread"] == seen["ray"] == seen["remote"] == seen["process"]
