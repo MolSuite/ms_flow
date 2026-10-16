@@ -16,12 +16,16 @@ import `Payload` in workers.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
+import tempfile
 import threading
 import zlib
 from collections import OrderedDict
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -35,6 +39,7 @@ except ImportError:  # pragma: no cover - Windows
 VOLUME_SIZE = 1 << 30  # a payload larger than this goes alone in its own volume
 MAX_OPEN_FDS = 256  # volumes a reader keeps open
 LOCATE_CHUNK = 900  # ids per location query, under SQLite's variable limit
+READ_WINDOW = 500  # ids read at once by `with_payloads` and `iter_bytes`
 
 MAGIC = b"MSVOL"
 VERSION = 1
@@ -336,6 +341,25 @@ class PayloadStore:
             raise KeyError(f"unknown payload ids: {missing[:10]}")
         return {i: self._read(i, located[i]) for i in sorted(located, key=located.__getitem__)}
 
+    def iter_bytes(self, ids: Iterable[int], window: int = READ_WINDOW):
+        """`(id, bytes)` for each id, `window` ids at a time, each window in (volume, offset) order: to export."""
+        ids = iter(ids)
+        while batch := list(islice(ids, window)):
+            yield from self.get_many(batch).items()
+
+    def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str = ""):
+        """The payload as the file `<directory>/<id><suffix>`, written once: what a job hands its
+        tasks as a `File` (a receptor), which executors without the disk carry once per job."""
+        from ms_flow.engine.files import File
+
+        path = Path(directory) / f"{int(payload_id)}{suffix}"
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            part = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}")
+            part.write_bytes(self.get(payload_id))
+            os.replace(part, path)
+        return File(path)
+
     def _locate(self, ids: list[int]) -> dict[int, tuple]:
         found = {}
         with self.engine.connect() as conn:
@@ -405,6 +429,55 @@ class PayloadStore:
                 if entry[1] == 0:
                     os.close(entry[0])
             self._fds.clear()
+
+
+class _WithPayloads:
+    def __init__(self, store: PayloadStore, rows: Iterable[dict], fields: dict[str, str], window: int):
+        self._store, self._rows, self._fields, self._window = store, rows, dict(fields), window
+
+    def __getattr__(self, name: str):
+        if name in ("open", "remaining", "reads"):  # only what `rows` has: the engine asks with hasattr
+            return getattr(self.__dict__["_rows"], name)
+        raise AttributeError(name)
+
+    def __iter__(self):
+        rows = iter(self._rows)
+        while batch := list(islice(rows, self._window)):
+            ids = {row[column] for row in batch for column in self._fields if row.get(column) is not None}
+            found = self._store.get_many(ids) if ids else {}
+            for row in batch:
+                yield {**row, **{key: found.get(row.get(column)) for column, key in self._fields.items()}}
+
+
+def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], window: int = READ_WINDOW):
+    """A job's source whose rows carry the bytes of their payloads, so a task gets bytes and never a path.
+
+    `fields` maps an id column to the key that gets its bytes (`{"current_payload_id": "ligand"}`;
+    a NULL id gives `None`). Rows are read `window` at a time in (volume, offset) order, so at most
+    that many hold bytes here, and the engine reads only its window ahead (I8). What `rows` knows
+    (`open`, `remaining`, `reads` of `ms_flow.query.Rows`) passes through.
+    """
+    from ms_flow.core.database import resolve_project_store
+
+    return _WithPayloads(resolve_project_store(project).payloads, rows, fields, window)
+
+
+@contextmanager
+def scratch_file(data: bytes, suffix: str = ""):
+    """`data` as a temporary file, for a program that only reads paths: in /dev/shm when it is
+    there and has room for it, in the system's temporary folder if not. Deleted on leaving."""
+    directory = None
+    if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK):
+        if shutil.disk_usage("/dev/shm").free > 2 * len(data):  # ponytail: room now, not while it is written
+            directory = "/dev/shm"
+    fd, name = tempfile.mkstemp(suffix=suffix, prefix="msflow-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+        yield Path(name)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(name)
 
 
 def _write_all(fd: int, buffers: list, offset: int) -> None:

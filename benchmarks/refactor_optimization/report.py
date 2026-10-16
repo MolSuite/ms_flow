@@ -243,7 +243,8 @@ def volumes_view(records: list[dict]) -> dict:
                     pct = 100 * (b / a - 1)
                     row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
             drift["rows"].append(row)
-    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref)}
+    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref),
+            "reads": _read_cost(records)}
 
 
 def _fsync_cost(records: list[dict]) -> list[dict]:
@@ -274,6 +275,20 @@ def _job_cost(records: list[dict], ref: dict | None) -> list[dict]:
                         "vs_base_pct": vs_base, "VP": vp.get("import_s"), "vs_vp_pct": pct(pj["import_s"], vp.get("import_s")),
                         "vs_vp_durable_pct": pct(pj.get("durable_s"), vp.get("durable_s")),
                         "flag": vs_base is not None and vs_base > VOL_MARGIN_PCT})
+    return out
+
+
+def _read_cost(records: list[dict]) -> list[dict]:
+    """V3: per run with PJ, reading every current payload cold as a job's source and as an export, against VP's reader."""
+    pct = lambda a, b: round(100 * (a / b - 1), 1) if a and b else None
+    out = []
+    for rec in records:
+        pj, vp = (rec["variants"].get(f"parallel/{k}", {}) for k in ("PJ", "VP"))
+        if pj.get("stream_all_current_s_cold"):
+            src, exp, base = pj["stream_all_current_s_cold"], pj.get("export_all_current_s_cold"), vp.get("stream_all_current_s_cold")
+            out.append({"label": rec["label"], "n": pj.get("n"), "source": src, "export": exp, "VP": base,
+                        "source_vs_vp_pct": pct(src, base), "export_vs_vp_pct": pct(exp, base),
+                        "disk_mb": pj.get("stream_all_current_cold_disk_mb")})
     return out
 
 
@@ -310,6 +325,10 @@ def _self_check() -> None:
     jobbed = {"parallel/PJ": {"import_s": 150.0, "durable_s": 160.0}, "parallel/VP": {"import_s": 125.0, "durable_s": 160.0}}
     (cost,) = volumes_view([vrec("v2", "2026-11-02", jobbed), vrec(VOL_BASE, "2026-10-15", {"parallel/VP": {"import_s": 120.0}})])["job"]
     assert (cost["vs_base_pct"], cost["vs_vp_pct"], cost["vs_vp_durable_pct"], cost["flag"]) == (25.0, 20.0, 0.0, True)
+    read = {"parallel/PJ": {"stream_all_current_s_cold": 12.0, "export_all_current_s_cold": 9.0},
+            "parallel/VP": {"stream_all_current_s_cold": 10.0}}
+    (cost,) = volumes_view([vrec("v3", "2026-11-03", read)])["reads"]
+    assert (cost["source_vs_vp_pct"], cost["export_vs_vp_pct"]) == (20.0, -10.0)
 
 
 _self_check()
@@ -466,6 +485,7 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <div class="scroll" id="drift"></div>
   <div class="scroll" id="fsync"></div>
   <div class="scroll" id="job"></div>
+  <div class="scroll" id="reads"></div>
 </div>
 
 <div class="card">
@@ -597,6 +617,15 @@ function jobs() {
     + '<p class="note">PJ: the import as an ms_flow job (<code>Flow</code>, <code>ProcessExecutor</code>, <code>table_sink</code>), with the group fsync of every commit. Red: more than 10 % over VP of the base run, the limit of V2-12. VP never syncs: import + sync compares both on the disk.</p>';
 }
 
+function reads() {
+  const c = D.volumes.reads, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
+  document.getElementById('reads').innerHTML = !c.length ? '' : `<h3>Reading everything cold (V3)</h3><table><tr><th class="l">Run</th><th>molecules</th>`
+    + `<th class="b">PJ job source s</th><th>vs VP</th><th>PJ export s</th><th>vs VP</th><th>VP reader s</th><th>MB read from the disk</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td class="b">${f(r.source)}</td><td>${pc(r.source_vs_vp_pct)}</td>`
+      + `<td>${f(r.export)}</td><td>${pc(r.export_vs_vp_pct)}</td><td>${f(r.VP)}</td><td>${f(r.disk_mb)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">Every current payload after evicting the files from the page cache. Job source: <code>with_payloads</code> over <code>Rows</code>, as a job reads it; export: <code>iter_bytes</code>; VP reader: the bench\'s own reader, <code>get_many</code> in batches of 10 000, of the same run.</p>';
+}
+
 function table(host) {
   host.innerHTML = '<table style="font-size:12px"><tr><th>Step</th><th>PR</th><th class="l">Commit</th><th class="l">Date</th>'
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
@@ -623,7 +652,7 @@ chart(document.getElementById('chart'));
 checks(document.getElementById('checks'));
 findings(document.getElementById('findings'));
 table(document.getElementById('table'));
-if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); }
+if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); reads(); }
 document.getElementById('how').innerHTML = D.metrics.map(m => `<p class="note"><b>${m.title.replace(/ \(.*/, '')}.</b> ${m.what.replace(/`([^`]+)`/g, '<code>$1</code>')}</p>`).join('');
 </script>
 </body>

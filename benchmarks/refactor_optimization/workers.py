@@ -64,6 +64,16 @@ def structure(payload: int) -> dict:
     return {"n": payload, "structure_payload_id": Payload(data, kind="sdf", series="ligands")}
 
 
+def uses_payloads(element: dict) -> dict:
+    """What a task got from `with_payloads` and a materialized receptor, as a row (`tests/test_payloads_read.py`)."""
+    import zlib
+
+    with open(element["receptor"]) as file:
+        text = file.read()
+    return {"n": element["n"], "got_bytes": int(type(element["structure"]) is bytes), "crc": zlib.crc32(element["structure"]),
+            "receptor_path": str(element["receptor"]), "receptor_text": text}
+
+
 
 def store_chunk(bounds):
     """`bench_volumes` PJ: the molecules `[start, stop)` as rows with their `Payload`s."""
