@@ -244,7 +244,7 @@ def volumes_view(records: list[dict]) -> dict:
                     row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
             drift["rows"].append(row)
     return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref),
-            "reads": _read_cost(records), "codecs": _codec_cost(records)}
+            "reads": _read_cost(records), "codecs": _codec_cost(records), "maintenance": _maintenance_cost(records)}
 
 
 def _fsync_cost(records: list[dict]) -> list[dict]:
@@ -312,6 +312,14 @@ def _codec_cost(records: list[dict]) -> list[dict]:
     return out
 
 
+def _maintenance_cost(records: list[dict]) -> list[dict]:
+    """V4-10: per run with PM, a full check, releasing half the payloads and compacting what that left behind, all cold."""
+    keys = ("n", "volume_mb", "check_full_s_cold", "release_s", "released", "compact_s_cold", "compact_mb_s",
+            "compacted_volumes", "compact_read_mb", "compact_written_mb")
+    return [{"label": rec["label"], **{k: rec["variants"]["parallel/PM"].get(k) for k in keys}}
+            for rec in records if "parallel/PM" in rec["variants"]]
+
+
 def _self_check() -> None:
     rec = lambda label, v: {"label": label, "commit": "x", "recorded_at": "2026-01-01", "metrics": {"a": {"values": v, "unit": "ms"}}}
     a = [s["m"]["a"] for s in summarize([rec("0", [10.0]), rec("1", [5.0]), rec("2", [5.1]), rec("3", [8.0])])]
@@ -355,6 +363,8 @@ def _self_check() -> None:
     assert (pj["ratio"], pj["durable_vs_pj_pct"]) == (1.0, 0.0)
     assert (pjd["ratio"], pjd["durable_vs_pj_pct"], pjd["source_vs_pj_pct"]) == (4.0, -10.0, -25.0)
     assert volumes_view([vrec("v2", "2026-11-02", jobbed)])["codecs"] == []  # PJ alone is V2/V3, not a codec run
+    (m,) = volumes_view([vrec("v4", "2026-11-04", {"parallel/PM": {"n": 9, "compact_mb_s": 80.0}})])["maintenance"]
+    assert (m["label"], m["compact_mb_s"], m["release_s"]) == ("v4", 80.0, None)
 
 
 _self_check()
@@ -513,6 +523,7 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <div class="scroll" id="job"></div>
   <div class="scroll" id="reads"></div>
   <div class="scroll" id="codecs"></div>
+  <div class="scroll" id="maintenance"></div>
 </div>
 
 <div class="card">
@@ -663,6 +674,16 @@ function codecs() {
     + '<p class="note">The PJ job with a codec per payload, compressed in the workers; PJD with a zstd dictionary per series, trained on records apart from the ones stored. Raw and stored MB count the job\'s payloads only, not the training ones. Reads evict the files from the page cache first.</p>';
 }
 
+function maintenance() {
+  const c = D.volumes.maintenance, f = v => v == null ? '' : num(v);
+  document.getElementById('maintenance').innerHTML = !c.length ? '' : `<h3>Maintenance (V4)</h3><table><tr><th class="l">Run</th><th>molecules</th><th>volume MB</th>`
+    + `<th>full check s, cold</th><th>released</th><th>release s</th><th class="b">compact s, cold</th><th>MB/s</th><th>volumes</th><th>MB read</th><th>MB written</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td>${f(r.volume_mb)}</td><td>${f(r.check_full_s_cold)}</td><td>${f(r.released)}</td>`
+      + `<td>${f(r.release_s)}</td><td class="b">${f(r.compact_s_cold)}</td><td>${f(r.compact_mb_s)}</td><td>${f(r.compacted_volumes)}</td>`
+      + `<td>${f(r.compact_read_mb)}</td><td>${f(r.compact_written_mb)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">The PJ job with zstd into smaller volumes, so several get sealed; then <code>check(full=True)</code> reads every needle, half the molecules are deleted and their payloads released, and <code>compact()</code> copies the live needles of the sealed volumes left half dead. MB/s is the live data read by the compaction over its time. Check and compaction start with the files evicted from the page cache.</p>';
+}
+
 function table(host) {
   host.innerHTML = '<table style="font-size:12px"><tr><th>Step</th><th>PR</th><th class="l">Commit</th><th class="l">Date</th>'
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
@@ -689,7 +710,7 @@ chart(document.getElementById('chart'));
 checks(document.getElementById('checks'));
 findings(document.getElementById('findings'));
 table(document.getElementById('table'));
-if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); reads(); codecs(); }
+if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); reads(); codecs(); maintenance(); }
 document.getElementById('how').innerHTML = D.metrics.map(m => `<p class="note"><b>${m.title.replace(/ \(.*/, '')}.</b> ${m.what.replace(/`([^`]+)`/g, '<code>$1</code>')}</p>`).join('');
 </script>
 </body>
