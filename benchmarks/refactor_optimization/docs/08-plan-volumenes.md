@@ -271,18 +271,34 @@ Desvíos: la ventana de `with_payloads` es fija (`READ_WINDOW = 500`), no el tam
 
 ### V4 — Mantenimiento: comprobar, reparar, liberar y compactar
 
-- [ ] **V4-1** `check(full)`: volúmenes que faltan, referencias fuera de rango, crc32 (con `full`), volúmenes sin filas, proporción de bytes muertos por volumen, filas de `ms_payloads` sin referencia.
-- [ ] **V4-2** `release(ids)`: borra las filas que ninguna FK referencia (descubiertas con `PRAGMA foreign_key_list`). Un volumen sellado sin bytes vivos pasa a `trash` y se borra sin copiar nada.
-- [ ] **V4-3** `compact`: elige volúmenes sellados con al menos un 50 % de bytes muertos, o pequeños; copia las agujas vivas a uno nuevo; actualiza con compare-and-set (I6); pasa los viejos a `trash`. Nunca toca un volumen activo. `order_by` opcional (puntuación o cluster).
-- [ ] **V4-4** La compactación es un job de `ms_flow` que declara las tablas que escribe, así que los jobs se ordenan con ella como con cualquier otro.
-- [ ] **V4-5** `repair`: trunca colas, borra volúmenes huérfanos y filas sin referencia. Nunca borra una fila referenciada.
-- [ ] **V4-6** Tests F8 y F9.
-- [ ] **V4-7** Tests F10 y F11, con los puntos de inyección de V2-9.
-- [ ] **V4-8** Test F12: un proceso lee en bucle mientras otro compacta; ningún error, todos los bytes iguales.
-- [ ] **V4-9** Test aleatorio con estado: 1000 secuencias con semilla de añadir, borrar, compactar y matar en un punto al azar; al final, `check` limpio y cada payload vivo idéntico byte a byte. Solo `random`, sin dependencias.
-- [ ] **V4-10** Banco: velocidad de compactación (MB/s) y `check(full)` a 700k.
+- [x] **V4-1** `check(full)`: volúmenes que faltan, referencias fuera de rango, crc32 (con `full`), volúmenes sin filas, proporción de bytes muertos por volumen, filas de `ms_payloads` sin referencia.
+- [x] **V4-2** `release(ids)`: borra las filas que ninguna FK referencia (descubiertas con `PRAGMA foreign_key_list`). Un volumen sellado sin bytes vivos pasa a `trash` y se borra sin copiar nada.
+- [x] **V4-3** `compact`: elige volúmenes sellados con al menos un 50 % de bytes muertos, o pequeños; copia las agujas vivas a uno nuevo; actualiza con compare-and-set (I6); pasa los viejos a `trash`. Nunca toca un volumen activo. `order_by` opcional (puntuación o cluster).
+- [x] **V4-4** La compactación es un job de `ms_flow` que declara las tablas que escribe, así que los jobs se ordenan con ella como con cualquier otro.
+- [x] **V4-5** `repair`: trunca colas, borra volúmenes huérfanos y filas sin referencia. Nunca borra una fila referenciada.
+- [x] **V4-6** Tests F8 y F9.
+- [x] **V4-7** Tests F10 y F11, con los puntos de inyección de V2-9.
+- [x] **V4-8** Test F12: un proceso lee en bucle mientras otro compacta; ningún error, todos los bytes iguales.
+- [x] **V4-9** Test aleatorio con estado: 1000 secuencias con semilla de añadir, borrar, compactar y matar en un punto al azar; al final, `check` limpio y cada payload vivo idéntico byte a byte. Solo `random`, sin dependencias.
+- [x] **V4-10** Banco: velocidad de compactación (MB/s) y `check(full)` a 700k.
 
 Hecho cuando: V4-6 a V4-9 pasan.
+
+Resultado (2026-10-16, `results/volumes_V4-10.json`, 100k con registros reales, 14 workers, zstd en volúmenes de 64 MB para que se sellen varios; `check` y `compact` empiezan con la caché desalojada):
+
+| `check(full)` en frío | Liberar | `compact` en frío | Volúmenes | MB vivos leídos / escritos | MB leídos del disco |
+|---|---|---|---|---|---|
+| 4,28 s (255 MB del disco, 160k agujas descomprimidas) | 160 000 payloads en 0,69 s | 3,35 s | 5 | 115 / 115 | 247 |
+
+La compactación va a 34 MB/s de datos vivos; lee los volúmenes enteros (las agujas muertas van intercaladas con las vivas y el read-ahead las trae igual), así que es el disco: 247 MB leídos más 115 escritos con fsync en 3,35 s. Los tests F8 a F12 y el aleatorio de V4-9 (1000 secuencias, unos 70 s) pasan en la suite.
+
+Desvíos frente a lo escrito arriba:
+- A 100k y no a 700k, como V5-8.
+- Un lector que se encuentra el volumen borrado vuelve a leer la ubicación hasta 3 veces, no una: entre dos lecturas la aguja puede moverse otra vez.
+- La compactación como job es `payloads.compaction(min_dead, order_by)`: una task vacía y un escritor que declara `ms_payloads` y `ms_volumes` y compacta en su `finish`. Para que se ordene con los jobs que añaden payloads, todo escritor `_Table` declara también `ms_payloads`.
+- Un fichero de volumen sin fila solo es huérfano si nadie tiene su flock y tiene más de `ORPHAN_GRACE` (60 s): así `repair` no borra el volumen que otro proceso acaba de crear.
+- V5-7: recomprimir lleva a zstd con el diccionario activo de la serie (si lo hay); las agujas con `none` se copian tal cual, porque `none` lo pide el `Payload` (ya venía comprimido).
+- Una aguja corrupta no se copia: se queda en el volumen viejo, que no se borra mientras tenga filas, y `check(full)` la sigue listando.
 
 ### V5 — Compresión (varios codecs)
 
@@ -303,7 +319,7 @@ Cada serie elige su codec; cada aguja dice con cuál se guardó (el campo `codec
 - [x] **V5-4** Elección por serie: `PayloadStore(codecs={"ligands": "zstd-dict", "poses": "zstd"}, default=...)`, guardada en el proyecto (tabla `ms_payload_series`: serie, codec, nivel, diccionario activo). Por defecto `zstd` si está y `zlib` si no. Un `Payload` puede forzar el suyo (`Payload(..., codec="none")` para lo que ya viene comprimido).
 - [x] **V5-5** Comprimir en el worker: `Payload.__reduce__` comprime con el codec de su serie antes de cruzar el proceso, y el padre escribe los bytes tal cual. El job lleva al worker la configuración de codecs y, si hay, el diccionario como `File` (una vez por job, como el receptor de V3).
 - [x] **V5-6** Diccionarios: `volumes/dicts/<dict_id>.zdict` + tabla `ms_payload_dicts` (id, serie, creado, muestras). Se entrenan con una muestra repartida de la serie (10 000 agujas) cuando la serie las tiene; antes, sus agujas van con `zstd` sin diccionario. El id del diccionario va dentro del marco zstd, así que leer no necesita la tabla. Un diccionario se borra solo cuando ninguna aguja lo usa.
-- [ ] **V5-7** Recomprimir al compactar (V4): las agujas que copia la compactación pasan al codec y al diccionario activos de su serie.
+- [x] **V5-7** Recomprimir al compactar (V4): las agujas que copia la compactación pasan al codec y al diccionario activos de su serie.
 - [x] **V5-8** Tests: ida y vuelta con cada codec y mezcla de codecs en un volumen; un proceso sin `zstandard` lee zlib y falla claro con zstd; un diccionario que falta → error claro en `check`; la compresión ocurre en el worker (el padre recibe bytes ya comprimidos); el banco PJ de 700k con `zstd-dict` y con SDF reales queda en el informe frente a `none`.
 
 Hecho cuando: V5-8 pasa y el banco PJ con compresión queda medido frente al de V2-12.
@@ -323,7 +339,7 @@ Desvíos frente a lo escrito arriba:
 - `zstd-dict` no es un codec 3 aparte: es el codec 2 con el id del diccionario dentro del marco zstd, que es lo que lee el lector.
 - `zstandard` es dependencia del núcleo, no opcional (Mario: «no importa si hay que tener una dependencia más si tiene valor real»). Por eso no hay test de «un proceso sin `zstandard`»; si falta, `_zstd()` da un error que dice qué instalar.
 - El diccionario que falta da `PayloadCorrupt` al leer; en `check` entra con V4-1.
-- V5-7 (recomprimir al compactar) va con V4-3.
+- V5-7 (recomprimir al compactar) se hizo con V4-3.
 
 ### V6 — Segmentos que escribe la task (condicional)
 
@@ -430,8 +446,8 @@ flowchart LR
 | V1 Formato y almacén | ☑ (PS +20 % frente a HT en disco, ver V1-9) | `feat/payload-volumes-v1` |
 | V2 Escribir desde jobs | ☑ (V2-12 se mide en tiempo a disco: −2 % frente a VP) | `feat/payload-volumes-v2` / #7 |
 | V3 Leer | ☑ (todo en frío: fuente de job 24,9 s, exportar 19,6 s, VP 29,2 s) | `feat/payload-volumes-v3` |
-| V4 Mantenimiento | ☐ | |
-| V5 Compresión | ☑ salvo V5-7, que va con V4 (100k: 5,9× con diccionario, importar a disco −40 %, leer en frío −75 %) | `feat/payload-volumes-v5` |
+| V4 Mantenimiento | ☑ (100k: `check(full)` en frío 4,3 s, compactar 34 MB/s vivos, limitado por el disco) | `feat/payload-volumes-v4` |
+| V5 Compresión | ☑ (V5-7 con V4; 100k: 5,9× con diccionario, importar a disco −40 %, leer en frío −75 %) | `feat/payload-volumes-v5` |
 | V6 Segmentos (condicional) | ☐ | |
 | V7 Escala y docs | ☐ | |
 | A0 Esquema | ☐ | |
