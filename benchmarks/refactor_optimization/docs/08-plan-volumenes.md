@@ -355,7 +355,8 @@ Desvíos frente a lo escrito arriba:
 ### V7 — Escala y documentación
 
 - [ ] **V7-1** 10M en el disco nuevo: importar, ordenar con índice, paginar por clave, contar con filtro, `check`, compactar y RSS máximo.
-- [ ] **V7-2** Guía y referencia de la API en la documentación de `ms_flow` (en inglés).
+- [x] **V7-2** Guía y referencia de la API en la documentación de `ms_flow` (en inglés).
+  `docs/payloads.md`: esquema con FK, escribir desde un job, diccionarios, leer (`with_payloads`, `materialize`, `scratch_file`), borrar y mantenimiento, con la referencia de `ms_flow.payloads` al final. Página aparte de la guía porque estas ramas no tienen todavía la guía del motor nuevo de `main` (#3, #4); al fusionar, solo choca la línea de `nav`. El `zensical build` de estas ramas falla en `api_reference.md` (`ms_flow.main.MolSuite`, que ya no existe), no en esta página; en `main` está corregido.
 - [ ] **V7-3** Publicación.
 
 Hecho cuando: los números de 10M están en el informe y la guía está publicada.
@@ -366,65 +367,66 @@ Empiezan cuando V3 está hecho; A7 necesita V4. Las columnas con `_payload_id` s
 
 ### A0 — Esquema
 
-- [ ] **A0-1** Cambiar las rutas por FK: `molecules.stored_payload_id`, `current_payload_id`; `molecule_models.payload_id`; `docking_results.pose_payload_id`; `complexes.reference_receptor_payload_id`, `reference_ligand_payload_id`; `sets.crystal_pose_payload_id`. Todas con índice.
-- [ ] **A0-2** Formas preparadas por motor: sacar `"prepared"` del `metadata` JSON a una tabla `prepared_inputs(molecule_id, engine, payload_id)` con FK (D10).
-- [ ] **A0-3** Versión de formato del proyecto; abrir uno anterior da un error claro.
-- [ ] **A0-4** Decidir qué se queda como fichero por ejecución (mapas de autogrid, parquet de clustering, modelos de QSAR) y documentarlo (D4).
+- [x] **A0-1** Cambiar las rutas por FK: `molecules.stored_payload_id`, `current_payload_id`; `molecule_models.payload_id`; `docking_results.pose_payload_id`; `complexes.reference_receptor_payload_id`, `reference_ligand_payload_id`; `sets.crystal_pose_payload_id`. Todas con índice. *Desviación:* `sets.crystal_pose_path` no lo usaba nadie y se borró en vez de cambiarlo; `molecule_models.files` (PAE de ESMFold) pasa a `pae_payload_id`.
+- [x] **A0-2** Formas preparadas por motor: sacar `"prepared"` del `metadata` JSON a una tabla `prepared_inputs(molecule_id, engine, payload_id)` con FK (D10). *Desviación:* columna `EngineState.prepared_payload_id`; `EngineState` ya es una fila por (molécula, rol, motor).
+- [x] **A0-3** Versión de formato del proyecto; abrir uno anterior da un error claro. *Desviación:* sin número de versión: la columna antigua `molecules.stored_path` marca el proyecto viejo; los `ALTER TABLE` aditivos desaparecen con ello.
+- [x] **A0-4** Decidir qué se queda como fichero por ejecución (mapas de autogrid, parquet de clustering, modelos de QSAR) y documentarlo (D4). En `AMDockVS/docs/volumes_contract.md`; se añaden los `.mshard`, las exportaciones y las imágenes de diagramas (caché por id de resultado).
 
 ### A1 — Importar
 
-- [ ] **A1-1** Las tasks de importación devuelven `Payload` en vez de escribir ficheros (`io/transformers/*`, grafo de importación con escritura al final).
-- [ ] **A1-2** Original como SMILES o como la entrada tal cual, sin duplicar si coincide con la forma actual (D11).
-- [ ] **A1-3** Receptores: el PDB/CIF importado como payload de la serie `receptors`.
-- [ ] **A1-4** Tests de importación actualizados; banco de 700k dentro de la app.
+- [x] **A1-1** Las tasks de importación devuelven `Payload` en vez de escribir ficheros (`io/transformers/*`, grafo de importación con escritura al final).
+- [x] **A1-2** Original como SMILES o como la entrada tal cual, sin duplicar si coincide con la forma actual (D11). *Desviación:* el original de un SDF es el bloque mol ya leído, no el registro crudo; cuando coincide con la forma actual, `share_current` pone el mismo objeto `Payload` en las dos columnas y el sink de `ms_flow` lo guarda una vez (b05282a, deduplicación por identidad en `_put_payloads`).
+- [x] **A1-3** Receptores: el PDB/CIF importado como payload de la serie `receptors`. Las referencias van a la serie `references`; la copia PDBQT preparada, a `prepared` (copia propia, no compartida).
+- [x] **A1-4** Tests de importación actualizados; banco de 700k dentro de la app. *700k SMILES de ChEMBL importados en la app con el pool de procesos: 365 s (`test/benchmarks/bench_700k_files.py`).*
 
 ### A2 — Build (protonar, 3D, minimizar) y modelos
 
-- [ ] **A2-1** `chemistry/` lee los bytes de la fila y devuelve `Payload`; `molecule_models` con `payload_id`.
-- [ ] **A2-2** Herramientas externas (pkasso, openbabel) con los temporales de V3-3.
-- [ ] **A2-3** Editar una molécula (copiar o sustituir, Ketcher) con `store.put`.
+- [x] **A2-1** `chemistry/` lee los bytes de la fila y devuelve `Payload`; `molecule_models` con `payload_id`. *Desviación:* el feed de descriptores de QSAR también pasa a bytes (llama al mismo cálculo). La forma actual y su modelo comparten un objeto `Payload`: se guarda una vez.
+- [x] **A2-2** Herramientas externas (pkasso, openbabel) con los temporales de V3-3.
+- [x] **A2-3** Editar una molécula (copiar o sustituir, Ketcher) con `store.put`. Sustituir una edición anterior libera su payload.
+- [x] **A2-4** (añadida) Diversidad, QSAR, predicción de bolsillos (p2rank) y la caja desde un ligando de referencia leen el payload; nadie las tenía en el plan.
 
 ### A3 — Preparación
 
-- [ ] **A3-1** meeko devuelve el PDBQT como `Payload` en `prepared_inputs`.
-- [ ] **A3-2** Preparación de receptores (reduce, pdb2pqr, pdbfixer): materializar, ejecutar y guardar el resultado como `Payload`.
-- [ ] **A3-3** Mapas de autogrid: caché por receptor en disco, que se puede regenerar (D4).
+- [x] **A3-1** meeko devuelve el PDBQT como `Payload` en `prepared_inputs`. *Desviación:* `EngineState.prepared_payload_id` (y `flex_payload_id` para las cadenas laterales flexibles) en vez de una tabla aparte; un PDBQT ya importado reutiliza su propio id.
+- [x] **A3-2** Preparación de receptores (reduce, pdb2pqr, pdbfixer): materializar, ejecutar y guardar el resultado como `Payload`. pdb2pqr: se guarda su PDB, no el `.pqr`.
+- [x] **A3-3** Mapas de autogrid: caché por receptor en disco, que se puede regenerar (D4). Se quedan como estaban: ya eran caché regenerable.
 
 ### A4 — Docking, interacciones y diagramas
 
-- [ ] **A4-1** La fuente del docking usa `with_payloads`: el ligando viaja en el elemento y el receptor se materializa una vez por job.
-- [ ] **A4-2** Vina dentro del proceso con `set_ligand_from_string`; QuickVina, gnina y AutoDock-GPU con temporales.
-- [ ] **A4-3** Las poses se guardan como `Payload` en la serie `poses`.
-- [ ] **A4-4** Interacciones y diagramas leen la pose desde los bytes.
-- [ ] **A4-5** Saltar lo ya dockado y el re-dock forzado (`supersede_results`) con `release` de las poses sustituidas.
-- [ ] **A4-6** Tests de docking en proceso, hilo y Ray con `shared=False`.
+- [x] **A4-1** La fuente del docking usa `with_payloads`: el ligando viaja en el elemento y el receptor se materializa una vez por job.
+- [x] **A4-2** Vina dentro del proceso con `set_ligand_from_string`; QuickVina, gnina y AutoDock-GPU con temporales. *Desviación:* todos los motores usan temporales de `scratch_file`; los ficheros nacen y mueren dentro del chunk.
+- [x] **A4-3** Las poses se guardan como `Payload` en la serie `poses`. Un SDF de un solo registro por fila de resultado (su rango); `metrics.receptor_payload_id` guarda el receptor dockado.
+- [x] **A4-4** Interacciones y diagramas leen la pose desde los bytes. *Desviación:* los diagramas tras un docking los dibuja un job dependiente; su caché va en `cache/payloads/<id>.sdf.rankN.diagram.*`, con la clave del id de la pose.
+- [x] **A4-5** Saltar lo ya dockado y el re-dock forzado (`supersede_results`) con `release` de las poses sustituidas. `delete_results_where` libera las poses y borra su caché; un hit promovido conserva su pose.
+- [x] **A4-6** Tests de docking en proceso, hilo y Ray con `shared=False`. Vina real en un pool de procesos y en Ray.
 
 ### A5 — HTPVS
 
-- [ ] **A5-1** Los `.mshard` y `ShardEngineState.files` no cambian.
-- [ ] **A5-2** `ingest_hits` promueve a filas y payloads con `store.put` (pose y ligando).
-- [ ] **A5-3** `docking/shard_tasks.py`: el staging de `extract_ligands` sigue igual; las poses de los hits van a payloads.
+- [x] **A5-1** Los `.mshard` y `ShardEngineState.files` no cambian.
+- [x] **A5-2** `ingest_hits` promueve a filas y payloads con `store.put` (pose y ligando). La molécula promovida y su resultado de docking comparten el id de la pose.
+- [x] **A5-3** `docking/shard_tasks.py`: el staging de `extract_ligands` sigue igual; las poses de los hits van a payloads.
 
 ### A6 — UI y exportar
 
-- [ ] **A6-1** Visor: PyMOL carga desde bytes (`cmd.load_raw`, `read_molstr`, `read_pdbstr`).
-- [ ] **A6-2** Vistas previas 2D y tablas sin rutas.
-- [ ] **A6-3** Exportar: SDF de poses con puntuaciones como propiedades, PDBQT, receptores y ZIP de una selección, con `iter_bytes`. Lecturas fuera del hilo de la GUI (`run_async`).
-- [ ] **A6-4** Panel de almacenamiento del proyecto: tamaño, bytes muertos, «Comprobar» y «Compactar».
+- [x] **A6-1** Visor: PyMOL carga desde bytes (`cmd.load_raw`, `read_molstr`, `read_pdbstr`). Lecturas fuera del hilo de la GUI; gana el último clic.
+- [x] **A6-2** Vistas previas 2D y tablas sin rutas.
+- [x] **A6-3** Exportar: SDF de poses con puntuaciones como propiedades, PDBQT, receptores y ZIP de una selección, con `iter_bytes`. Lecturas fuera del hilo de la GUI (`run_async`). *Desviación:* el «PDBQT» es la exportación genérica de estructuras: escribe el formato que tenga el payload.
+- [x] **A6-4** Panel de almacenamiento del proyecto: tamaño, bytes muertos, «Comprobar» y «Compactar». *Desviación:* va en el diálogo de información del proyecto, no en una vista nueva.
 
 ### A7 — Borrar y compactar
 
-- [ ] **A7-1** `project/deletion.py`: `delete_molecules`, `delete_results_where` y `clear_derived` llaman a `release`. `remove_unreferenced_files` y `_remove_result_files` desaparecen.
-- [ ] **A7-2** Compactación automática cuando no hay jobs y los bytes muertos pasan del 50 % (D6).
-- [ ] **A7-3** `check` rápido al abrir el proyecto: el resultado va al registro de notificaciones y no bloquea.
+- [x] **A7-1** `project/deletion.py`: `delete_molecules`, `delete_results_where` y `clear_derived` llaman a `release`. `remove_unreferenced_files` y `_remove_result_files` desaparecen. `release(project_db, ids)` público; borra también la caché `cache/payloads/<id>.*`.
+- [x] **A7-2** Compactación automática cuando no hay jobs y los bytes muertos pasan del 50 % (D6). *Desviación:* la dispara el controlador de la UI al terminar el último job; desde la API o un notebook, `runtime.compact_storage_if_due()`. Sin fusionar volúmenes pequeños (`small=0`).
+- [x] **A7-3** `check` rápido al abrir el proyecto: el resultado va al registro de notificaciones y no bloquea. Solo los avisos y errores llegan al registro; una comprobación sana no.
 
 ### A8 — Limpieza y extremo a extremo
 
-- [ ] **A8-1** Borrar las ayudas de rutas (`absolutize_pose_paths`, `resolve_storage_dir`, `resolve_docking_output_dir`...) y los directorios de almacenamiento por entidad.
-- [ ] **A8-2** `grep` de las columnas de ruta = 0 fuera de los ficheros por ejecución de D4.
-- [ ] **A8-3** E2E del pipeline completo (importar → build → preparar → dockar → interacciones → exportar) en proceso, hilo y Ray con `shared=False`.
-- [ ] **A8-4** Recuento de ficheros: un proyecto de 700k moléculas dockadas tiene menos de 100 ficheros.
-- [ ] **A8-5** Documentación de usuario (en inglés): dónde están los datos y cómo exportar.
+- [x] **A8-1** Borrar las ayudas de rutas (`absolutize_pose_paths`, `resolve_storage_dir`, `resolve_docking_output_dir`...) y los directorios de almacenamiento por entidad. Queda `resolve_docking_output_dir` (carpeta de trabajo por corrida y la de cribado de shards, D4) y la carpeta de importación, que solo guarda el parquet de propiedades SDF y las estadísticas.
+- [x] **A8-2** `grep` de las columnas de ruta = 0 fuera de los ficheros por ejecución de D4. Solo queda la comprobación de A0 que rechaza proyectos antiguos (`runtime.py`).
+- [x] **A8-3** E2E del pipeline completo (importar → build → preparar → dockar → interacciones → exportar) en proceso, hilo y Ray con `shared=False`. *Hecho con `test/e2e/smoke_full_pipeline.py` y `AMDOCK_SMOKE_EXECUTOR=thread|compute|ray`: 24 de 25 etapas pasan en los tres (p2rank no instalado). VS y HTPVS exportan poses a SDF y ZIP. Al hacer el inventario aparecieron dos fugas de ficheros por elemento, ya quitadas: un JSON de interacciones por pose (nadie lo leía, las filas están en `interaction_results`) y un JSON de recuento por lote de importación (ahora una línea en un único `import_stats.jsonl`).*
+- [x] **A8-4** Recuento de ficheros: un proyecto de 700k moléculas dockadas tiene menos de 100 ficheros. *9 ficheros, 1,2 GB (3 volúmenes). Desviación: las 700k poses se escriben por el sink del job de docking con bytes sintéticos (la estructura del ligando ×9 modos), no con Vina, que tardaría días y no deja más ficheros. Las etiquetas SDF van ahora a un payload parquet por lote en los volúmenes (`molecules.properties_payload_id`, serie `properties`), sin fichero propio. Con Enamine 100k SDF (`bench_project_files.py`): 10 ficheros, 183 MB, 102 payloads de propiedades, importación 64 s.*
+- [x] **A8-5** Documentación de usuario (en inglés): dónde están los datos y cómo exportar. *`docs/data_and_export.md`, en la navegación de zensical.*
 
 ## Orden
 
@@ -448,17 +450,17 @@ flowchart LR
 | V3 Leer | ☑ (todo en frío: fuente de job 24,9 s, exportar 19,6 s, VP 29,2 s) | `feat/payload-volumes-v3` |
 | V4 Mantenimiento | ☑ (100k: `check(full)` en frío 4,3 s, compactar 34 MB/s vivos, limitado por el disco) | `feat/payload-volumes-v4` |
 | V5 Compresión | ☑ (V5-7 con V4; 100k: 5,9× con diccionario, importar a disco −40 %, leer en frío −75 %) | `feat/payload-volumes-v5` |
-| V6 Segmentos (condicional) | ☐ | |
-| V7 Escala y docs | ☐ | |
-| A0 Esquema | ☐ | |
-| A1 Importar | ☐ | |
-| A2 Build y modelos | ☐ | |
-| A3 Preparación | ☐ | |
-| A4 Docking | ☐ | |
-| A5 HTPVS | ☐ | |
-| A6 UI y exportar | ☐ | |
-| A7 Borrar y compactar | ☐ | |
-| A8 Limpieza y E2E | ☐ | |
+| V6 Segmentos (condicional) | ☐ (espera a V0-4, disco nuevo) | |
+| V7 Escala y docs | ◐ (V7-2 hecho; V7-1 necesita el disco nuevo, V7-3 a Mario) | `feat/payload-volumes-v7` |
+| A0 Esquema | ☑ | AMDockVS `feat/volumes-a0` |
+| A1 Importar | ☑ | AMDockVS `feat/volumes-a1-import` |
+| A2 Build y modelos | ☑ | AMDockVS `feat/volumes-a2-chemistry` |
+| A3 Preparación | ☑ | AMDockVS `feat/volumes-a34-docking` (A3-2 en `feat/volumes-a2-chemistry`) |
+| A4 Docking | ☑ | AMDockVS `feat/volumes-a34-docking` |
+| A5 HTPVS | ☑ | AMDockVS `feat/volumes-a57-htp-delete` |
+| A6 UI y exportar | ☑ | AMDockVS `feat/volumes-a6-ui` |
+| A7 Borrar y compactar | ☑ | AMDockVS `feat/volumes-a57-htp-delete` |
+| A8 Limpieza y E2E | ☑ | AMDockVS `feat/volumes-integration` |
 
 ## Decisiones
 

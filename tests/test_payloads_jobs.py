@@ -102,6 +102,26 @@ def test_a_graph_sink_stores_the_payloads_of_every_node(project):
     assert series == [("ligands", 20), ("poses", 40)]
 
 
+@task()
+def as_is(n: int) -> dict:
+    same = Payload(structure(n), kind="sdf", series="ligands")  # the input already is the current form
+    return {"n": n, "original_payload_id": same, "structure_payload_id": same}
+
+
+@job(task=as_is, output=table_sink("forms", columns=("n", "original_payload_id", "structure_payload_id")))
+def forms(params, project):
+    yield from range(params["n"])
+
+
+def test_one_payload_in_two_columns_is_stored_once(project):
+    with closing(sqlite3.connect(project.db_path)) as conn, conn:
+        conn.execute("CREATE TABLE forms (id INTEGER PRIMARY KEY, n INT, original_payload_id INTEGER"
+                     " REFERENCES ms_payloads(id), structure_payload_id INTEGER REFERENCES ms_payloads(id))")
+    run(project, forms, {"n": 5})
+    assert all(a == b for a, b in rows(project, "SELECT original_payload_id, structure_payload_id FROM forms"))
+    assert rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(5,)]
+
+
 @job(task=task()(workers.structure), output=table_sink("ligands", columns=("n", "structure_payload_id")))
 def anywhere(params, project):
     yield from range(params["n"])

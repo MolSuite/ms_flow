@@ -430,17 +430,32 @@ class PayloadStore:
             raise KeyError(f"unknown payload ids: {missing[:10]}")
         return {i: self._read(i, located[i]) for i in sorted(located, key=located.__getitem__)}
 
+    def kinds(self, ids: Iterable[int]) -> dict[int, str]:
+        """The `kind` each payload was stored with (a format: `sdf`, `pdbqt`...), by id; unknown ids are left out."""
+        ids = list(dict.fromkeys(int(i) for i in ids))
+        found = {}
+        with self.engine.connect() as conn:
+            for start in range(0, len(ids), LOCATE_CHUNK):
+                chunk = ids[start : start + LOCATE_CHUNK]
+                found.update(tuple(row) for row in conn.exec_driver_sql(
+                    f"SELECT id, kind FROM ms_payloads WHERE id IN ({','.join('?' * len(chunk))})", tuple(chunk)))
+        return found
+
     def iter_bytes(self, ids: Iterable[int], window: int = READ_WINDOW):
         """`(id, bytes)` for each id, `window` ids at a time, each window in (volume, offset) order: to export."""
         ids = iter(ids)
         while batch := list(islice(ids, window)):
             yield from self.get_many(batch).items()
 
-    def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str = ""):
+    def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str | None = None):
         """The payload as the file `<directory>/<id><suffix>`, written once: what a job hands its
-        tasks as a `File` (a receptor), which executors without the disk carry once per job."""
+        tasks as a `File` (a receptor), which executors without the disk carry once per job.
+        Without `suffix`, the payload's kind is the extension (`.pdbqt`)."""
         from ms_flow.engine.files import File
 
+        if suffix is None:
+            kind = self.kinds([payload_id]).get(int(payload_id))
+            suffix = f".{kind}" if kind else ""
         path = Path(directory) / f"{int(payload_id)}{suffix}"
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -825,8 +840,8 @@ class PayloadStore:
 
 
 class _WithPayloads:
-    def __init__(self, store: PayloadStore, rows: Iterable[dict], fields: dict[str, str], window: int):
-        self._store, self._rows, self._fields, self._window = store, rows, dict(fields), window
+    def __init__(self, store: PayloadStore, rows: Iterable[dict], fields: dict[str, str], window: int, kinds: bool):
+        self._store, self._rows, self._fields, self._window, self._kinds = store, rows, dict(fields), window, kinds
 
     def __getattr__(self, name: str):
         if name in ("open", "remaining", "reads"):  # only what `rows` has: the engine asks with hasattr
@@ -838,21 +853,27 @@ class _WithPayloads:
         while batch := list(islice(rows, self._window)):
             ids = {row[column] for row in batch for column in self._fields if row.get(column) is not None}
             found = self._store.get_many(ids) if ids else {}
+            kinds = self._store.kinds(ids) if ids and self._kinds else {}
             for row in batch:
-                yield {**row, **{key: found.get(row.get(column)) for column, key in self._fields.items()}}
+                row = {**row, **{key: found.get(row.get(column)) for column, key in self._fields.items()}}
+                if self._kinds:
+                    row.update({f"{key}_kind": kinds.get(row.get(column)) for column, key in self._fields.items()})
+                yield row
 
 
-def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], window: int = READ_WINDOW):
+def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], window: int = READ_WINDOW,
+                  kinds: bool = False):
     """A job's source whose rows carry the bytes of their payloads, so a task gets bytes and never a path.
 
     `fields` maps an id column to the key that gets its bytes (`{"current_payload_id": "ligand"}`;
     a NULL id gives `None`). Rows are read `window` at a time in (volume, offset) order, so at most
     that many hold bytes here, and the engine reads only its window ahead (I8). What `rows` knows
-    (`open`, `remaining`, `reads` of `ms_flow.query.Rows`) passes through.
+    (`open`, `remaining`, `reads` of `ms_flow.query.Rows`) passes through. With `kinds`, each key
+    also gets `<key>_kind`, the kind its payload was stored with, so a task knows how to parse it.
     """
     from ms_flow.core.database import resolve_project_store
 
-    return _WithPayloads(resolve_project_store(project).payloads, rows, fields, window)
+    return _WithPayloads(resolve_project_store(project).payloads, rows, fields, window, kinds)
 
 
 def compaction(min_dead: float = 0.5, order_by: str | None = None):

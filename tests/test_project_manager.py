@@ -30,9 +30,7 @@ def test_project_manager_create_bootstraps_min_layout(tmp_path, monkeypatch):
     assert context.path == project_dir
     assert (project_dir / "config.toml").exists()
     assert (project_dir / "logs").is_dir()
-    assert (project_dir / "data").is_dir()
-    assert (project_dir / "results").is_dir()
-    assert (project_dir / "tmp").is_dir()
+    assert not (project_dir / "data").exists()  # nothing else until something writes there
 
 
 def test_project_manager_load_raises_if_folder_missing(tmp_path, monkeypatch):
@@ -77,6 +75,4 @@ def test_project_manager_load_ensures_required_layout(tmp_path, monkeypatch):
 
     assert context.path == project_dir
     assert (project_dir / "logs").is_dir()
-    assert (project_dir / "data").is_dir()
-    assert (project_dir / "results").is_dir()
-    assert (project_dir / "tmp").is_dir()
+    assert not (project_dir / "data").exists()  # nothing else until something writes there
