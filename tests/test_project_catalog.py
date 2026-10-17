@@ -105,8 +105,9 @@ def test_project_catalog_creates_declared_project_resource_dirs(tmp_path, monkey
             description="catalog project",
         )
 
-        assert (project_root / "data" / "ligands").is_dir()
-        assert (project_root / "results" / "docking").is_dir()
+        # Resource dirs appear on their first write, not at creation.
+        assert not (project_root / "data").exists()
+        assert not (project_root / "results").exists()
     finally:
         editor.shutdown()
 
