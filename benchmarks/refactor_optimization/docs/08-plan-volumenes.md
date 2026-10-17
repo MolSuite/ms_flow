@@ -355,7 +355,8 @@ Desvíos frente a lo escrito arriba:
 ### V7 — Escala y documentación
 
 - [ ] **V7-1** 10M en el disco nuevo: importar, ordenar con índice, paginar por clave, contar con filtro, `check`, compactar y RSS máximo.
-- [ ] **V7-2** Guía y referencia de la API en la documentación de `ms_flow` (en inglés).
+- [x] **V7-2** Guía y referencia de la API en la documentación de `ms_flow` (en inglés).
+  `docs/payloads.md`: esquema con FK, escribir desde un job, diccionarios, leer (`with_payloads`, `materialize`, `scratch_file`), borrar y mantenimiento, con la referencia de `ms_flow.payloads` al final. Página aparte de la guía porque estas ramas no tienen todavía la guía del motor nuevo de `main` (#3, #4); al fusionar, solo choca la línea de `nav`. El `zensical build` de estas ramas falla en `api_reference.md` (`ms_flow.main.MolSuite`, que ya no existe), no en esta página; en `main` está corregido.
 - [ ] **V7-3** Publicación.
 
 Hecho cuando: los números de 10M están en el informe y la guía está publicada.
@@ -448,8 +449,8 @@ flowchart LR
 | V3 Leer | ☑ (todo en frío: fuente de job 24,9 s, exportar 19,6 s, VP 29,2 s) | `feat/payload-volumes-v3` |
 | V4 Mantenimiento | ☑ (100k: `check(full)` en frío 4,3 s, compactar 34 MB/s vivos, limitado por el disco) | `feat/payload-volumes-v4` |
 | V5 Compresión | ☑ (V5-7 con V4; 100k: 5,9× con diccionario, importar a disco −40 %, leer en frío −75 %) | `feat/payload-volumes-v5` |
-| V6 Segmentos (condicional) | ☐ | |
-| V7 Escala y docs | ☐ | |
+| V6 Segmentos (condicional) | ☐ (espera a V0-4, disco nuevo) | |
+| V7 Escala y docs | ◐ (V7-2 hecho; V7-1 necesita el disco nuevo, V7-3 a Mario) | `feat/payload-volumes-v7` |
 | A0 Esquema | ☐ | |
 | A1 Importar | ☐ | |
 | A2 Build y modelos | ☐ | |
