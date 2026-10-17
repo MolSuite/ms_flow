@@ -607,9 +607,11 @@ class _ProjectStoreSqliteOps:
         its bytes are on disk before the rows commit, and gone again if they don't (I1, I2)."""
         found = [(row, key) for row in rows for key, value in row.items() if isinstance(value, Payload)]
         if found:
-            ids = self._db.payloads.put(session, [row[key] for row, key in found])
-            for (row, key), payload_id in zip(found, ids):
-                row[key] = payload_id
+            # One object in several columns (an input that is also the current form) is stored once.
+            unique = list({id(row[key]): row[key] for row, key in found}.values())
+            ids = dict(zip((id(payload) for payload in unique), self._db.payloads.put(session, unique)))
+            for row, key in found:
+                row[key] = ids[id(row[key])]
 
     def bulk_insert_rows(self, request: ProjectBulkInsertRequest) -> ProjectBulkInsertResult:
         rows = [dict(row) for row in request.rows]
