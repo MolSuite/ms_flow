@@ -47,7 +47,7 @@ ray = ["ray>=2.9"]
 
 [project.urls]
 Homepage = "https://github.com/MolSuite/ms_flow"
-Documentation = "https://github.com/MolSuite/ms_flow/tree/main/docs"
+Documentation = "https://molsuite.github.io/ms_flow/"
 Issues = "https://github.com/MolSuite/ms_flow/issues"
 
 # The release tag is the only version there is: nothing to bump by hand, and

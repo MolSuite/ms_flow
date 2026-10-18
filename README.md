@@ -4,10 +4,19 @@ In-process, desktop-first, domain-agnostic orchestrator for massive data flows:
 jobs, executors and persistence in the same process as your app — no broker, no
 daemon, no server. Works from a Qt app, a notebook or a plain script.
 
-```python
-import sqlite3
+`workers.py` (tasks and jobs live in a module the workers can import):
 
-from ms_flow import Workspace, job, table_sink, task
+```python
+from sqlmodel import Field, SQLModel
+
+from ms_flow import job, table_sink, task
+
+
+class Result(SQLModel, table=True):      # the project creates this table when it opens
+    __tablename__ = "results"
+    id: int | None = Field(default=None, primary_key=True)
+    value: int
+    double_value: int
 
 
 @task()
@@ -18,15 +27,21 @@ def double_value(value: int) -> dict:
 @job(task=double_value, output=table_sink("results", columns=("value", "double_value")))
 def double_values(params, project):
     yield from range(1000)
+```
 
+`run.py`:
+
+```python
+from ms_flow import Workspace
+from workers import Result, double_values
 
 ms = Workspace(app_id="demo")
-ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
-with sqlite3.connect(ms.project_db.db_path) as db:
-    db.execute("CREATE TABLE IF NOT EXISTS results (value INTEGER, double_value INTEGER)")
-
-print(ms.engine.wait(ms.submit(double_values)).status)
-ms.shutdown()
+try:
+    ms.create_or_open_project(name="demo", folder="./demo_project", activate=True)
+    print(ms.engine.wait(ms.submit(double_values)).status)   # completed
+    print(ms.project_db.count(Result))                       # 1000
+finally:
+    ms.shutdown()
 ```
 
 ## Install
@@ -35,17 +50,14 @@ ms.shutdown()
 pip install ms_flow            # engine + projects: SQLite and loky
 ```
 
-## Where to look
+## Documentation
 
-- [5-minute quickstart](docs/guides/quickstart_5min.md) — first working job.
-- [Runnable examples](examples/README.md) — scripts y notebook.
-- [Public API](docs/guides/public_api.md) — API.
-- [Docs index](docs/README.md) — guides, contracts, operation
-- [Benchmarks](benchmarks/README.md) — performance.
+<https://molsuite.github.io/ms_flow/>: a guide to tasks, jobs, sinks, following and
+continuing jobs and where they run, and the API reference.
 
 ## Status
 
-Beta. The public API (`ms_flow.api`) is the stable surface; `ms_flow.core.*` may change without notice.
+Beta. The public API (`ms_flow`, `ms_flow.api`, `ms_flow.engine`) is the stable surface; `ms_flow.core.*` may change without notice.
 
 ## License
 
