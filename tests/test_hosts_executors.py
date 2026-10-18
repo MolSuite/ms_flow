@@ -299,3 +299,11 @@ def test_a_machine_works_for_one_executor_at_a_time(tmp_path, monkeypatch):
         assert ms.settings_manager.settings.general.default_executor == "local"  # the one it named is gone
     finally:
         ms.shutdown()
+
+
+def test_this_machine_leaves_two_cpus_free_unless_told_otherwise():
+    from ms_flow.core.settings.models import Settings, share
+
+    local = Settings().hosts["local"]
+    assert local.cpus == -2 and share(local.cpus, 16, 1) == 14 and share(local.cpus, 2, 1) == 1
+    assert Settings(hosts={"local": {"cpus": 0}}).hosts["local"].cpus == 0  # a saved choice stays
