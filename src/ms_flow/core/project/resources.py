@@ -79,13 +79,6 @@ class ProjectResourceContract:
             seen.add(spec.key)
         object.__setattr__(self, "specs", normalized_specs)
 
-    def required_dirs(self) -> list[str]:
-        dirs: list[str] = []
-        for spec in self.specs:
-            if spec.relative_path not in dirs:
-                dirs.append(spec.relative_path)
-        return dirs
-
     def resolve(self, project_root: str | Path) -> dict[str, ProjectResource]:
         root = Path(project_root).expanduser().resolve()
         return {

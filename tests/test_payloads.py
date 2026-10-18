@@ -47,11 +47,15 @@ def test_payload_tables_exist_with_autoincrement_and_enforced_fk(project):
 
 # -- V1-2 writer ------------------------------------------------------------
 
+import functools
 import struct
 import zlib
 
 from ms_flow import payloads as P
-from ms_flow.payloads import Payload, PayloadStore
+from ms_flow.payloads import PayloadStore
+
+# The volume format, with the bytes as given: codecs are tested in test_payloads_codecs.py.
+Payload = functools.partial(P.Payload, codec="none")
 
 
 def _put(store, project, items):
@@ -231,10 +235,10 @@ def test_open_cuts_the_uncommitted_tail_of_a_dead_writer(project):
         project = ProjectStore.open_at(sys.argv[1])
         store = PayloadStore(project)
         with project.get_session() as session:
-            store.put(session, [Payload(b"committed")])
+            store.put(session, [Payload(b"committed", codec="none")])
             session.commit()
         session = project.get_session()
-        store.put(session, [Payload(b"x" * 1000)])  # synced, never committed
+        store.put(session, [Payload(b"x" * 1000, codec="none")])  # synced, never committed
         os._exit(137)
         """,
         project.db_path,
@@ -361,3 +365,23 @@ def test_referencing_columns_come_from_the_app_schema(project):
     store = PayloadStore(project)
     assert sorted(store.referencing_columns()) == [("app_items", "structure_payload_id"), ("poses", "pose_payload_id")]
     store.close()
+
+
+# -- V2-1 the type that travels -----------------------------------------------
+
+import pickle
+import subprocess
+import sys
+
+
+def test_payload_pickles_its_bytes_once_and_loads_without_sql():
+    item = Payload(os.urandom(100_000), kind="sdf", series="ligands")
+    blob = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
+    assert pickle.loads(blob) == item.packed()
+    assert len(blob) - len(item.data) < 200  # the bytes once, plus the class and two names
+
+    probe = ("import pickle, sys; item = pickle.loads(sys.stdin.buffer.read()); "
+             "print(len(item.data), 'sqlalchemy' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", probe], input=blob, capture_output=True, check=True,
+                         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}).stdout.split()
+    assert out == [b"100000", b"False"]  # a worker that loads a result never pulls in the database

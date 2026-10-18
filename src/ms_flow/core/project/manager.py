@@ -15,7 +15,8 @@ from ms_flow.core.settings.manager import SettingsManager
 SettingsProfile = Literal["default", "global"]
 
 class ProjectManager:
-    REQUIRED_DIRS = ("logs", "data", "results", "tmp")
+    # Only what the framework writes on open; app resource dirs appear on their first write.
+    REQUIRED_DIRS = ("logs",)
 
     def __init__(self, master_db, app_id_filter: str | None = None):
         # The PM does not hold the active state, the Facade does.
