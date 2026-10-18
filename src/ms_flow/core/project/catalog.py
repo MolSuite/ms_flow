@@ -160,10 +160,6 @@ class AppProjectCatalog(ProjectCatalog):
 
 
 class ProjectCatalogEditor(_ProjectCatalogService):
-    @staticmethod
-    def _manifest_extra_dirs(manifest: AppManifest) -> list[str]:
-        return [spec.relative_path for spec in getattr(manifest, "project_resources", ()) if spec.relative_path]
-
     def _resolve_manifest(self, app_id: str | None = None) -> AppManifest:
         effective_app_id = (app_id or "").strip() or self.app_id_filter
         if not effective_app_id:
@@ -197,7 +193,6 @@ class ProjectCatalogEditor(_ProjectCatalogService):
             scope=manifest.scope_id,
             app_id=manifest.app_id,
             tags=tags,
-            extra_dirs=self._manifest_extra_dirs(manifest),
         )
         self.logger.info(
             "Project created in catalog: id=%s app_id=%s path=%s",

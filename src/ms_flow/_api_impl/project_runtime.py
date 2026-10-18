@@ -60,7 +60,7 @@ class WorkspaceProjectRuntimeMixin:
 
     def _merge_project_dirs(self, extra_dirs: list[str] | None = None) -> list[str]:
         names: list[str] = []
-        for item in (*self._project_resource_contract.required_dirs(), *(tuple(extra_dirs or ()))):
+        for item in tuple(extra_dirs or ()):
             normalized = str(item).strip()
             if normalized and normalized not in names:
                 names.append(normalized)

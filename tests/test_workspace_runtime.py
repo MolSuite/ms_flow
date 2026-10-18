@@ -497,6 +497,6 @@ def test_app_runtime_project_resources_follow_manifest_like_contract(tmp_path, m
 
         assert tuple(spec.key for spec in runtime.project_resource_specs()) == ("ligands", "receptors")
         assert runtime.get_project_resource_path("ligands") == tmp_path / "amdock-project" / "data" / "ligands"
-        assert (tmp_path / "amdock-project" / "data" / "receptors").is_dir()
+        assert not (tmp_path / "amdock-project" / "data").exists()
     finally:
         runtime.shutdown()
