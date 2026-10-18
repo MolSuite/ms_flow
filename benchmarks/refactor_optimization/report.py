@@ -243,7 +243,8 @@ def volumes_view(records: list[dict]) -> dict:
                     pct = 100 * (b / a - 1)
                     row[m] = {"was": a, "now": b, "pct": round(pct, 1), "flag": abs(pct) > VOL_MARGIN_PCT}
             drift["rows"].append(row)
-    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref)}
+    return {"modes": out, "base": VOL_BASE, "drift": drift, "fsync": _fsync_cost(records), "job": _job_cost(records, ref),
+            "reads": _read_cost(records), "codecs": _codec_cost(records), "maintenance": _maintenance_cost(records)}
 
 
 def _fsync_cost(records: list[dict]) -> list[dict]:
@@ -275,6 +276,48 @@ def _job_cost(records: list[dict], ref: dict | None) -> list[dict]:
                         "vs_vp_durable_pct": pct(pj.get("durable_s"), vp.get("durable_s")),
                         "flag": vs_base is not None and vs_base > VOL_MARGIN_PCT})
     return out
+
+
+def _read_cost(records: list[dict]) -> list[dict]:
+    """V3: per run with PJ, reading every current payload cold as a job's source and as an export, against VP's reader."""
+    pct = lambda a, b: round(100 * (a / b - 1), 1) if a and b else None
+    out = []
+    for rec in records:
+        pj, vp = (rec["variants"].get(f"parallel/{k}", {}) for k in ("PJ", "VP"))
+        if pj.get("stream_all_current_s_cold"):
+            src, exp, base = pj["stream_all_current_s_cold"], pj.get("export_all_current_s_cold"), vp.get("stream_all_current_s_cold")
+            out.append({"label": rec["label"], "n": pj.get("n"), "source": src, "export": exp, "VP": base,
+                        "source_vs_vp_pct": pct(src, base), "export_vs_vp_pct": pct(exp, base),
+                        "disk_mb": pj.get("stream_all_current_cold_disk_mb")})
+    return out
+
+
+def _codec_cost(records: list[dict]) -> list[dict]:
+    """V5: per run with PJZ or PJD, each codec against PJ (none) of the same run: on disk, and cold reads."""
+    pct = lambda a, b: round(100 * (a / b - 1), 1) if a and b else None
+    out = []
+    for rec in records:
+        pj = rec["variants"].get("parallel/PJ", {})
+        for k in ("PJ", "PJZ", "PJD"):
+            v = rec["variants"].get(f"parallel/{k}", {})
+            if v.get("codec") and any(f"parallel/{c}" in rec["variants"] for c in ("PJZ", "PJD")):
+                out.append({"label": rec["label"], "variant": k, "codec": v["codec"], "n": v.get("n"),
+                            "durable": v.get("durable_s"), "durable_vs_pj_pct": pct(v.get("durable_s"), pj.get("durable_s")),
+                            "raw_mb": v.get("raw_mb"), "stored_mb": v.get("stored_mb"),
+                            "ratio": round(v["raw_mb"] / v["stored_mb"], 2) if v.get("stored_mb") else None,
+                            "source": v.get("stream_all_current_s_cold"),
+                            "source_vs_pj_pct": pct(v.get("stream_all_current_s_cold"), pj.get("stream_all_current_s_cold")),
+                            "export": v.get("export_all_current_s_cold"),
+                            "export_vs_pj_pct": pct(v.get("export_all_current_s_cold"), pj.get("export_all_current_s_cold"))})
+    return out
+
+
+def _maintenance_cost(records: list[dict]) -> list[dict]:
+    """V4-10: per run with PM, a full check, releasing half the payloads and compacting what that left behind, all cold."""
+    keys = ("n", "volume_mb", "check_full_s_cold", "release_s", "released", "compact_s_cold", "compact_mb_s",
+            "compacted_volumes", "compact_read_mb", "compact_written_mb")
+    return [{"label": rec["label"], **{k: rec["variants"]["parallel/PM"].get(k) for k in keys}}
+            for rec in records if "parallel/PM" in rec["variants"]]
 
 
 def _self_check() -> None:
@@ -310,6 +353,18 @@ def _self_check() -> None:
     jobbed = {"parallel/PJ": {"import_s": 150.0, "durable_s": 160.0}, "parallel/VP": {"import_s": 125.0, "durable_s": 160.0}}
     (cost,) = volumes_view([vrec("v2", "2026-11-02", jobbed), vrec(VOL_BASE, "2026-10-15", {"parallel/VP": {"import_s": 120.0}})])["job"]
     assert (cost["vs_base_pct"], cost["vs_vp_pct"], cost["vs_vp_durable_pct"], cost["flag"]) == (25.0, 20.0, 0.0, True)
+    read = {"parallel/PJ": {"stream_all_current_s_cold": 12.0, "export_all_current_s_cold": 9.0},
+            "parallel/VP": {"stream_all_current_s_cold": 10.0}}
+    (cost,) = volumes_view([vrec("v3", "2026-11-03", read)])["reads"]
+    assert (cost["source_vs_vp_pct"], cost["export_vs_vp_pct"]) == (20.0, -10.0)
+    coded = {"parallel/PJ": {"codec": "none", "durable_s": 10.0, "raw_mb": 600, "stored_mb": 600, "stream_all_current_s_cold": 8.0},
+             "parallel/PJD": {"codec": "zstd-dict", "durable_s": 9.0, "raw_mb": 600, "stored_mb": 150, "stream_all_current_s_cold": 6.0}}
+    pj, pjd = volumes_view([vrec("v5", "2026-11-05", coded)])["codecs"]
+    assert (pj["ratio"], pj["durable_vs_pj_pct"]) == (1.0, 0.0)
+    assert (pjd["ratio"], pjd["durable_vs_pj_pct"], pjd["source_vs_pj_pct"]) == (4.0, -10.0, -25.0)
+    assert volumes_view([vrec("v2", "2026-11-02", jobbed)])["codecs"] == []  # PJ alone is V2/V3, not a codec run
+    (m,) = volumes_view([vrec("v4", "2026-11-04", {"parallel/PM": {"n": 9, "compact_mb_s": 80.0}})])["maintenance"]
+    assert (m["label"], m["compact_mb_s"], m["release_s"]) == ("v4", 80.0, None)
 
 
 _self_check()
@@ -458,7 +513,7 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <h2>Volumes</h2>
   <p class="sub"><code>bench_volumes.py</code> stores molecule payloads two ways and times the same reads on both: SQLite blobs
     (<b>RT</b>) against append-only volumes (serial: <b>HT</b> no fsync, <b>H</b> fsync per shard; parallel: <b>VP</b> the parent
-    writes, <b>VC</b> one segment per chunk, <b>PJ</b> a real ms_flow job whose rows carry <code>Payload</code>s; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
+    writes, <b>VC</b> one segment per chunk, <b>PJ</b> a real ms_flow job whose rows carry <code>Payload</code>s, <b>PJZ</b>/<b>PJD</b> the same with zstd, without and with a dictionary per series; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
     without it). <b>Warm</b> reads run right after the import, with the data in the page cache;
     <b>cold</b> ones run after <code>fsync</code> and <code>posix_fadvise(DONTNEED)</code> on every file, so they come from the disk.
     A blank cell was not measured (the 2026-10-15 run has no cold reads). Plan: <a href="08-plan-volumenes.md">08-plan-volumenes.md</a>.</p>
@@ -466,6 +521,9 @@ td.b, th.b { border-left: 1px solid var(--border); }
   <div class="scroll" id="drift"></div>
   <div class="scroll" id="fsync"></div>
   <div class="scroll" id="job"></div>
+  <div class="scroll" id="reads"></div>
+  <div class="scroll" id="codecs"></div>
+  <div class="scroll" id="maintenance"></div>
 </div>
 
 <div class="card">
@@ -597,6 +655,35 @@ function jobs() {
     + '<p class="note">PJ: the import as an ms_flow job (<code>Flow</code>, <code>ProcessExecutor</code>, <code>table_sink</code>), with the group fsync of every commit. Red: more than 10 % over VP of the base run, the limit of V2-12. VP never syncs: import + sync compares both on the disk.</p>';
 }
 
+function reads() {
+  const c = D.volumes.reads, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
+  document.getElementById('reads').innerHTML = !c.length ? '' : `<h3>Reading everything cold (V3)</h3><table><tr><th class="l">Run</th><th>molecules</th>`
+    + `<th class="b">PJ job source s</th><th>vs VP</th><th>PJ export s</th><th>vs VP</th><th>VP reader s</th><th>MB read from the disk</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td class="b">${f(r.source)}</td><td>${pc(r.source_vs_vp_pct)}</td>`
+      + `<td>${f(r.export)}</td><td>${pc(r.export_vs_vp_pct)}</td><td>${f(r.VP)}</td><td>${f(r.disk_mb)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">Every current payload after evicting the files from the page cache. Job source: <code>with_payloads</code> over <code>Rows</code>, as a job reads it; export: <code>iter_bytes</code>; VP reader: the bench\'s own reader, <code>get_many</code> in batches of 10 000, of the same run.</p>';
+}
+
+function codecs() {
+  const c = D.volumes.codecs, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
+  document.getElementById('codecs').innerHTML = !c.length ? '' : `<h3>Codecs (V5)</h3><table><tr><th class="l">Run</th><th class="l">Variant</th><th class="l">Codec</th><th>molecules</th>`
+    + `<th class="b">import + sync s</th><th>vs PJ</th><th>raw MB</th><th>stored MB</th><th>ratio</th><th>job source s, cold</th><th>vs PJ</th><th>export s, cold</th><th>vs PJ</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td class="l">${esc(r.variant)}</td><td class="l">${esc(r.codec)}</td><td>${f(r.n)}</td>`
+      + `<td class="b">${f(r.durable)}</td><td>${pc(r.durable_vs_pj_pct)}</td><td>${f(r.raw_mb)}</td><td>${f(r.stored_mb)}</td><td>${f(r.ratio)}</td>`
+      + `<td>${f(r.source)}</td><td>${pc(r.source_vs_pj_pct)}</td><td>${f(r.export)}</td><td>${pc(r.export_vs_pj_pct)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">The PJ job with a codec per payload, compressed in the workers; PJD with a zstd dictionary per series, trained on records apart from the ones stored. Raw and stored MB count the job\'s payloads only, not the training ones. Reads evict the files from the page cache first.</p>';
+}
+
+function maintenance() {
+  const c = D.volumes.maintenance, f = v => v == null ? '' : num(v);
+  document.getElementById('maintenance').innerHTML = !c.length ? '' : `<h3>Maintenance (V4)</h3><table><tr><th class="l">Run</th><th>molecules</th><th>volume MB</th>`
+    + `<th>full check s, cold</th><th>released</th><th>release s</th><th class="b">compact s, cold</th><th>MB/s</th><th>volumes</th><th>MB read</th><th>MB written</th></tr>`
+    + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td>${f(r.volume_mb)}</td><td>${f(r.check_full_s_cold)}</td><td>${f(r.released)}</td>`
+      + `<td>${f(r.release_s)}</td><td class="b">${f(r.compact_s_cold)}</td><td>${f(r.compact_mb_s)}</td><td>${f(r.compacted_volumes)}</td>`
+      + `<td>${f(r.compact_read_mb)}</td><td>${f(r.compact_written_mb)}</td></tr>`).join('') + '</table>'
+    + '<p class="note">The PJ job with zstd into smaller volumes, so several get sealed; then <code>check(full=True)</code> reads every needle, half the molecules are deleted and their payloads released, and <code>compact()</code> copies the live needles of the sealed volumes left half dead. MB/s is the live data read by the compaction over its time. Check and compaction start with the files evicted from the page cache.</p>';
+}
+
 function table(host) {
   host.innerHTML = '<table style="font-size:12px"><tr><th>Step</th><th>PR</th><th class="l">Commit</th><th class="l">Date</th>'
     + D.metrics.map((m, i) => `<th${i ? '' : ' class="b"'} title="${m.title}">${m.short}</th>`).join('') + '<th class="b">checks</th></tr>'
@@ -623,7 +710,7 @@ chart(document.getElementById('chart'));
 checks(document.getElementById('checks'));
 findings(document.getElementById('findings'));
 table(document.getElementById('table'));
-if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); }
+if (D.volumes) { document.getElementById('volumes-card').hidden = false; volumes(document.getElementById('volumes'), document.getElementById('drift')); jobs(); reads(); codecs(); maintenance(); }
 document.getElementById('how').innerHTML = D.metrics.map(m => `<p class="note"><b>${m.title.replace(/ \(.*/, '')}.</b> ${m.what.replace(/`([^`]+)`/g, '<code>$1</code>')}</p>`).join('');
 </script>
 </body>

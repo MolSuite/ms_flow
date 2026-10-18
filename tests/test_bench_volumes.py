@@ -63,9 +63,33 @@ def test_parallel_variants_join_the_serial_run_of_the_same_label(tmp_path):
         check_cold(record["variants"][name], PARALLEL_READS, "parallel_2x20k_random")
         assert "parallel_2x20k_random_s" in record["variants"][name]
     assert record["variants"]["parallel/VC"]["files"] == 4  # project.db and one segment per chunk of 1000
-    job = record["variants"]["parallel/PJ"]  # a real ms_flow job: import only, its reads are V3
+    job = record["variants"]["parallel/PJ"]  # a real ms_flow job; its reads are cold, with the V3 readers
     assert job["verified_ids"] == 200 and job["durable_s"] >= job["import_s"] > 0
+    for name in ("stream_all_current", "export_all_current"):
+        disk_mb = job[name + "_cold_disk_mb"]
+        assert job[name + "_s_cold"] > 0 and (disk_mb is None or disk_mb > 0), name
     assert job["files"] == 3  # project.db, a "ligands" and a "poses" volume
+
+
+@pytest.mark.slow
+def test_codec_variants_store_a_sample_compressed(tmp_path):
+    import pickle
+
+    sample = tmp_path / "sample"
+    sample.mkdir()
+    fake = lambda kind, n, seed: [f"{kind} {seed + i}\n".encode() + b"".join(
+        f"  {(seed + i) * j % 97:4d}.{j:04d}  C  0  0\n".encode() for j in range(40)) for i in range(n)]
+    for name, seed in (("bench.pkl", 0), ("train.pkl", 10_000)):  # disjoint, as V5-1's sample
+        (sample / name).write_bytes(pickle.dumps({k: fake(k, 300, seed) for k in ("sdf", "pdbqt", "pose")}))
+    record = run(tmp_path, "parallel", "--workers", "2", "--variants", "PJ,PJZ,PJD", "--sample", str(sample))
+    assert record["sample"] == str(sample)
+    pj, pjz, pjd = (record["variants"][f"parallel/{k}"] for k in ("PJ", "PJZ", "PJD"))
+    assert [v["codec"] for v in (pj, pjz, pjd)] == ["none", "zstd", "zstd-dict"]
+    assert pj["raw_mb"] == pjz["raw_mb"] == pjd["raw_mb"] == pj["stored_mb"]  # the same bytes; training stays apart
+    assert pjd["stored_mb"] <= pjz["stored_mb"] < pj["stored_mb"] and pjd["train_mb"] > 0 == pjz["train_mb"]
+    for res in (pjz, pjd):
+        assert res["verified_ids"] == 200 and res["stream_all_current_s_cold"] > 0
+    assert pjd["files"] == pj["files"] + 2  # and a dictionary per series, in volumes/dicts/
 
 
 def test_variant_that_does_not_fit_is_refused_before_it_runs(tmp_path):

@@ -24,7 +24,18 @@ parallel: `--workers` loky processes produce the payloads and one parent writes 
   VC  volumes, each worker writes one segment file per chunk and the parent keeps the references
   RT  SQLite blobs, the parent inserts
   PJ  a real ms_flow job: `Flow` on a `ProcessExecutor`, the task returns rows with `Payload`s and the `table_sink`
-      stores them through PayloadStore, group fsync included (V2-12). Import only; its reads are V3
+      stores them through PayloadStore, group fsync included (V2-12). Its reads are cold only, with the V3 readers:
+      `stream_all_current_s_cold` through `with_payloads` over `Rows` (a job's source), `export_all_current_s_cold`
+      through `iter_bytes` (an export)
+
+  PJZ PJ with zstd payloads, compressed in the workers (V5)
+  PJD PJ with zstd and a dictionary per series, trained first on `--sample`'s train.pkl (V5)
+  PM  PJZ in volumes of 64 MB, then, cold: check(full), the app deletes half the molecules,
+      release, and compact (V4-10)
+
+`--sample DIR` replaces the synthetic payloads with real ones: DIR/bench.pkl is `{"sdf": [...], "pdbqt": [...],
+"pose": [...]}` (original and current are SDF), cycled over the molecules; DIR/train.pkl, the same shape and
+disjoint, trains PJD's dictionaries. Without it the payloads are random hex and compress about 1.8x.
 
 `durable_s` is `import_s` plus the `sync` right after it: the time until the import is on the disk. Variants that never
 sync (HT, PSN) otherwise finish in the page cache whenever the data fits in RAM.
@@ -66,12 +77,29 @@ VOL_MAX = 256 << 20
 FLUSH_EVERY = 16  # results per index commit in the parallel import, as ms_flow output_flush_every
 DOCKED_FRACTION = 0.2
 SPARE = 1_500_000_000  # bytes that must stay free after a variant
-VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT", "PJ")}
+VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT", "PJ", "PJZ", "PJD", "PM")}
+JOB_CODECS = {"PJ": "none", "PJZ": "zstd", "PJD": "zstd-dict", "PM": "zstd"}
+PM_VOLUME_MB = 64  # so that 100k molecules fill sealed volumes, the only ones compact touches
+SAMPLE_KIND = {"original": "sdf", "current": "sdf", "pdbqt": "pdbqt", "pose": "pose"}
 # The payloads come from this pool; seeded, so every process (a loky worker, a test) produces the same bytes.
 _POOL = random.Random(0).randbytes(32768).hex().encode()
 
 
+_SAMPLE = {}  # --sample: real payloads by kind, in this process
+
+
+def use_sample(directory):
+    if directory and _SAMPLE.get("dir") != str(directory):
+        import pickle
+
+        with open(Path(directory) / "bench.pkl", "rb") as f:
+            _SAMPLE.update(pickle.load(f), dir=str(directory))
+
+
 def payload(i, kind):
+    if _SAMPLE:
+        records = _SAMPLE[SAMPLE_KIND[kind]]
+        return f"{i}:{kind}\n".encode() + records[(i * 7 + KINDS[kind][0]) % len(records)]
     size = KINDS[kind][1] + (i * 7919) % 800
     off = (i * 104729) % (len(_POOL) - size)
     return f"{i}:{kind}\n".encode() + _POOL[off:off + size]
@@ -309,10 +337,15 @@ def verify_store(project, store, n, is_docked):
     return len(mols)
 
 
-def store_rows(start, stop):
-    """PJ, in a worker: the rows of one chunk, each with its `Payload`s, as an AMDockVS task would return them."""
+def store_rows(start, stop, config=None):
+    """PJ, in a worker: the rows of one chunk, each with its `Payload`s, as an AMDockVS task would return them.
+    `config`: the sample directory, the codec and the dictionary of each series (PJZ, PJD)."""
     from ms_flow.payloads import Payload
 
+    config = config or {}
+    use_sample(config.get("sample"))
+    codec = "none" if config.get("codec", "none") == "none" else "zstd"
+    dicts = config.get("dicts") or {}
     rng = random.Random(start)
     rows = []
     for i in range(start, stop):
@@ -321,13 +354,98 @@ def store_rows(start, stop):
         for k in KINDS:
             row[f"{k}_payload_id"] = None
         for k in kinds_for(i, docked_hash):
-            row[f"{k}_payload_id"] = Payload(payload(i, k), kind=k, series="poses" if k == "pose" else "ligands")
+            series = "poses" if k == "pose" else "ligands"
+            row[f"{k}_payload_id"] = Payload(payload(i, k), kind=k, series=series, codec=codec, dictionary=dicts.get(series))
         rows.append(row)
     return rows
 
 
-def measure_job(root, n, workers, quick):
-    """PJ: the import as a job of the engine writes it (V2-12)."""
+def read_all_job(root, n, dev):
+    """PJ, cold: every current payload as a job's source reads it, then as an export does (V3)."""
+    from ms_flow.core.database import ProjectStore
+    from ms_flow.payloads import with_payloads
+    from ms_flow.query import QuerySpec, Rows
+
+    def run(read):
+        project = ProjectStore.open_at(root / "project.db")
+        try:
+            seconds, count = timed(lambda: read(project))
+        finally:
+            project.dispose()
+        assert count == n, (count, n)
+        return seconds
+
+    def source(project):
+        rows = Rows(project, QuerySpec(table="molecules"))
+        return sum(1 for row in with_payloads(project, rows, {"current_payload_id": "current"}) if row["current"])
+
+    def export(project):
+        with project.engine.connect() as c:
+            ids = [r[0] for r in c.exec_driver_sql("SELECT current_payload_id FROM molecules")]
+        return sum(1 for _, data in project.payloads.iter_bytes(ids) if data)
+
+    res = {}
+    for name, read in (("stream_all_current", source), ("export_all_current", export)):
+        res[name + "_s_cold"], res[name + "_cold_disk_mb"] = cold(root, "PJ", dev, lambda _: run(read), fresh=False)
+    return res
+
+
+def maintain_job(root, dev):
+    """PM, cold: check(full), then the app deletes every other molecule, releases their payloads and
+    compacts. MB/s of compact is of live needles read (and written as they are: no dictionary)."""
+    from ms_flow.core.database import ProjectStore
+    from ms_flow.payloads import PayloadStore
+
+    def run(fn):
+        project = ProjectStore.open_at(root / "project.db")
+        store = PayloadStore(project)
+        try:
+            return timed(lambda: fn(project, store))
+        finally:
+            store.close()
+            project.dispose()
+
+    def delete_half(project, store):
+        with project.engine.begin() as c:
+            gone = c.exec_driver_sql("DELETE FROM molecules WHERE id % 2 = 0 RETURNING "
+                                     + ", ".join(f"{k}_payload_id" for k in KINDS)).fetchall()
+        return store.release(pid for row in gone for pid in row if pid is not None)
+
+    res = {"volume_mb": PM_VOLUME_MB}
+    (res["check_full_s_cold"], report), res["check_full_cold_disk_mb"] = cold(
+        root, "PJ", dev, lambda _: run(lambda project, store: store.check(full=True)), fresh=False)
+    assert report.clean, report
+    res["release_s"], res["released"] = run(delete_half)
+    (res["compact_s_cold"], stats), res["compact_cold_disk_mb"] = cold(
+        root, "PJ", dev, lambda _: run(lambda project, store: store.compact()), fresh=False)
+    res["compact_mb_s"] = round(stats["read_mb"] / res["compact_s_cold"], 1)
+    res.update(compacted_volumes=stats["volumes"], compact_read_mb=round(stats["read_mb"]),
+               compact_written_mb=round(stats["written_mb"]))
+    (_, report), _ = cold(root, "PJ", dev, lambda _: run(lambda project, store: store.check(full=True)), fresh=False)
+    assert report.clean, report
+    return res
+
+
+def train_dictionaries(project, sample):
+    """PJD: each series gets a dictionary trained on train.pkl, stored as payloads first, as an app would."""
+    import pickle
+
+    from ms_flow.payloads import Payload
+
+    with open(Path(sample) / "train.pkl", "rb") as f:
+        train = pickle.load(f)
+    dicts = {}
+    for series, kinds in (("ligands", ("sdf", "pdbqt")), ("poses", ("pose",))):
+        with project.get_session() as session:
+            project.payloads.put(session, [Payload(r, series=series) for k in kinds for r in train[k]])
+            session.commit()
+        dicts[series] = str(project.payloads.train_dictionary(series))
+    return dicts
+
+
+def measure_job(root, n, workers, quick, dev=None, codec="none", sample=None, maintain=False):
+    """PJ: the import as a job of the engine writes it (V2-12); PJZ/PJD with zstd (V5); PM then maintains it (V4)."""
+    from ms_flow import payloads
     from ms_flow.engine import Engine, Flow, ProcessExecutor, job, task
     from ms_flow.sinks import table_sink
 
@@ -335,14 +453,20 @@ def measure_job(root, n, workers, quick):
 
     store_chunk = task()(tasks.store_chunk)
     project = store_project(root)
+    config = {"sample": str(sample) if sample else None, "codec": codec,
+              "dicts": train_dictionaries(project, sample) if codec == "zstd-dict" else {}}
+    with project.engine.connect() as c:  # the training payloads stay out of raw_mb/stored_mb
+        first = c.exec_driver_sql("SELECT coalesce(max(id), 0) FROM ms_payloads").scalar() + 1
     output = table_sink("molecules", columns=("id", "mw", "logp", "score", *(f"{k}_payload_id" for k in KINDS)))
     chunks = job(task=store_chunk, output=output)(
-        lambda params, project: [(i, min(i + CHUNK, n)) for i in range(0, n, CHUNK)])
+        lambda params, project: [(i, min(i + CHUNK, n), config) for i in range(0, n, CHUNK)])
+    volume_size = payloads.VOLUME_SIZE
+    payloads.VOLUME_SIZE = PM_VOLUME_MB << 20 if maintain else volume_size  # the writer is this process
     try:
         with Engine(cpus=workers, mem_mb=0) as engine:
             engine.register("process", ProcessExecutor(workers))
             flow = Flow(engine, project)
-            warm = flow.submit(job(task=store_chunk)(lambda params, project: [(0, 0)] * workers))
+            warm = flow.submit(job(task=store_chunk)(lambda params, project: [(0, 0, config)] * workers))
             engine.wait(warm, 120)  # workers up before the clock starts
             t = time.perf_counter()
             ended = engine.wait(flow.submit(chunks), 3600)
@@ -350,12 +474,20 @@ def measure_job(root, n, workers, quick):
             assert ended.status == "completed", ended.error
         with project.engine.connect() as c:
             c.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
-        res = {"n": n, "workers": workers, "import_s": elapsed}
+        res = {"n": n, "workers": workers, "codec": codec, "import_s": elapsed}
         res["durable_s"] = res["import_s"] + timed_sync()
+        with project.engine.connect() as c:
+            raw, stored = c.exec_driver_sql(
+                "SELECT sum(raw_length), sum(length) FROM ms_payloads WHERE id >= ?", (first,)).one()
+            train = c.exec_driver_sql("SELECT coalesce(sum(length), 0) FROM ms_payloads WHERE id < ?",
+                                      (first,)).scalar()
+        res["raw_mb"], res["stored_mb"], res["train_mb"] = round(raw / 1e6), round(stored / 1e6), round(train / 1e6, 1)
         if quick:
             res["verified_ids"] = verify_store(project, project.payloads, n, docked_hash)
     finally:
+        payloads.VOLUME_SIZE = volume_size
         project.dispose()
+    res.update(maintain_job(root, dev) if maintain else read_all_job(root, n, dev))
     res["files"] = sum(len(f) for _, _, f in os.walk(root))  # closed: no -wal/-shm
     res["size_mb"] = round(dir_size(root) / 1e6)
     return res
@@ -798,13 +930,21 @@ def main(argv=None):
     ap.add_argument("--data-dir", type=Path, default=_REPO / ".bench_runs" / "refactor_optimization" / "volumes",
                     help="where the variants write; the disk it is on is the one measured")
     ap.add_argument("--results-dir", type=Path, default=_HERE / "results")
+    ap.add_argument("--sample", type=Path, help="directory with bench.pkl and train.pkl of real payloads (see above)")
     ap.add_argument("--keep", action="store_true", help="do not delete the data of each variant")
     ap.add_argument("--quick", action="store_true", help="small n, and check 200 molecules read back identical; not comparable")
     args = ap.parse_args(argv)
 
-    variants = args.variants.split(",") if args.variants else list(VARIANTS[args.mode])
+    # PJZ/PJD/PM only on request: the codecs want --sample, the synthetic pool is not chemistry
+    variants = args.variants.split(",") if args.variants else [v for v in VARIANTS[args.mode]
+                                                               if v not in ("PJZ", "PJD", "PM")]
     if bad := [v for v in variants if v not in VARIANTS[args.mode]]:
         ap.error(f"{args.mode} has no variant {bad}; choose from {','.join(VARIANTS[args.mode])}")
+    if args.sample and (other := [v for v in variants if v not in JOB_CODECS]):
+        ap.error(f"--sample is for {','.join(JOB_CODECS)}; not {other}")  # the other variants generate in their own workers
+    if "PJD" in variants and not args.sample:
+        ap.error("PJD trains its dictionaries on <sample>/train.pkl: give --sample")
+    use_sample(args.sample)
     n = args.n or (3000 if args.quick else 100_000)
     data_dir = args.data_dir.resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -812,7 +952,7 @@ def main(argv=None):
     meta = {"label": args.label,
             "commit": _git("rev-parse", "--short", "HEAD") + ("+dirty" if _git("status", "--porcelain", "-uno") else ""),
             "machine": {"hostname": socket.gethostname(), "cpus": os.cpu_count(), "kernel": os.uname().release},
-            "disk": disk_info(data_dir)}
+            "disk": disk_info(data_dir), **({"sample": str(args.sample)} if args.sample else {})}
     dev = diskstats_name(meta["disk"])
 
     for variant in variants:
@@ -827,8 +967,9 @@ def main(argv=None):
         try:
             if variant in ("PS", "PSN"):
                 res = measure_store(variant, root, n, args.quick)
-            elif variant == "PJ":
-                res = measure_job(root, n, args.workers, args.quick)
+            elif variant in JOB_CODECS:
+                res = measure_job(root, n, args.workers, args.quick, dev, JOB_CODECS[variant], args.sample,
+                                  maintain=variant == "PM")
             elif args.mode == "serial":
                 res = measure_serial(variant, root, n, args.quick, dev)
             else:
