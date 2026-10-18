@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import SQLModel, Session
 
+from ms_flow.core.database import project_models  # noqa: F401  registers ms_volumes/ms_payloads
 from ms_flow.core.database.master_models import (
     Project,
     ProjectJobIndex,

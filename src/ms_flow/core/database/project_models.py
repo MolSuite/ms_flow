@@ -58,3 +58,45 @@ class ProjectOperationRun(SQLModel, table=True):
     params_json: str = "{}"
     created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
     finished_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+
+
+class PayloadVolume(SQLModel, table=True):
+    """One append-only volume file, `volumes/<id:09d>.vol` (see `ms_flow.payloads`)."""
+
+    __tablename__ = "ms_volumes"
+    # Ids are never reused: a file name must never point to two volumes over time.
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    series: str = Field(default="", index=True)
+    state: str = Field(default="active", index=True)  # active | sealed | trash
+    size: int = 0
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+
+
+class PayloadRecord(SQLModel, table=True):
+    """Where the bytes of one payload live. App tables reference `id`, never the location."""
+
+    __tablename__ = "ms_payloads"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    volume_id: int = Field(foreign_key="ms_volumes.id", index=True)
+    offset: int = 0  # of the needle header
+    length: int = 0  # stored bytes, without the needle header
+    raw_length: int = 0
+    codec: int = 0
+    crc32: int = 0
+    kind: str = ""
+
+
+class PayloadDictionary(SQLModel, table=True):
+    """A zstd dictionary of one series, `volumes/dicts/<id>.zdict`; `id` is the dictionary id in its frames."""
+
+    __tablename__ = "ms_payload_dicts"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    series: str = Field(default="", index=True)
+    samples: int = 0
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)

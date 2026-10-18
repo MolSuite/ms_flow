@@ -1,0 +1,69 @@
+{
+  "label": "V5-8",
+  "commit": "cf7b187",
+  "machine": {
+    "hostname": "mario-LabPC",
+    "cpus": 16,
+    "kernel": "6.8.0-138-generic"
+  },
+  "disk": {
+    "device": "/dev/nvme0n1p3",
+    "fstype": "ext4",
+    "model": "XPG SPECTRIX S40G"
+  },
+  "sample": ".bench_runs/codecs_V5-1",
+  "recorded_at": "2026-10-16T23:45:18+00:00",
+  "mode": "parallel",
+  "n": 100000,
+  "workers": 14,
+  "variants": {
+    "parallel/PJ": {
+      "n": 100000,
+      "workers": 14,
+      "codec": "none",
+      "import_s": 7.051,
+      "durable_s": 7.103,
+      "raw_mb": 974,
+      "stored_mb": 974,
+      "train_mb": 0.0,
+      "stream_all_current_s_cold": 11.464,
+      "stream_all_current_cold_disk_mb": 910.4,
+      "export_all_current_s_cold": 2.441,
+      "export_all_current_cold_disk_mb": 903.0,
+      "files": 3,
+      "size_mb": 1004
+    },
+    "parallel/PJZ": {
+      "n": 100000,
+      "workers": 14,
+      "codec": "zstd",
+      "import_s": 4.293,
+      "durable_s": 4.304,
+      "raw_mb": 974,
+      "stored_mb": 225,
+      "train_mb": 0.0,
+      "stream_all_current_s_cold": 3.287,
+      "stream_all_current_cold_disk_mb": 230.9,
+      "export_all_current_s_cold": 1.207,
+      "export_all_current_cold_disk_mb": 223.5,
+      "files": 3,
+      "size_mb": 256
+    },
+    "parallel/PJD": {
+      "n": 100000,
+      "workers": 14,
+      "codec": "zstd-dict",
+      "import_s": 4.261,
+      "durable_s": 4.27,
+      "raw_mb": 974,
+      "stored_mb": 166,
+      "train_mb": 15.3,
+      "stream_all_current_s_cold": 2.905,
+      "stream_all_current_cold_disk_mb": 179.3,
+      "export_all_current_s_cold": 0.972,
+      "export_all_current_cold_disk_mb": 170.6,
+      "files": 5,
+      "size_mb": 214
+    }
+  }
+}

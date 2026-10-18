@@ -12,6 +12,7 @@ copyright = "Copyright &copy; 2026 MolSuite authors"
 nav = [
   { "Home" = "index.md" },
   { "Guide" = "guide.md" },
+  { "Payloads" = "payloads.md" },
   { "API reference" = "api_reference.md" },
 ]
 
