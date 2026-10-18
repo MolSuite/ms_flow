@@ -79,7 +79,9 @@ class _Table:
     def __init__(self, output, project):
         self.output, self.project = output, project
         graph = output.meta["graph"]["nodes"] if output.mode == "graph" else ()
+        # and ms_payloads, where the Payloads of its rows go: a compaction waits for it
         self.tables = [node["table"] for node in graph] or [output.table]
+        self.tables.append("ms_payloads")
 
     def write(self, results: list) -> None:
         data = _merged(self.output, results)

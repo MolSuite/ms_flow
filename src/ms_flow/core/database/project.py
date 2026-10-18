@@ -26,6 +26,7 @@ from ms_flow.core.database.sqlite_utils import compile_subquery_sql
 _PROJECT_STORE_CACHE: "OrderedDict[str, ProjectStore]" = OrderedDict()
 _PROJECT_STORE_CACHE_LOCK = threading.Lock()
 _PROJECT_STORE_CACHE_MAX = 8
+_PAYLOADS_LOCK = threading.Lock()
 ModelT = TypeVar("ModelT", bound=SQLModel)
 
 
@@ -281,7 +282,28 @@ class ProjectStore:
         self._sqlite.set_db_path(resolved_db_path)
         self._sqlite.setup()
 
+    @property
+    def payloads(self):
+        """The project's `PayloadStore` (`volumes/` next to project.db), made on first use.
+
+        The sinks write the `Payload`s of their rows through it, in the transaction of the rows.
+        """
+        with _PAYLOADS_LOCK:
+            store = self.__dict__.get("_payloads")
+            if store is None or store.engine is not self.engine:  # first use, or the engine was remade
+                from ms_flow.payloads import PayloadStore
+
+                self._close_payloads()
+                store = self._payloads = PayloadStore(self)
+            return store
+
+    def _close_payloads(self):
+        store = self.__dict__.pop("_payloads", None)
+        if store is not None:
+            store.close()
+
     def disconnect(self):
+        self._close_payloads()
         self._sqlite.dispose()
         self._sqlite.db_path = None
         self.project_dir = None
@@ -293,6 +315,7 @@ class ProjectStore:
         self._sqlite.reconnect()
 
     def dispose(self):
+        self._close_payloads()
         self._sqlite.dispose()
 
     def setup(self):

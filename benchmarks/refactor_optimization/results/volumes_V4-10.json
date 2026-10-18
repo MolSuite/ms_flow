@@ -1,0 +1,44 @@
+{
+  "label": "V4-10",
+  "commit": "21e26c7",
+  "machine": {
+    "hostname": "mario-LabPC",
+    "cpus": 16,
+    "kernel": "6.8.0-138-generic"
+  },
+  "disk": {
+    "device": "/dev/nvme0n1p3",
+    "fstype": "ext4",
+    "model": "XPG SPECTRIX S40G"
+  },
+  "sample": ".bench_runs/codecs_V5-1",
+  "recorded_at": "2026-10-17T02:36:02+00:00",
+  "mode": "parallel",
+  "n": 100000,
+  "workers": 14,
+  "variants": {
+    "parallel/PM": {
+      "n": 100000,
+      "workers": 14,
+      "codec": "zstd",
+      "import_s": 4.087,
+      "durable_s": 4.099,
+      "raw_mb": 974,
+      "stored_mb": 225,
+      "train_mb": 0.0,
+      "volume_mb": 64,
+      "check_full_s_cold": 4.275,
+      "check_full_cold_disk_mb": 254.9,
+      "release_s": 0.685,
+      "released": 160000,
+      "compact_s_cold": 3.351,
+      "compact_cold_disk_mb": 247.0,
+      "compact_mb_s": 34.3,
+      "compacted_volumes": 5,
+      "compact_read_mb": 115,
+      "compact_written_mb": 115,
+      "files": 3,
+      "size_mb": 141
+    }
+  }
+}
