@@ -23,9 +23,13 @@ import functools
 import importlib
 import inspect
 import json
+import logging
 import threading
 import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0, batch: int | None = None,
@@ -45,6 +49,90 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
                        "batched": batched, "label": label, "thread": thread}
         return fn
     return mark
+
+
+_scope = threading.local()  # `stack`: the clean-up of the chain running on this thread
+
+
+@contextmanager
+def cleanup():
+    """What a task leaves to tidy up, as an `ExitStack`:
+
+        with cleanup() as later:
+            later.callback(os.unlink, path)
+
+    Alone, it is done when the task's `with` ends; within a `chain`, once the last step has ended,
+    so what one step leaves on disk is still there for the next.
+    """
+    stack = getattr(_scope, "stack", None)
+    if stack is not None:
+        yield stack
+        return
+    with ExitStack() as stack:
+        yield stack
+
+
+class _Chain:
+    """Tasks run one after the other on each element, as one task (see `chain`)."""
+
+    def __init__(self, steps, needs, on_error):
+        self.steps, self.on_error = steps, on_error
+        self.names = [step.__name__ for step in steps]
+        self.needs = {name: frozenset(needs.get(name, self.names[:place])) for place, name in enumerate(self.names)}
+        self.__qualname__ = self.__name__ = "+".join(self.names)
+        self.__module__ = steps[0].__module__
+
+    def __call__(self, element, params=None):
+        merged, failed, first = {}, set(), None
+        outer = getattr(_scope, "stack", None)
+        with ExitStack() as own:
+            _scope.stack = outer or own
+            try:
+                for name, step in zip(self.names, self.steps):
+                    if self.needs[name] & failed:
+                        failed.add(name)  # what it would build on is not there
+                        continue
+                    wants = inspect.signature(step).parameters
+                    given = {key: value for key, value in (("params", params), ("previous", merged)) if key in wants}
+                    try:
+                        result = step(element, **given)
+                    except Exception as error:  # noqa: BLE001 - one step failing is not the next failing
+                        failed.add(name)
+                        first = first or error
+                        log.warning("chain %s: step %s failed", self.__name__, name, exc_info=True)
+                        result = self.on_error(name, element, error) if self.on_error is not None else None
+                    for node, rows in (result if isinstance(result, dict) else {name: result or ()}).items():
+                        merged.setdefault(node, []).extend([rows] if isinstance(rows, dict) else rows or ())
+            finally:
+                _scope.stack = outer
+        if len(failed) == len(self.steps):
+            raise first
+        return merged
+
+
+def chain(*steps, needs=None, on_error=None, thread=None):
+    """Tasks that run one after the other on each element, as one task whose result is for a `graph_sink`.
+
+    A step is a task. It gets the element, and `previous` (what the steps before it returned,
+    `{node: rows}`) and `params` if it names them; it returns `{node: rows}`, or rows for a node
+    named after it. `needs` maps a step's name to the steps it builds on, by default every step
+    before it: a step whose needs failed is skipped, the others still run and what they returned
+    is written. The element fails only when every step did. `on_error(step, element, error)` may
+    return `{node: rows}` for the step that failed (a failures table); otherwise it is only logged.
+
+    The chain needs what its hungriest step needs and keeps the first step's retries, batch and
+    label. It runs on a thread only if every step does (`thread` overrides that).
+    ponytail: each step reports its own progress, so the element's bar restarts at each step.
+    """
+    if not steps or not all(hasattr(step, "__task__") for step in steps):
+        raise TypeError("chain takes tasks: decorate each step with @task(...)")
+    if any(step.__task__["batched"] for step in steps):
+        raise TypeError("a batched task cannot be a step of a chain")
+    run = _Chain(steps, dict(needs or {}), on_error)
+    first = steps[0].__task__
+    run.__task__ = {**first, **{need: max(step.__task__[need] for step in steps) for need in ("cpu", "gpu", "mem_mb")},
+                    "thread": all(step.__task__.get("thread", False) for step in steps) if thread is None else thread}
+    return run
 
 
 def job(*, task, name: str = "", params_model=None, output=None, reads=(), finalize=None):

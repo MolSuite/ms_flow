@@ -64,7 +64,7 @@ def test_query_module_exports_query_surface():
 def test_top_level_package_is_a_minimal_entrypoint():
     assert ms_flow.__all__ == [
         "AppRuntime", "BaseRuntime", "MultipleResultsFound", "NoResultFound", "Selection", "Workspace",
-        "file_sink", "graph_sink", "job", "report", "table_sink", "task",
+        "chain", "cleanup", "file_sink", "graph_sink", "job", "report", "table_sink", "task",
     ]
     assert all(getattr(ms_flow, name) is not None for name in ms_flow.__all__)
     assert ms_flow.job is public_engine.job and ms_flow.report is public_engine.report

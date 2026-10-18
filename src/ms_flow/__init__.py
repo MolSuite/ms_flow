@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ms_flow.api import AppRuntime, Workspace
-    from ms_flow.engine import job, report, task
+    from ms_flow.engine import chain, cleanup, job, report, task
     from ms_flow.runtime import BaseRuntime
     from ms_flow.selection import MultipleResultsFound, NoResultFound, Selection
     from ms_flow.sinks import file_sink, graph_sink, table_sink
@@ -26,6 +26,8 @@ _LAZY = {
     "MultipleResultsFound": "ms_flow.selection",
     "NoResultFound": "ms_flow.selection",
     "Selection": "ms_flow.selection",
+    "chain": "ms_flow.engine",
+    "cleanup": "ms_flow.engine",
     "job": "ms_flow.engine",
     "report": "ms_flow.engine",
     "task": "ms_flow.engine",
@@ -51,6 +53,8 @@ __all__ = [
     "NoResultFound",
     "Selection",
     "Workspace",
+    "chain",
+    "cleanup",
     "file_sink",
     "graph_sink",
     "job",
