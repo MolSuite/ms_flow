@@ -254,7 +254,7 @@ def test_a_table_as_source_gives_the_total_and_keeps_out_what_arrives_later(proj
         submit = lambda **more: flow.submit(every_ligand, executor="thread", journal="project", **more)  # noqa: E731
 
         first = submit(key="all")
-        assert flow._writing[first] == {"docking_results"}
+        assert flow._writing[first] == {"docking_results", "ms_payloads"}
         _until(lambda: engine.status(first).chunks_total == 400)
         sql("DELETE FROM ligands WHERE id BETWEEN 381 AND 390")  # not read yet: the total follows
         _until(lambda: engine.status(first).chunks_total == 390)

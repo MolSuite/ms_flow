@@ -88,3 +88,15 @@ class PayloadRecord(SQLModel, table=True):
     codec: int = 0
     crc32: int = 0
     kind: str = ""
+
+
+class PayloadDictionary(SQLModel, table=True):
+    """A zstd dictionary of one series, `volumes/dicts/<id>.zdict`; `id` is the dictionary id in its frames."""
+
+    __tablename__ = "ms_payload_dicts"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    series: str = Field(default="", index=True)
+    samples: int = 0
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)

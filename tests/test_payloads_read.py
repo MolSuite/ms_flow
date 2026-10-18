@@ -57,6 +57,14 @@ def test_a_source_with_payloads_gives_each_row_its_bytes_and_keeps_what_its_rows
     assert [row["structure"] for row in plain] == [structure(n) for n in range(3)]
 
 
+def test_kinds_name_each_payload_format_for_sources_and_materialize(project, tmp_path):
+    add_ligands(project, 3)
+    assert project.payloads.kinds([1, 3, 99]) == {1: "sdf", 3: "sdf"}
+    rows = with_payloads(project, Rows(project, QuerySpec(table="ligands")), {"structure_payload_id": "structure"}, kinds=True)
+    assert [(row["structure"], row["structure_kind"]) for row in rows] == [(structure(n), "sdf") for n in range(3)] + [(None, None)]
+    assert Path(project.payloads.materialize(2, tmp_path)).name == "2.sdf"
+
+
 def test_iter_bytes_streams_every_id_once_in_bounded_windows(project):
     data = add_ligands(project, 50)
     got = list(project.payloads.iter_bytes(reversed(range(1, 51)), window=8))
