@@ -157,7 +157,7 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def _hosts_and_executors(self) -> "Settings":
         """`local` is always there, in both; an executor names hosts that are kept."""
-        self.hosts.setdefault("local", HostConfig())
+        self.hosts.setdefault("local", HostConfig(cpus=-2))  # two cores stay for the desktop and the UI
         self.executors.setdefault("local", ExecutorConfig(kind="loky"))
         for name in (*self.hosts, *self.executors):
             if not NAME.fullmatch(name):
