@@ -11,7 +11,9 @@ the bytes. A volume has one writer and only grows; a sealed volume never changes
 
 Each payload says its codec (`none`, `zlib`, `zstd`), so volumes mix them. A
 `Payload` compresses itself when it is pickled, i.e. in the worker that made it:
-the writer only appends bytes. A zstd frame names its dictionary (`dicts/<id>.zdict`,
+the writer only appends bytes. A `PayloadGroup` stores several payloads as one needle, which
+compresses them better (the poses of one docking, about half); each part keeps its own row and
+id, with its place in the needle's raw bytes (`part_offset`, `part_length`). A zstd frame names its dictionary (`dicts/<id>.zdict`,
 trained per series with `PayloadStore.train_dictionary`), so reading needs no table.
 
 Maintenance: `check` reports, `release` drops payloads nobody references, `compact`
@@ -36,7 +38,7 @@ from collections import OrderedDict
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-from itertools import islice
+from itertools import accumulate, islice
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -120,6 +122,61 @@ class Payload:
     def __reduce__(self):
         packed = self.packed()
         return Payload, (packed.data, packed.kind, packed.series, packed.codec, None, packed.raw_length)
+
+
+class PayloadGroup:
+    """Payloads stored together as one compressed needle; each part keeps its own id.
+
+    Reading a part decompresses the whole needle, so a group holds what is read together (the
+    poses of one docking). `add` returns the `PayloadPart` a row carries; the sink stores the
+    group once. Pickling compresses the parts as one, in the worker, like a `Payload`.
+    """
+
+    __slots__ = ("kind", "series", "codec", "dictionary", "parts", "_packed")
+
+    def __init__(self, kind: str = "", series: str = "default", codec: str = DEFAULT_CODEC,
+                 dictionary: str | None = None):
+        self.kind, self.series, self.codec, self.dictionary = kind, series, codec, dictionary
+        self.parts: list[bytes] = []  # raw bytes, until packed
+        self._packed: tuple[Payload, list[int]] | None = None
+
+    def add(self, data: bytes) -> PayloadPart:
+        if self._packed is not None:
+            raise ValueError("a packed group takes no more parts")
+        self.parts.append(bytes(data))
+        return PayloadPart(self, len(self.parts) - 1)
+
+    def __len__(self) -> int:
+        return len(self._packed[1]) if self._packed is not None else len(self.parts)
+
+    def packed(self) -> tuple[Payload, list[int]]:
+        """The parts as one compressed `Payload`, and the raw length of each part."""
+        if self._packed is None:
+            whole = Payload(b"".join(self.parts), self.kind, self.series, self.codec, self.dictionary)
+            return whole.packed(), [len(part) for part in self.parts]
+        return self._packed
+
+    def __reduce__(self):
+        return _packed_group, self.packed()
+
+
+def _packed_group(payload: Payload, sizes: list[int]) -> PayloadGroup:
+    group = PayloadGroup(payload.kind, payload.series, payload.codec)
+    group._packed = (payload, sizes)
+    return group
+
+
+@dataclass(frozen=True, slots=True)
+class PayloadPart:
+    """One payload of a `PayloadGroup`, what a row carries where it would carry a `Payload`."""
+
+    group: PayloadGroup
+    index: int
+
+    @property
+    def data(self) -> bytes:
+        """The raw bytes, in the process that made the group (before it is pickled)."""
+        return self.group.parts[self.index]
 
 
 _codecs = threading.local()  # zstd (de)compressors are not thread-safe: one set per thread
@@ -217,10 +274,22 @@ class PayloadStore:
         self._hooked: weakref.WeakSet = weakref.WeakSet()
         self._fds: OrderedDict[int, list] = OrderedDict()  # volume id -> [fd, users, evicted]
         self._fd_lock = threading.Lock()
+        self._add_part_columns()
         self._recover()
 
     def path(self, volume_id: int) -> Path:
         return self.directory / f"{volume_id:09d}.vol"
+
+    def _add_part_columns(self) -> None:
+        """A project made before groups existed has no `part_*` columns: NULL there is what its rows mean."""
+        from sqlalchemy.exc import OperationalError
+
+        with self.engine.connect() as conn:
+            have = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(ms_payloads)")}
+        for column in ("part_offset", "part_length"):
+            if column not in have:
+                with suppress(OperationalError), self.engine.begin() as conn:  # another process added it first
+                    conn.exec_driver_sql(f"ALTER TABLE ms_payloads ADD COLUMN {column} INTEGER")
 
     def _recover(self) -> None:
         """F3/F4: seal the active volumes of dead writers, cut back to their committed bytes.
@@ -259,8 +328,9 @@ class PayloadStore:
 
     # -- writing ---------------------------------------------------------
 
-    def put(self, session: Any, payloads: Iterable[Payload]) -> list[int]:
-        """Store `payloads` inside the caller's transaction; return their ids, in order.
+    def put(self, session: Any, payloads: Iterable[Payload | PayloadGroup]) -> list[int]:
+        """Store `payloads` inside the caller's transaction; return their ids, in order: one per
+        `Payload`, one per part of a `PayloadGroup` (an empty group stores nothing).
 
         The bytes are on disk (fdatasync) when this returns, so the caller's commit never
         points to lost bytes. If that transaction does not commit, the volumes go back to
@@ -276,6 +346,11 @@ class PayloadStore:
             pending: dict[_Volume, list] = {}
             placed = []
             for payload in payloads:
+                sizes = None
+                if isinstance(payload, PayloadGroup):
+                    payload, sizes = payload.packed()
+                    if not sizes:
+                        continue
                 payload = payload.packed()  # done already when it came from a worker
                 data, codec = payload.data, CODECS[payload.codec]
                 size = len(data)
@@ -285,7 +360,11 @@ class PayloadStore:
                     _NEEDLE.pack(crc, size, payload.raw_length, codec, 0),
                     data,
                 )
-                placed.append((volume.id, volume.end, size, payload.raw_length, codec, crc, payload.kind))
+                row = (volume.id, volume.end, size, payload.raw_length, codec, crc, payload.kind)
+                if sizes is None:
+                    placed.append((*row, None, None))
+                else:
+                    placed += [(*row, start, length) for start, length in zip(accumulate(sizes, initial=0), sizes)]
                 volume.end += NEEDLE + size
             for volume, (offset, buffers) in pending.items():
                 try:
@@ -304,8 +383,8 @@ class PayloadStore:
             ids = []
             for row in placed:
                 cursor.execute(
-                    'INSERT INTO ms_payloads (volume_id, "offset", length, raw_length, codec, crc32, kind)'
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    'INSERT INTO ms_payloads (volume_id, "offset", length, raw_length, codec, crc32, kind,'
+                    " part_offset, part_length) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     row,
                 )
                 ids.append(cursor.lastrowid)
@@ -428,7 +507,13 @@ class PayloadStore:
         missing = [i for i in wanted if i not in located]
         if missing:
             raise KeyError(f"unknown payload ids: {missing[:10]}")
-        return {i: self._read(i, located[i]) for i in sorted(located, key=located.__getitem__)}
+        found, needle, raw = {}, None, b""
+        for i in sorted(located, key=lambda i: located[i][:2]):
+            location = located[i]
+            if location[:2] != needle:  # the parts of a group: one read, one decompression
+                needle, raw = location[:2], self._read(i, location)
+            found[i] = _part(raw, location)
+        return found
 
     def kinds(self, ids: Iterable[int]) -> dict[int, str]:
         """The `kind` each payload was stored with (a format: `sdf`, `pdbqt`...), by id; unknown ids are left out."""
@@ -470,8 +555,8 @@ class PayloadStore:
             for start in range(0, len(ids), LOCATE_CHUNK):
                 chunk = ids[start : start + LOCATE_CHUNK]
                 rows = conn.exec_driver_sql(
-                    'SELECT id, volume_id, "offset", length, raw_length, codec, crc32 FROM ms_payloads'
-                    f" WHERE id IN ({','.join('?' * len(chunk))})",
+                    'SELECT id, volume_id, "offset", length, raw_length, codec, crc32, part_offset, part_length'
+                    f" FROM ms_payloads WHERE id IN ({','.join('?' * len(chunk))})",
                     tuple(chunk),
                 )
                 for row in rows:
@@ -479,18 +564,19 @@ class PayloadStore:
         return found
 
     def _read(self, payload_id: int, location: tuple) -> bytes:
+        """The needle's raw bytes, all of them (the parts of a group too)."""
         data, location = self._stored(payload_id, location)
         return self._decode(payload_id, data, location[4], location[3])
 
     def _stored(self, payload_id: int, location: tuple, retry: int = 3) -> tuple:
         """The checked stored bytes of a needle, and the location they came from. A needle that
         moved follows its row (I7), `retry` times: compactions can run back to back."""
-        volume_id, offset, length, raw_length, codec, crc = location
+        volume_id, offset, length, raw_length, codec, crc = location[:6]
         try:
             entry = self._open(volume_id)
         except FileNotFoundError:
             moved = self._locate([payload_id]).get(payload_id) if retry else None
-            if moved is not None and moved != location:  # compacted meanwhile: read the new place
+            if moved is not None and moved[:6] != location[:6]:  # compacted meanwhile: read the new place
                 return self._stored(payload_id, moved, retry - 1)
             raise PayloadCorrupt(payload_id, f"volume {volume_id} is missing") from None
         try:
@@ -580,7 +666,7 @@ class PayloadStore:
             volumes = {r[0]: r[1:] for r in conn.exec_driver_sql("SELECT id, state, size FROM ms_volumes")}
             stats = {r[0]: r[1:] for r in conn.exec_driver_sql(
                 f'SELECT volume_id, sum({NEEDLE} + length), max("offset" + {NEEDLE} + length)'
-                " FROM ms_payloads GROUP BY volume_id")}
+                f" FROM {_NEEDLES} GROUP BY volume_id")}
             report.unreferenced = [r[0] for r in conn.exec_driver_sql(
                 f"SELECT id FROM ms_payloads WHERE {self._unreferenced()}")]
             dicts = [r[0] for r in conn.exec_driver_sql("SELECT id FROM ms_payload_dicts")]
@@ -611,12 +697,16 @@ class PayloadStore:
             if full:
                 rows = conn.exec_driver_sql('SELECT id, volume_id, "offset", length, raw_length, codec, crc32'
                                             ' FROM ms_payloads ORDER BY volume_id, "offset"')
+                needle, error = None, None
                 for pid, *location in rows:
-                    if pid not in report.broken:
+                    if tuple(location[:2]) != needle:  # the parts of a group: read once
+                        needle, error = tuple(location[:2]), None
                         try:
                             self._read(pid, tuple(location))
-                        except Exception as error:  # a report: whatever stops a read goes in it
-                            report.broken[pid] = str(error)
+                        except Exception as failure:  # a report: whatever stops a read goes in it
+                            error = str(failure)
+                    if error is not None and pid not in report.broken:
+                        report.broken[pid] = error
         report.missing_dicts = [d for d in dicts if not (self.directory / "dicts" / f"{d}.zdict").exists()]
         known = set(volumes)
         report.orphans = sorted(volume_id for volume_id in self._volume_files()
@@ -653,7 +743,7 @@ class PayloadStore:
         with self.engine.connect() as conn:
             rows = conn.exec_driver_sql(
                 f"SELECT v.id, v.series, v.size, coalesce(sum({NEEDLE} + p.length), 0) FROM ms_volumes v"
-                " LEFT JOIN ms_payloads p ON p.volume_id = v.id WHERE v.state = 'sealed' GROUP BY v.id").fetchall()
+                f" LEFT JOIN {_NEEDLES} p ON p.volume_id = v.id WHERE v.state = 'sealed' GROUP BY v.id").fetchall()
         picked: dict[str, list[int]] = {}
         for series in {r[1] for r in rows}:
             mine = [(vid, 1 - live / max(size - HEADER, 1), size) for vid, s, size, live in rows if s == series]
@@ -680,8 +770,12 @@ class PayloadStore:
         dictionary = self.dictionary(series)
         dict_id = int(Path(dictionary).stem) if dictionary else 0
         targets, moved, buffers, volume, offset = [], [], [], None, 0
+        copied: dict[tuple, tuple] = {}  # (old volume, old offset) -> its new location: a group moves once
         try:
             for pid, *location in rows:
+                if (new := copied.get(tuple(location[:2]))) is not None:
+                    moved.append((*new, pid, *location[:2]))
+                    continue
                 try:
                     data, _ = self._stored(pid, tuple(location), retry=0)
                 except PayloadCorrupt:  # stays where it is: check() names it
@@ -700,7 +794,8 @@ class PayloadStore:
                 if not buffers:
                     offset = volume.end
                 buffers += (_NEEDLE.pack(crc, len(data), raw_length, codec, 0), data)
-                moved.append((volume.id, volume.end, len(data), raw_length, codec, crc, pid, old_volume, old_offset))
+                copied[(old_volume, old_offset)] = new = (volume.id, volume.end, len(data), raw_length, codec, crc)
+                moved.append((*new, pid, old_volume, old_offset))
                 volume.end += NEEDLE + len(data)
                 if len(buffers) >= _IOV_MAX:
                     _write_all(volume.fd, buffers, offset)
@@ -920,6 +1015,15 @@ def scratch_file(data: bytes, suffix: str = ""):
     finally:
         with suppress(FileNotFoundError):
             os.unlink(name)
+
+
+# One row per needle: the parts of a group share theirs, and count once.
+_NEEDLES = '(SELECT DISTINCT volume_id, "offset", length FROM ms_payloads)'
+
+
+def _part(raw: bytes, location: tuple) -> bytes:
+    start, length = location[6:8]
+    return raw if start is None else raw[start : start + length]
 
 
 def _write_all(fd: int, buffers: list, offset: int) -> None:
