@@ -23,7 +23,7 @@ from ms_flow.core.database.project_records import (
     ProjectStoreCapabilities,
 )
 from ms_flow.core.database.sqlite_utils import compile_count, compile_select, normalize_identifier
-from ms_flow.payloads import Payload
+from ms_flow.payloads import Payload, PayloadPart
 
 
 class SessionProvider(Protocol):
@@ -605,13 +605,20 @@ class _ProjectStoreSqliteOps:
     def _put_payloads(self, session, rows: Iterator[dict[str, Any]]) -> None:
         """Swap each `Payload` in `rows` for the id it gets, stored in the transaction of the rows:
         its bytes are on disk before the rows commit, and gone again if they don't (I1, I2)."""
-        found = [(row, key) for row in rows for key, value in row.items() if isinstance(value, Payload)]
+        found = [(row, key) for row in rows for key, value in row.items() if isinstance(value, (Payload, PayloadPart))]
         if found:
-            # One object in several columns (an input that is also the current form) is stored once.
-            unique = list({id(row[key]): row[key] for row, key in found}.values())
-            ids = dict(zip((id(payload) for payload in unique), self._db.payloads.put(session, unique)))
+            # One object in several columns (an input that is also the current form) is stored once;
+            # a group once for all its parts, which get one id each.
+            values = [row[key] for row, key in found]
+            singles = list({id(v): v for v in values if isinstance(v, Payload)}.values())
+            groups = list({id(v.group): v.group for v in values if isinstance(v, PayloadPart)}.values())
+            stored = iter(self._db.payloads.put(session, singles + groups))
+            ids = {id(payload): next(stored) for payload in singles}
+            for group in groups:
+                ids.update({(id(group), index): next(stored) for index in range(len(group))})
             for row, key in found:
-                row[key] = ids[id(row[key])]
+                value = row[key]
+                row[key] = ids[id(value)] if isinstance(value, Payload) else ids[(id(value.group), value.index)]
 
     def bulk_insert_rows(self, request: ProjectBulkInsertRequest) -> ProjectBulkInsertResult:
         rows = [dict(row) for row in request.rows]

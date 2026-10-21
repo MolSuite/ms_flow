@@ -88,6 +88,8 @@ class PayloadRecord(SQLModel, table=True):
     codec: int = 0
     crc32: int = 0
     kind: str = ""
+    part_offset: Optional[int] = None  # a part of a group: where its raw bytes start in the needle's
+    part_length: Optional[int] = None  # NULL: the whole needle
 
 
 class PayloadDictionary(SQLModel, table=True):
