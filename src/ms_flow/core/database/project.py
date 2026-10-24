@@ -660,6 +660,40 @@ class ProjectStore:
             session.commit()
             return updated
 
+    # Deferred indexes: indexes an app builds after a bulk insert, not during it. Kept live, a
+    # random key (a name) turns appends into random page writes and the rate falls with the table
+    # size. `indexes` maps a name to its column list and optional WHERE: {"ix_t_name": "(name)"}.
+    def ensure_indexes(self, table: str, indexes: Mapping[str, str], *, retired: Sequence[str] = ()) -> None:
+        """Build the indexes that are missing and drop the `retired` ones (older projects).
+        `CREATE INDEX IF NOT EXISTS` never rebuilds one whose definition changed: rename it."""
+        with self.engine.begin() as conn:
+            for name in retired:
+                conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
+            for name, target in indexes.items():
+                conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS {name} ON {table} {target}")
+
+    def drop_indexes(self, names: Iterable[str]) -> None:
+        with self.engine.begin() as conn:
+            for name in names:
+                conn.exec_driver_sql(f"DROP INDEX IF EXISTS {name}")
+
+    def defer_indexes(self, table: str, names: Iterable[str], incoming: int) -> bool:
+        """Drop `names` when `incoming` rows at least double `table`: building them once at the
+        end beats keeping them live. A small insert into a big table keeps them. True if dropped."""
+        with self.engine.connect() as conn:
+            rows = conn.exec_driver_sql(f"SELECT coalesce(max(rowid), 0) FROM {table}").scalar()
+        if incoming < rows:
+            return False
+        self.drop_indexes(names)
+        return True
+
+    def indexes_ready(self, table: str, names: Iterable[str]) -> bool:
+        """False while any of `names` is dropped or still building (an uncommitted CREATE INDEX
+        is invisible to other connections). A query planned meanwhile may scan the whole table."""
+        from sqlalchemy import inspect
+
+        return set(names) <= {ix["name"] for ix in inspect(self.engine).get_indexes(table)}
+
 
 class _ProjectSQLiteHandle(BaseSQLiteDB):
     def _create_tables(self):
