@@ -211,7 +211,9 @@ class SQLiteBackend(InputBackendBase, OutputBackendBase):
     def _graph_model_columns(self, model) -> list[str]:
         if not hasattr(model, "__table__"):
             raise DataContractError(f"Graph model {model!r} does not define a SQL table.")
-        columns = [column.name for column in model.__table__.columns if not column.primary_key]
+        # A generated column (`Computed`) is the database's to fill: inserting it is an error.
+        columns = [column.name for column in model.__table__.columns
+                   if not column.primary_key and column.computed is None]
         if not columns:
             raise DataContractError(f"Graph model {model!r} does not expose writable columns.")
         return columns

@@ -19,7 +19,7 @@ def _model_output_columns(model: type[SQLModel]) -> tuple[str, ...]:
     table = getattr(model, "__table__", None)
     if table is None:
         raise ValueError(f"Model {model!r} does not define a SQL table.")
-    return tuple(column.name for column in table.columns if not column.primary_key)
+    return tuple(column.name for column in table.columns if not column.primary_key and column.computed is None)
 
 
 def _model_path(model: type[SQLModel]) -> str:

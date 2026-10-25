@@ -24,8 +24,6 @@ class ProjectArtifact(SQLModel, table=True):
     status: str = Field(default="available", index=True)
     producer_job_id: str = Field(default="", index=True)
     metadata_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
-    updated_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ProjectArtifactCapability(SQLModel, table=True):
@@ -40,7 +38,6 @@ class ProjectArtifactCapability(SQLModel, table=True):
     method: str = Field(default="", index=True)
     params_json: str = "{}"
     metadata_json: str = "{}"
-    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime, index=True)
 
 
 class ProjectOperationRun(SQLModel, table=True):
@@ -71,7 +68,6 @@ class PayloadVolume(SQLModel, table=True):
     series: str = Field(default="", index=True)
     state: str = Field(default="active", index=True)  # active | sealed | trash
     size: int = 0
-    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
 
 
 class PayloadRecord(SQLModel, table=True):
@@ -101,4 +97,3 @@ class PayloadDictionary(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     series: str = Field(default="", index=True)
     samples: int = 0
-    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)

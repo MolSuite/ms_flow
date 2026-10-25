@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any, Mapping
 
 from sqlmodel import select
@@ -41,7 +40,6 @@ class ArtifactRegistry:
         producer_job_id: str = "",
         metadata: Mapping[str, Any] | None = None,
     ) -> ProjectArtifact:
-        now = datetime.now()
         row = ProjectArtifact(
             app_id=self.app_id,
             entity_kind=str(entity_kind or "").strip(),
@@ -54,8 +52,6 @@ class ArtifactRegistry:
             status=str(status or "available").strip(),
             producer_job_id=str(producer_job_id or ""),
             metadata_json=_json_text(metadata),
-            created_at=now,
-            updated_at=now,
         )
         if not row.entity_kind:
             raise ValueError("entity_kind must not be empty.")
@@ -179,7 +175,6 @@ class ArtifactRegistry:
                         current_metadata.update(next_metadata)
                         next_metadata = current_metadata
                 artifact.metadata_json = _json_text(next_metadata)
-            artifact.updated_at = datetime.now()
             session.add(artifact)
             session.commit()
             session.refresh(artifact)
