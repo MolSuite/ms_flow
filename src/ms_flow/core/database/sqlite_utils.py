@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\\.]*$")
@@ -80,7 +80,47 @@ def compile_subquery_sql(value: Any, *, null_safe: bool = False) -> tuple[str, t
     return wrapped, sub_params
 
 
-def compile_filters(filters: Mapping[str, Any] | None) -> tuple[list[str], list[Any]]:
+def converting_types(table: str) -> dict[str, Any]:
+    """The columns of a declared table whose type converts values (a `TypeDecorator` with
+    `process_bind_param`, e.g. a text name stored as an integer code), by column name.
+
+    The declarative read goes through them as an ORM comparison would: filter values are
+    bound by the type, read values come back through it.
+    """
+    from sqlalchemy.types import TypeDecorator
+    from sqlmodel import SQLModel
+
+    declared = SQLModel.metadata.tables.get(str(table or ""))
+    if declared is None:
+        return {}
+    return {
+        column.name: column.type
+        for column in declared.columns
+        if isinstance(column.type, TypeDecorator)
+        and type(column.type).process_bind_param is not TypeDecorator.process_bind_param
+    }
+
+
+def decode_rows(rows: Iterable[dict[str, Any]], types: Mapping[str, Any]) -> Iterator[dict[str, Any]]:
+    """Each row with the `converting_types` columns it holds read back through their type."""
+    for row in rows:
+        for name, type_ in types.items():
+            if name in row:
+                row[name] = type_.process_result_value(row[name], None)
+        yield row
+
+
+def _bind(type_: Any, value: Any) -> Any:
+    if type_ is None:
+        return value
+    if isinstance(value, (list, tuple, set)):
+        return [type_.process_bind_param(item, None) for item in value]
+    return type_.process_bind_param(value, None)
+
+
+def compile_filters(
+    filters: Mapping[str, Any] | None, types: Mapping[str, Any] | None = None
+) -> tuple[list[str], list[Any]]:
     conditions: list[str] = []
     params: list[Any] = []
     for raw_key, raw_value in (filters or {}).items():
@@ -94,6 +134,8 @@ def compile_filters(filters: Mapping[str, Any] | None) -> tuple[list[str], list[
         field = compile_field(field_name)
         operator = op.strip().lower()
         value = raw_value
+        if operator in ("eq", "ne", "in", "not_in") and value is not None:
+            value = _bind((types or {}).get(field), value)
 
         if operator == "eq":
             conditions.append(f"{field} = ?")
@@ -177,7 +219,7 @@ def compile_select(
 
     select_fields = ", ".join(fields) if fields else "*"
     sql = f"SELECT {select_fields} FROM {table}"
-    where_parts, bound_params = compile_filters(filters)
+    where_parts, bound_params = compile_filters(filters, converting_types(table))
 
     if where_parts:
         sql += " WHERE " + " AND ".join(where_parts)
