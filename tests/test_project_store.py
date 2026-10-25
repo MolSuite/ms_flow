@@ -429,3 +429,22 @@ def test_project_store_ops_caches_graph_table_reflection(tmp_path, monkeypatch):
     assert result1.rows_written == 2
     assert result2.rows_written == 2
     assert table_calls["count"] == 2
+
+
+def test_deferred_indexes_drop_for_a_big_insert_and_come_back(tmp_path):
+    store = ProjectStore()
+    store.connect(tmp_path / "project")
+    table = _TestMolecule.__tablename__
+    indexes = {"ix_t_name": "(name)", "ix_t_selected": "(id) WHERE selected=1"}
+    store.ensure_indexes(table, indexes)
+    assert store.indexes_ready(table, indexes)
+    store.insert_batch([_TestMolecule(name=f"m{i}") for i in range(10)])
+
+    assert not store.defer_indexes(table, indexes, incoming=9)  # small insert into a bigger table
+    assert store.indexes_ready(table, indexes)
+    assert store.defer_indexes(table, indexes, incoming=10)
+    assert not store.indexes_ready(table, indexes)
+
+    store.ensure_indexes(table, {"ix_t_name": "(name)"}, retired=("ix_t_selected",))
+    assert store.indexes_ready(table, ["ix_t_name"]) and not store.indexes_ready(table, ["ix_t_selected"])
+    store.dispose()

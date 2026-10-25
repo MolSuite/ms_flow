@@ -22,7 +22,9 @@ from ms_flow.core.database.project_records import (
     ProjectReadQuery,
     ProjectStoreCapabilities,
 )
-from ms_flow.core.database.sqlite_utils import compile_count, compile_select, normalize_identifier
+from ms_flow.core.database.sqlite_utils import (
+    compile_count, compile_select, converting_types, decode_rows, normalize_identifier,
+)
 from ms_flow.payloads import Payload, PayloadPart
 
 
@@ -274,7 +276,9 @@ class _ProjectStoreSqliteOps:
     def _graph_model_columns(model) -> list[str]:
         if not hasattr(model, "__table__"):
             raise DataContractError(f"Graph model {model!r} does not define a SQL table.")
-        columns = [column.name for column in model.__table__.columns if not column.primary_key]
+        # A generated column (`Computed`) is the database's to fill: inserting it is an error.
+        columns = [column.name for column in model.__table__.columns
+                   if not column.primary_key and column.computed is None]
         if not columns:
             raise DataContractError(f"Graph model {model!r} does not expose writable columns.")
         return columns
@@ -558,13 +562,18 @@ class _ProjectStoreSqliteOps:
         sql, params = self._compile_query(query)
         with self.get_session() as session:
             result = session.connection().exec_driver_sql(sql, params)
-            return list(self._rows_from_result(result, batch_size=None))
+            return list(self._decoded(query, self._rows_from_result(result, batch_size=None)))
 
     def stream_rows(self, query: ProjectReadQuery) -> Iterator[dict[str, Any]]:
         sql, params = self._compile_query(query)
         with self.get_session() as session:
             result = session.connection().exec_driver_sql(sql, params)
-            yield from self._rows_from_result(result, batch_size=query.batch_size)
+            yield from self._decoded(query, self._rows_from_result(result, batch_size=query.batch_size))
+
+    @staticmethod
+    def _decoded(query: ProjectReadQuery, rows: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+        types = {} if query.query else converting_types(query.table)
+        return decode_rows(rows, types) if types else rows
 
     @staticmethod
     def _graph_cache_key(graph_meta: Mapping[str, Any]) -> str:

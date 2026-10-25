@@ -20,7 +20,7 @@ from ms_flow.core.data.contracts import (
 )
 from ms_flow.core.data.runtime import DataContext
 from ms_flow.core.database.base import get_sqlite_engine
-from ms_flow.core.database.sqlite_utils import compile_select
+from ms_flow.core.database.sqlite_utils import compile_select, converting_types, decode_rows
 
 
 class InputBackendBase:
@@ -211,7 +211,9 @@ class SQLiteBackend(InputBackendBase, OutputBackendBase):
     def _graph_model_columns(self, model) -> list[str]:
         if not hasattr(model, "__table__"):
             raise DataContractError(f"Graph model {model!r} does not define a SQL table.")
-        columns = [column.name for column in model.__table__.columns if not column.primary_key]
+        # A generated column (`Computed`) is the database's to fill: inserting it is an error.
+        columns = [column.name for column in model.__table__.columns
+                   if not column.primary_key and column.computed is None]
         if not columns:
             raise DataContractError(f"Graph model {model!r} does not expose writable columns.")
         return columns
@@ -582,7 +584,8 @@ class SQLiteBackend(InputBackendBase, OutputBackendBase):
         )
         with get_sqlite_engine(db_path).connect() as conn:
             result = conn.exec_driver_sql(sql, params)
-            return [dict(row) for row in result.mappings()]
+            rows = [dict(row) for row in result.mappings()]
+        return list(decode_rows(rows, {} if spec.query else converting_types(spec.table)))
 
     def write(self, spec: OutputSpec, data: Any, context: DataContext) -> dict[str, Any]:
         if isinstance(spec, DbOutputSpec) and str(spec.db_role or "").strip().lower() == "project":

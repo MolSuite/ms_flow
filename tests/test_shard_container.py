@@ -2,11 +2,11 @@
 import os
 import uuid
 
+import pyarrow.parquet as pq
 import pytest
 
 from ms_flow.core.data.shard import (
     MAX_RECORDS,
-    NOT_PRESENT,
     PayloadKind,
     Serializer,
     Shard,
@@ -32,7 +32,7 @@ def _write(path, ids, *, base_id=0, slot_count=4096, **kw):
 
 def test_holes_keep_the_ids_they_belong_to(tmp_path):
     """The point of the container: a filtered-out record leaves a hole, not a renumbering."""
-    shard = Shard.open(_write(tmp_path / "a.mshard", [100, 102, 105], base_id=100, slot_count=10))
+    shard = Shard.open(_write(tmp_path / "a.parquet", [100, 102, 105], base_id=100, slot_count=10))
     with shard:
         assert len(shard) == 3
         assert [record.id for record in shard] == [100, 102, 105]
@@ -42,25 +42,19 @@ def test_holes_keep_the_ids_they_belong_to(tmp_path):
             shard[101]
 
 
-def test_contiguous_records_pay_no_slot_map(tmp_path):
-    """slot_count is a capacity; a full-but-short shard shrinks to dense on close."""
-    path = _write(tmp_path / "b.mshard", range(10), slot_count=4096)
-    with Shard.open(path) as shard:
+def test_slot_count_shrinks_to_the_last_id_written(tmp_path):
+    """slot_count is a capacity; a short shard does not claim the ids it never had."""
+    with Shard.open(_write(tmp_path / "b.parquet", range(10), slot_count=4096)) as shard:
         assert shard.slot_count == shard.record_count == 10
-        assert shard._dense
-        assert [record.id for record in shard] == list(range(10))
-    sparse = _write(tmp_path / "c.mshard", [0, 9], slot_count=4096)
-    with Shard.open(sparse) as shard:
-        assert shard.slot_count == 10 and shard.record_count == 2 and not shard._dense
+    with Shard.open(_write(tmp_path / "c.parquet", [0, 9], slot_count=4096)) as shard:
+        assert shard.slot_count == 10 and shard.record_count == 2
 
 
-def test_a_shard_too_big_for_the_slot_map_is_refused_up_front(tmp_path):
-    """A record index of 0xFFFF is indistinguishable from `absent`, so the range is capped
-    when the writer opens — not after gigabytes have been written."""
-    assert MAX_RECORDS == NOT_PRESENT
+def test_a_shard_bigger_than_the_cap_is_refused_up_front(tmp_path):
+    """The writer holds the shard in memory, so the range is capped when it opens."""
     with pytest.raises(ValueError, match="slot_count"):
         ShardWriter(
-            tmp_path / "d.mshard",
+            tmp_path / "d.parquet",
             dataset_id=None,
             shard_id=0,
             base_id=0,
@@ -72,7 +66,7 @@ def test_a_shard_too_big_for_the_slot_map_is_refused_up_front(tmp_path):
 
 def test_ids_must_arrive_in_order_and_inside_the_range(tmp_path):
     writer = ShardWriter(
-        tmp_path / "e.mshard", dataset_id=None, shard_id=0, base_id=10, kind=0,
+        tmp_path / "e.parquet", dataset_id=None, shard_id=0, base_id=10, kind=0,
         serializer=Serializer.RAW, slot_count=5,
     )
     writer.add(11, b"x")
@@ -85,69 +79,62 @@ def test_ids_must_arrive_in_order_and_inside_the_range(tmp_path):
     writer.close()
 
 
-def test_the_footer_catches_a_corrupted_shard(tmp_path):
-    path = _write(tmp_path / "f.mshard", range(5))
+def test_a_corrupted_shard_refuses_to_open(tmp_path):
+    path = tmp_path / "f.parquet"
+    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
+                     serializer=Serializer.RAW, slot_count=8) as writer:
+        for index in range(8):
+            writer.add(index, os.urandom(20_000))  # incompressible: the middle is record data
     with Shard.open(path) as shard:
         assert shard.verify()
     data = bytearray(path.read_bytes())
-    data[100] ^= 0xFF
+    data[len(data) // 2] ^= 0xFF
     path.write_bytes(data)
-    with Shard.open(path) as shard:
-        assert not shard.verify()
+    with pytest.raises(ValueError, match="unreadable shard"):
+        Shard.open(path)
 
 
 def test_a_failed_write_leaves_no_shard_behind(tmp_path):
-    path = tmp_path / "g.mshard"
+    path = tmp_path / "g.parquet"
     with pytest.raises(RuntimeError):
         with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
                          serializer=Serializer.RAW, slot_count=8) as writer:
             writer.add(0, b"x")
             raise RuntimeError("boom")
-    assert not path.exists() and not path.with_suffix(".mshard.tmp").exists()
     assert list(tmp_path.iterdir()) == []
 
 
 def test_metadata_and_dataset_id_travel_with_the_file(tmp_path):
     dataset = uuid.UUID(int=7)
-    path = _write(tmp_path / "h.mshard", range(3), metadata={"source": "lib.sdf"})
+    path = _write(tmp_path / "h.parquet", range(3), metadata={"source": "lib.sdf"})
     with Shard.open(path, dataset_id=dataset) as shard:
         assert shard.metadata == {"source": "lib.sdf"} and shard.dataset_id == dataset
     with pytest.raises(ValueError, match="dataset_id mismatch"):
         Shard.open(path, dataset_id=uuid.UUID(int=8))
 
 
-def test_views_are_zero_copy_and_die_with_the_shard(tmp_path):
-    shard = Shard.open(_write(tmp_path / "i.mshard", range(4)))
-    assert [bytes(view) for view in shard.iter_views()] == [f"mol-{i}".encode() for i in range(4)]
-    held = shard[1].view()
-    with pytest.raises(BufferError):
-        shard.close()
-    held.release()
-    shard.close()
+def test_a_shard_is_plain_parquet(tmp_path):
+    """What makes it worth it: any Parquet reader sees ids and text, no container code."""
+    table = pq.read_table(_write(tmp_path / "i.parquet", [3, 5], base_id=3, slot_count=4))
+    assert table.to_pydict() == {"id": [3, 5], "record": ["mol-3", "mol-5"]}
+    with Shard.open(tmp_path / "i.parquet") as shard:
+        assert [bytes(view) for view in shard.iter_views()] == [b"mol-3", b"mol-5"]
 
 
-def test_verify_does_not_read_the_file_into_memory(tmp_path):
-    """A shard is sized to be shipped, so `verify()` must stay O(1) in memory."""
-    import tracemalloc
-
-    path = tmp_path / "j.mshard"
-    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
-                     serializer=Serializer.RAW, slot_count=64) as writer:
-        for index in range(64):
-            writer.add(index, os.urandom(200_000))
-    with Shard.open(path) as shard:
-        tracemalloc.start()
-        assert shard.verify()
-        peak = tracemalloc.get_traced_memory()[1]
-        tracemalloc.stop()
-    assert os.path.getsize(path) > 12_000_000
-    assert peak < 4 * (1 << 20)
+def test_a_legacy_mshard_says_to_reimport(tmp_path):
+    path = tmp_path / "old.mshard"
+    path.write_bytes(b"MSHARD" + bytes(100))
+    with pytest.raises(ValueError, match="re-import"):
+        Shard.open(path)
 
 
 def test_reading_a_shard_brings_no_database():
-    """A worker opens shards; the package they live in must not load SQL with them."""
+    """A worker opens shards; the package they live in must not load SQL (or pyarrow) with them."""
     import subprocess
     import sys
 
-    code = "import sys; from ms_flow.core.data.shard import Shard; assert 'sqlalchemy' not in sys.modules"
+    code = (
+        "import sys; from ms_flow.core.data.shard import Shard; "
+        "assert 'sqlalchemy' not in sys.modules and 'pyarrow' not in sys.modules"
+    )
     subprocess.run([sys.executable, "-c", code], check=True)

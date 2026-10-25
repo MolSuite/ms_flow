@@ -32,7 +32,7 @@ def test_payload_tables_exist_with_autoincrement_and_enforced_fk(project):
     sql = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'").fetchall())
     assert "AUTOINCREMENT" in sql["ms_volumes"] and "AUTOINCREMENT" in sql["ms_payloads"]
 
-    conn.execute("INSERT INTO ms_volumes (series, state, size, created_at) VALUES ('s', 'active', 0, '')")
+    conn.execute("INSERT INTO ms_volumes (series, state, size) VALUES ('s', 'active', 0)")
     conn.execute(
         'INSERT INTO ms_payloads (volume_id, "offset", length, raw_length, codec, crc32, kind)'
         " VALUES (1, 32, 0, 0, 0, 0, '')"
