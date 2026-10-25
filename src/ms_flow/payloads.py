@@ -37,7 +37,6 @@ import zlib
 from collections import OrderedDict
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime
 from itertools import accumulate, islice
 from pathlib import Path
 from typing import Any, Iterable
@@ -466,8 +465,8 @@ class PayloadStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         while True:
             cursor.execute(
-                "INSERT INTO ms_volumes (series, state, size, created_at) VALUES (?, 'active', ?, ?)",
-                (series, HEADER, datetime.now().isoformat(" ")),
+                "INSERT INTO ms_volumes (series, state, size) VALUES (?, 'active', ?)",
+                (series, HEADER),
             )
             volume_id = cursor.lastrowid
             try:
@@ -634,8 +633,8 @@ class PayloadStore:
         data = [b for _, b in self.iter_bytes(picked)]
         with self.engine.begin() as conn:
             dict_id = conn.exec_driver_sql(
-                "INSERT INTO ms_payload_dicts (series, samples, created_at) VALUES (?, ?, ?)",
-                (series, len(data), datetime.now().isoformat(" "))).lastrowid
+                "INSERT INTO ms_payload_dicts (series, samples) VALUES (?, ?)",
+                (series, len(data))).lastrowid
             trained = _zstd().train_dictionary(size, data, dict_id=dict_id)
             path = self.directory / "dicts" / f"{dict_id}.zdict"
             path.parent.mkdir(parents=True, exist_ok=True)
