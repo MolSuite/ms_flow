@@ -289,6 +289,29 @@ def test_a_job_waits_for_the_jobs_it_comes_after():
             engine.submit("thread", _boom_on_3, [1], after=[999])
 
 
+def test_a_higher_priority_takes_the_cpus_it_can_before_a_lower_one_gets_any():
+    started, gate = [], threading.Event()
+
+    def low(payload):
+        started.append("low")
+        gate.wait(10)
+
+    def high(payload):
+        started.append("high")
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(8, uses_tokens=True))
+        a = engine.submit("thread", low, range(10), cpu=1)
+        deadline = time.monotonic() + 10
+        while len(started) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        b = engine.submit("thread", high, range(6), cpu=1, priority=1)
+        time.sleep(0.2)  # its chunks are fed
+        gate.set()
+        assert engine.wait(a, 30).status == engine.wait(b, 30).status == "completed"
+    assert started[:10] == ["low"] * 4 + ["high"] * 6
+
+
 @pytest.mark.slow
 def test_worker_death_costs_one_chunk():
     with Engine(cpus=4, mem_mb=0) as engine:
