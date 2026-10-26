@@ -22,6 +22,16 @@ def _model_output_columns(model: type[SQLModel]) -> tuple[str, ...]:
     return tuple(column.name for column in table.columns if not column.primary_key and column.computed is None)
 
 
+def _with_conflict_keys(columns: Iterable[str], conflict_keys: Iterable[str]) -> tuple[str, ...]:
+    """An upsert's default columns: the model's writable ones plus its conflict keys.
+
+    The writable columns leave primary keys out, so a composite-PK upsert would emit rows
+    without the very keys its ON CONFLICT names.
+    """
+    columns = tuple(columns)
+    return tuple(key for key in conflict_keys if key not in columns) + columns
+
+
 def _model_path(model: type[SQLModel]) -> str:
     return f"{model.__module__}:{model.__qualname__}"
 
@@ -44,6 +54,8 @@ def _coerce_graph_node(value: Mapping[str, Any]) -> dict[str, Any]:
     conflict_keys = tuple(str(key).strip() for key in (value.get("conflict_keys") or ()) if str(key).strip())
     if write_mode == "upsert" and not conflict_keys:
         conflict_keys = ("id",)
+    if write_mode == "upsert" and model is not None and not value.get("columns"):
+        columns = _with_conflict_keys(columns, conflict_keys)
     return {
         "name": str(value.get("name", "")),
         "table": table,
@@ -100,6 +112,8 @@ def table_sink(
         resolved_columns: tuple[str, ...] = tuple(str(col) for col in columns)
     elif model is not None:
         resolved_columns = _model_output_columns(model)
+        if str(write_mode or "").strip().lower() == "upsert":
+            resolved_columns = _with_conflict_keys(resolved_columns, (str(key) for key in conflict_keys))
     else:
         resolved_columns = ()
     return DbOutputSpec(
