@@ -35,3 +35,6 @@ chunk_payloads/
 .aiassistant/
 
 .idea/
+
+# zensical build output
+site/

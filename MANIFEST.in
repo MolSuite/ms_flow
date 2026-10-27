@@ -1,0 +1,4 @@
+# setuptools-scm puts every git-tracked file in the sdist; these are repo
+# working directories, not package content.  tests/ and examples/ stay.
+prune benchmarks
+prune docs
