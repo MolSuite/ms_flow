@@ -477,15 +477,15 @@ def test_a_task_that_waits_for_a_program_runs_on_a_thread_of_the_pool():
         pool = ProcessExecutor(4)
         engine.register("process", pool)
 
-        # in this process, as many at once as there are CPUs, each one saying how far it is
+        # in one process that is not this one, as many at once as there are CPUs, each one saying how far it is
         pids = []
         job_id = engine.submit("process", _waits_for_a_program, [{"s": 0.5, "idx": i} for i in range(4)], thread=True,
                                total=4, on_result=lambda key, pid: pids.append(pid))
         flying(job_id, [0.5, 0.5])
-        assert engine.wait(job_id, 30).status == "completed" and pids == [os.getpid()] * 4
+        assert engine.wait(job_id, 30).status == "completed" and len(set(pids)) == 1 and pids[0] != os.getpid()
         assert not pool._pool._processes  # and no worker was started for them
 
-        # stopped through the program it told of: canceled, or running past its time
+        # stopped with that process and its programs: canceled, or running past its time
         hung = engine.submit("process", _waits_for_a_program, [{"s": 60, "idx": i} for i in range(2)], thread=True, total=2)
         flying(hung, [0.5, 0.5])
         engine.cancel(hung)
@@ -507,6 +507,15 @@ def test_the_workers_of_the_pool_leave_when_idle_and_come_back():
             assert time.monotonic() < deadline, pool._pool._processes
             time.sleep(0.05)
         assert engine.wait(engine.submit("process", workers.nap, naps), 30).chunks_done == 4
+
+        # and so does the process of the tasks on a thread
+        waits = [{"s": 0.1, "idx": i} for i in range(2)]
+        assert engine.wait(engine.submit("process", _waits_for_a_program, waits, thread=True), 30).chunks_done == 2
+        host = pool._host
+        host.process.join(15)
+        assert host.over and not host.process.is_alive()
+        assert engine.wait(engine.submit("process", _waits_for_a_program, waits, thread=True), 30).chunks_done == 2
+        assert pool._host is not host
 
 
 def test_progress_counts_how_far_the_running_chunks_are(tmp_path):

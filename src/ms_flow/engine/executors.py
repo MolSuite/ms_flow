@@ -52,6 +52,7 @@ import hashlib
 import itertools
 import mmap
 import os
+import pickle
 import shutil
 import sys
 import tempfile
@@ -59,7 +60,7 @@ import threading
 import time
 import traceback
 import weakref
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 
@@ -109,10 +110,11 @@ class ThreadExecutor:
 class ProcessExecutor:
     """loky process pool. A dead worker costs the pool, never the executor: it is rebuilt.
 
-    The tasks of a job submitted with `thread=True` run on threads of this process instead, and
-    no worker is started or kept for them: they count against the same `capacity`.
-    A worker with nothing to do for `idle` seconds leaves, with the memory of what it imported,
-    and one is started again when there is work for it; `None` keeps them all.
+    The tasks of a job submitted with `thread=True` run instead on threads of one more process,
+    the same for all of them (see `_Host`), and no worker is started or kept for them: they
+    count against the same `capacity`.
+    A worker, or that process, with nothing to do for `idle` seconds leaves, with the memory of
+    what it imported, and one is started again when there is work for it; `None` keeps them all.
     """
 
     uses_tokens = threads = watches_all = True  # watching: a float in a file the worker has mapped
@@ -126,8 +128,8 @@ class ProcessExecutor:
                                  initargs=(os.getpid(),))
         self._pool = self._new_pool()
         self._slots = _Slots()
-        self._threads = ThreadPoolExecutor(max_workers, thread_name_prefix="msflow-task")  # started as they are used
-        self._flying = set()  # the `_Started` of each task on a thread
+        self._idle = idle
+        self._host, self._hosting = None, threading.Lock()  # the `_Host`, started with the first task for it
 
     def bind(self, on_done) -> None:
         self._on_done = on_done
@@ -137,19 +139,20 @@ class ProcessExecutor:
         task = (call or _call, fn, payload)
         if index is not None:
             task = (_watched, self._slots.path, index, *task)
-        started = None
         if thread:
-            started = _Started()
-            self._flying.add(started)
-            future = self._threads.submit(_on_thread, started, *task)
-        else:
-            try:
-                future = self._pool.submit(*task)
-            except self._lost:  # a worker died: loky refuses this pool for good
-                self._pool.shutdown(wait=False, kill_workers=True)
-                self._pool = self._new_pool()
-                future = self._pool.submit(*task)
-        future.add_done_callback(partial(self._finished, tag, index, started))
+            with self._hosting:
+                if self._host is None or self._host.over:
+                    self._host = _Host(self.capacity, self._idle, self._hosting)
+                future = self._host.submit(task)
+            future.add_done_callback(partial(self._landed, tag, index))
+            return future
+        try:
+            future = self._pool.submit(*task)
+        except self._lost:  # a worker died: loky refuses this pool for good
+            self._pool.shutdown(wait=False, kill_workers=True)
+            self._pool = self._new_pool()
+            future = self._pool.submit(*task)
+        future.add_done_callback(partial(self._finished, tag, index))
         return future
 
     def submit_many(self, fn, payloads, tag, whole=False, owner=None, thread=False):
@@ -159,19 +162,26 @@ class ProcessExecutor:
         slots = self._slots
         return {slots.tags[index]: slots.done[index] for index, whose in enumerate(slots.owners) if whose == owner}
 
-    def _finished(self, tag, index, started, future) -> None:
+    def _finished(self, tag, index, future) -> None:
         if index is not None:
             self._slots.free(index)
         status, value, error = _outcome(future, self._lost)
-        if started is not None:
-            self._flying.discard(started)
-            if started.killed and status != CANCELED:  # whatever it made of its program dying
-                status, value, error = LOST, None, None
         result, peak_mb = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, peak_mb)
 
+    def _landed(self, tag, index, future) -> None:
+        if index is not None:
+            self._slots.free(index)
+        # ponytail: no peak of memory. The process is not the task's, and the program it runs
+        # is not measured: its `Popen` would have to be waited with `os.wait4`.
+        self._on_done(tag, *future.result(), 0)
+
     def cancel(self, handle) -> None:
-        handle.cancel()
+        host = getattr(handle, "host", None)
+        if host is None:
+            handle.cancel()
+        else:
+            host.cancel(handle.id)
 
     def kill(self) -> None:
         # ponytail: loky gives up on the whole pool when one worker dies, so stopping one
@@ -179,15 +189,16 @@ class ProcessExecutor:
         # the rest, where the chunk is not stuck in native code; add it if limits fire often.
         from loky.backend.utils import kill_process_tree
 
-        for started in tuple(self._flying):  # first: loky takes its time over each worker
-            started.kill()
+        with self._hosting:  # first: loky takes its time over each worker
+            if self._host is not None and self._host.pending:
+                self._host.kill()
         for process in list(self._pool._processes.values()):  # no public way to a busy worker
             kill_process_tree(process)  # and the programs it launched
 
     def shutdown(self) -> None:
-        for started in tuple(self._flying):
-            started.kill()
-        self._threads.shutdown(wait=False, cancel_futures=True)
+        with self._hosting:
+            if self._host is not None:
+                self._host.kill()
         self._pool.shutdown(wait=True, kill_workers=True)  # waiting is what lets loky clean up after itself
         try:
             os.unlink(self._slots.path)  # ponytail: stays behind on Windows, where a mapped file cannot go
@@ -375,12 +386,135 @@ class _Slots:
         self._free.append(index)
 
 
+class _Host:
+    """The process where the tasks submitted with `thread=True` wait for their programs, on as many
+    threads as the pool has workers.
+
+    Whatever Python they run between programs (imports, reading what a program left) takes the
+    GIL of that process, not of this one, where the threads of the engine and of an app's
+    interface need it. It starts without the app's `__main__` and imports only what the tasks
+    bring. One that dies, is killed or leaves after `idle` seconds without a task is over: its
+    tasks come back `LOST` and the next one starts another.
+    """
+
+    # ponytail: one process, so one GIL for every task on a thread. Spread them over several
+    # once its CPU is full (pure-Python work between the programs).
+
+    def __init__(self, workers: int, idle: float | None, lock: threading.Lock):
+        from loky.backend.context import get_context
+
+        context = get_context("loky")
+        self._conn, theirs = context.Pipe(duplex=True)
+        self.process = context.Process(target=_serve, args=(theirs, workers), name="msflow-host", daemon=True)
+        self.process.start()
+        theirs.close()  # its end lives there now: when it dies, this one reads the end
+        self._idle, self._lock, self._ids = idle, lock, itertools.count()
+        self.pending, self.over = {}, False  # id -> Future of each task sent; whether it takes no more
+        threading.Thread(target=self._read, name="msflow-host-reader", daemon=True).start()
+
+    # `submit` and `kill` are called holding `lock`, which `cancel` and `_read` take.
+
+    def submit(self, task) -> Future:
+        from loky.backend.reduction import dumps
+
+        task = bytes(dumps(task))  # unpickled on a thread there, where importing what it needs holds back nothing else
+        future = Future()
+        future.host, future.id = self, next(self._ids)
+        self.pending[future.id] = future
+        try:
+            self._conn.send(("run", future.id, task))
+        except OSError:  # it died: `_read` is about to learn it, and this task with the rest come back LOST
+            pass
+        return future
+
+    def cancel(self, id) -> None:
+        with self._lock:
+            if not self.over:
+                try:
+                    self._conn.send(("cancel", id, None))  # one that has not begun; it says so
+                except OSError:
+                    pass
+
+    def kill(self) -> None:
+        from loky.backend.utils import kill_process_tree
+
+        self.over = True
+        kill_process_tree(self.process)  # and the programs it launched
+
+    def _read(self) -> None:
+        conn, pending = self._conn, self.pending
+        while True:
+            try:
+                if not conn.poll(self._idle):
+                    with self._lock:
+                        if not pending and not self.over:
+                            self.over = True  # it goes; whatever comes next starts another
+                            conn.send(("stop", None, None))
+                    continue
+                id, status, value, error = conn.recv()
+            except (EOFError, OSError):
+                break
+            if status == DONE:
+                try:
+                    value = pickle.loads(value)
+                except Exception:  # what the task returned means nothing here
+                    status, value, error = ERROR, None, traceback.format_exc()
+            pending.pop(id).set_result((status, value, error))
+        with self._lock:
+            self.over = True
+            lost = list(pending.values())
+            pending.clear()
+        conn.close()
+        self.process.join()
+        for future in lost:
+            future.set_result((LOST, None, None))
+
+
+def _serve(conn, workers: int) -> None:
+    """The main thread of a `_Host`: the tasks go to its threads, and how each ended goes back."""
+    from loky.backend.reduction import dumps
+    from loky.backend.utils import kill_process_tree
+
+    pool, running, sending = ThreadPoolExecutor(workers, thread_name_prefix="msflow-task"), {}, threading.Lock()
+
+    def ended(id, future):
+        running.pop(id, None)
+        status, value, error = _outcome(future)
+        if status == DONE:
+            try:
+                value = bytes(dumps(value))
+            except Exception:
+                status, value, error = ERROR, None, traceback.format_exc()
+        with sending:
+            conn.send((id, status, value, error))
+
+    while True:
+        try:
+            kind, id, task = conn.recv()
+        except EOFError:  # the engine is gone, and nobody waits for what runs here
+            kill_process_tree(SimpleNamespace(pid=os.getpid(), kill=partial(os._exit, 1), join=None))
+        if kind == "run":
+            future = running[id] = pool.submit(_hosted, task)
+            future.add_done_callback(partial(ended, id))
+        elif kind == "cancel":
+            future = running.get(id)
+            if future is not None:
+                future.cancel()
+        else:  # "stop", with nothing running
+            pool.shutdown()
+            return
+
+
+def _hosted(task):
+    call, *task = pickle.loads(task)
+    return call(*task)[0]
+
+
 # --- Worker side --------------------------------------------------------------------
 
 _slots = None  # (path, floats): the executor's progress file as this process maps it
-# What the task running on this thread goes by, since the tasks of the pool may share a process:
-# `at` = [slot, chunks of the task done, chunks `fn` is working on] while it is watched, and
-# `started` = its `_Started` when it runs on a thread of the pool.
+# What the task running on this thread goes by, since the tasks of a `_Host` share a process:
+# `at` = [slot, chunks of the task done, chunks `fn` is working on] while it is watched.
 _task = threading.local()
 
 
@@ -397,48 +531,12 @@ def report(fraction: float) -> None:
 
 
 def launched(program) -> None:
-    """From a task, on the thread it was called on: a program it started (a `subprocess.Popen`)
-    and waits for.
+    """From a task: a program it started (a `subprocess.Popen`) and waits for.
 
-    A task on a thread (`thread=True`) cannot be stopped, only what it runs can: when the engine
-    stops what is running (a cancel, a time limit) the programs it told of are killed, and one it
-    tells of after that is killed at once. A task that tells of none runs to its end. Does nothing
-    in a worker process, which is killed with everything it started.
+    Does nothing: a task on a thread runs in a process of the pool's (see `_Host`), and a worker
+    or that process is killed with whatever it started. Kept for its callers from when the tasks
+    on a thread ran in the engine's process.
     """
-    started = getattr(_task, "started", None)
-    if started is not None:
-        started.programs.append(program)
-        if started.killed:
-            _stop(program)
-
-
-class _Started:
-    """The programs a task on a thread started: what a kill can reach of it."""
-
-    def __init__(self):
-        self.programs, self.killed = [], False
-
-    def kill(self) -> None:
-        self.killed = True  # before the programs are read: `launched` appends, then looks
-        for program in tuple(self.programs):
-            _stop(program)
-
-
-def _stop(program) -> None:
-    from loky.backend.utils import kill_process_tree
-
-    if program.poll() is None:  # and what it launched; loky's idea of a process is `multiprocessing`'s
-        kill_process_tree(SimpleNamespace(pid=program.pid, kill=program.kill, join=program.wait))
-
-
-def _on_thread(started, call, *task):
-    _task.started = started
-    try:
-        # ponytail: no peak of memory. This process is not the task's, and the program it runs
-        # is not measured: its `Popen` would have to be waited with `os.wait4`.
-        return call(*task)[0], 0
-    finally:
-        _task.started = None
 
 
 def _watched(path, index, call, fn, payload):
