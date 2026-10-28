@@ -27,6 +27,20 @@ def _flag(name: str, asked: int, has: str, least: int = 0, times: int = 1) -> st
             f"echo $(((n < {least} ? {least} : n) * {times})))")
 
 
+def _auth() -> tuple[str, bytes]:
+    """What `ray start` on another machine needs to join the Ray of this process: the shell
+    words before it, and what goes to its stdin. Ray starts a cluster here with a token that
+    every node has to show; it goes through stdin, so no `ps` there lists it."""
+    from ray._private.authentication.authentication_utils import is_token_auth_enabled
+
+    if not is_token_auth_enabled():
+        return "", b""
+    from ray._raylet import AuthenticationTokenLoader
+
+    token = AuthenticationTokenLoader.instance().get_raw_token(ignore_auth_mode=True)
+    return 'RAY_AUTH_MODE=token RAY_AUTH_TOKEN="$(cat)" ', token.encode()
+
+
 class RayOverHosts(RayExecutor):
     """`hosts` as `ssh` names them, `env` the path of the environment on each of them: one for
     all, or one for each. `limits` gives for each the (CPUs, GPUs, GB of memory) that are for
@@ -52,12 +66,13 @@ class RayOverHosts(RayExecutor):
         here = self._hosts[0][0].run("echo ${SSH_CLIENT%% *}", timeout=60).decode().strip()
         super().__init__(None, shared=False, _node_ip_address=here, **init)
         address = self._ray.get_runtime_context().gcs_address
+        auth, token = _auth()
         try:
             for (host, ray_there), given in zip(self._hosts, gives, strict=True):
                 # ponytail: `ray stop` ends every Ray of the account on that machine, one left by a
                 # session that died included. A host that runs a Ray of its own is not one to list here.
-                host.run(f"{ray_there} stop >/dev/null 2>&1; {ray_there} start --address={address}{given}",
-                         timeout=join_seconds)
+                host.run(f"{ray_there} stop >/dev/null 2>&1; {auth}{ray_there} start --address={address}{given}",
+                         data=token, timeout=join_seconds)
             limit = time.monotonic() + join_seconds
             while sum(node["Alive"] for node in self._ray.nodes()) <= len(self._hosts):
                 if time.monotonic() > limit:
