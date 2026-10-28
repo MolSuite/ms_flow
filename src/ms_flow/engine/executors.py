@@ -33,7 +33,8 @@ The engine knows an executor only through this contract:
   `submit` and `submit_many` then take `thread=True` for the tasks of a job that only wait for a
   program they start (see `launched`).
 - `wants_cost`, optional: an executor that does its own accounting sets it, and `submit` and
-  `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the job says each of its chunks needs.
+  `submit_many` then take `cost=(cpu, gpu, mem_mb)`: what the chunks of the task need, as the
+  job says or each chunk of itself.
 - `outlives`, optional: an executor whose tasks go on without this process sets it. `submit` and
   `submit_many` then take `key`, the key of the job in its journal (`None` for a job without
   one), and `keys`, the key of each chunk of the task. A job with a key is one the executor is

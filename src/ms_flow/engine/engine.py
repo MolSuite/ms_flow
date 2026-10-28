@@ -132,11 +132,13 @@ class _Job:
 class _Chunk:
     """A chunk between dispatch and its result being delivered. Finished ones are only counted."""
 
-    __slots__ = ("job", "key", "payload", "cost", "handle", "alone", "pack", "started", "attempt", "doomed",
-                 "spared")
+    __slots__ = ("job", "key", "payload", "cost", "needs", "handle", "alone", "pack", "started", "attempt",
+                 "doomed", "spared")
 
-    def __init__(self, job: _Job, key, payload, cost):
-        self.job, self.key, self.payload, self.cost = job, key, payload, cost
+    def __init__(self, job: _Job, key, payload, cost, needs):
+        # `needs`: the (cpu, gpu, mem_mb) the chunk asks for. `cost`: the same, when this engine's
+        # tokens are the ones that pay it, else None.
+        self.job, self.key, self.payload, self.cost, self.needs = job, key, payload, cost, needs
         self.handle, self.alone, self.pack = None, False, None  # `pack`: the chunks sharing its task
         self.attempt = 1
         self.doomed = None  # why the engine is stopping it, when it is
@@ -561,7 +563,7 @@ class Engine:
             return
         chunk.pack[index] = None  # ended: the task has nothing more to say of it
         if member is chunk:  # the task still goes by this one, so what ends, and may run again, is its twin
-            member = _Chunk(job, chunk.key, chunk.payload, chunk.cost)
+            member = _Chunk(job, chunk.key, chunk.payload, chunk.cost, chunk.needs)
             member.attempt = chunk.attempt
         self._chunk_ended(member, status, result, error)
 
@@ -750,7 +752,8 @@ class Engine:
                 pack, size = [chunk], job.pack
                 if job.fed_all and not job.batch:  # the tail is shared out, or the last tasks take it all and workers idle
                     size = min(size, -(-(len(ready) + 1) // slot.impl.capacity))
-                while len(pack) < size and job.open < job.window and ready and ready[0].cost == cost:
+                while (len(pack) < size and job.open < job.window and ready and ready[0].cost == cost
+                       and ready[0].needs == chunk.needs):
                     pack.append(ready.popleft())
                     job.seq += 1
                     job.open += 1
@@ -811,9 +814,7 @@ class Engine:
                 job.total is not None and job.total <= 2 * slot.impl.capacity)
         watch = {"owner": job.id} if fine and slot.tells else {}
         if slot.costs:
-            # ponytail: what the job says, not what one chunk says of itself (`cpu` in its payload):
-            # that is read only where the engine does the accounting.
-            watch["cost"] = job.needs
+            watch["cost"] = chunk.needs
         if slot.outlives:
             watch["key"], watch["keys"] = job.key, [member.key for member in chunk.pack or (chunk,)]
         if job.thread:
@@ -845,18 +846,18 @@ class Engine:
                         room.wait()
                 if job.status != RUNNING:
                     return
-                cost, key = job.cost, None
+                needs, key = job.needs, None
                 if type(payload) is dict and ("_key" in payload or not payload.keys().isdisjoint(_PER_CHUNK)):
                     payload = dict(payload)
                     key = payload.pop("_key", None)
                     own = [payload.pop(name, None) for name in _PER_CHUNK]
-                    if cost is not None:
-                        cost = tuple(c if o is None else o for c, o in zip(cost, own))
+                    needs = tuple(n if o is None else o for n, o in zip(needs, own))
+                cost = needs if job.cost is not None else None
                 if key is None:
                     key = content_key(payload)
                 if seen is not None and seen(key):  # done before the job was interrupted
                     continue
-                ready.append(_Chunk(job, key, payload, cost))
+                ready.append(_Chunk(job, key, payload, cost, needs))
                 if remaining is not None:
                     # First at the first chunk that is not done already: what a continued job had
                     # done is mostly what its source brings first, and counting it twice would
