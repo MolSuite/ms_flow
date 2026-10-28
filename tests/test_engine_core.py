@@ -154,6 +154,7 @@ def test_results_are_taken_in_groups_and_done_only_once_taken():
             time.sleep(0.01)
         time.sleep(0.1)
         assert engine.status(job).chunks_done == 0  # ended is not done: nothing has been taken yet
+        assert engine.status(job).tasks_running == 0  # in flight, yet nothing runs: all wait on the write
         go.set()
         snap = engine.wait(job, 30)
         assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 198, 2)

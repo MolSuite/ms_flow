@@ -96,6 +96,11 @@ class JobSnapshot:
     key: str | None  # what the job is called in its journal; submitting it again continues it
     chunks_retried: int  # attempts beyond the first, over all its chunks
     progress: float | None  # 0 to 1, with how far the running chunks are; None while the total is unknown
+    # `chunks_inflight` counts every chunk taken and not yet settled: the ones running, the ones a
+    # task carries along with them, and the ones done whose result is still being written. What
+    # runs right now is `tasks_running` (one worker each), on `cpu_used` CPUs of the engine's tokens.
+    tasks_running: int = 0
+    cpu_used: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +131,7 @@ class _Job:
             progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
-                           self.retried, progress)
+                           self.retried, progress, len(self.flying), self.cpu_used)
 
 
 class _Chunk:
