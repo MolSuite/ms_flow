@@ -817,6 +817,12 @@ by name, in the settings of <code>~/.molsuite</code> (<code>$MOLSUITE_HOME</code
 <ul>
 <li>Commands go over the system's <code>ssh</code>, through <code>ms_env</code>: keys and users come
   from <code>~/.ssh/config</code>, no credential is handled.</li>
+<li>Give each host an address that does not change: a name (<code>ssh</code> resolves it
+  from <code>~/.ssh/config</code>, DNS or mDNS, such as <code>lab-server.local</code>) or a fixed IP
+  (a DHCP reservation in the router). An address the network gives anew each
+  time makes the host unreachable the next time its machine joins.</li>
+<li>A Ray cluster takes only the machines on the network of the first host:
+  each one joins the address of this machine as that host sees it.</li>
 <li>A host with no <code>env</code> is given the environment of the app by the app
   (<code>Workspace.host_env</code>).</li>
 <li><code>ms.executors()</code> lists them with their state; <code>deactivate</code> stops one.</li>
