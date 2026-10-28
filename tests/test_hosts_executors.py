@@ -307,3 +307,14 @@ def test_this_machine_leaves_two_cpus_free_unless_told_otherwise():
     local = Settings().hosts["local"]
     assert local.cpus == -2 and share(local.cpus, 16, 1) == 14 and share(local.cpus, 2, 1) == 1
     assert Settings(hosts={"local": {"cpus": 0}}).hosts["local"].cpus == 0  # a saved choice stays
+
+
+def test_a_machine_joins_with_the_token_of_this_ray_through_stdin(monkeypatch):
+    pytest.importorskip("ray")
+    # Ray reads its auth mode once per process: asked in one that starts with it set.
+    monkeypatch.setenv("RAY_AUTH_MODE", "token")
+    monkeypatch.setenv("RAY_AUTH_TOKEN", "a" * 32)
+    said = subprocess.run([sys.executable, "-c", "from ms_flow import ray_hosts; print(repr(ray_hosts._auth()))"],
+                          capture_output=True, text=True, check=True).stdout
+    words, stdin = eval(said)
+    assert stdin == b"a" * 32 and "a" * 32 not in words and words.endswith('RAY_AUTH_TOKEN="$(cat)" ')

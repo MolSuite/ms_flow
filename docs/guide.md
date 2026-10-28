@@ -156,6 +156,12 @@ ms.move(key, "local")                      # a job that runs continues elsewhere
 
 - Commands go over the system's `ssh`, through `ms_env`: keys and users come
   from `~/.ssh/config`, no credential is handled.
+- Give each host an address that does not change: a name (`ssh` resolves it
+  from `~/.ssh/config`, DNS or mDNS, such as `lab-server.local`) or a fixed IP
+  (a DHCP reservation in the router). An address the network gives anew each
+  time makes the host unreachable the next time its machine joins.
+- A Ray cluster takes only the machines on the network of the first host:
+  each one joins the address of this machine as that host sees it.
 - A host with no `env` is given the environment of the app by the app
   (`Workspace.host_env`).
 - `ms.executors()` lists them with their state; `deactivate` stops one.
