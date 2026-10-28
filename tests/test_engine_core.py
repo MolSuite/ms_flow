@@ -196,6 +196,27 @@ def test_a_chunk_can_carry_its_own_cost_and_key():
         assert engine.tokens.free == [8, 0, 1000]
 
 
+class _Costed(ThreadExecutor):
+    """An executor that does its own accounting, as Ray does: it is told what each task needs."""
+    wants_cost = True
+
+    def __init__(self):
+        super().__init__(4)
+        self.costs = []
+
+    def submit(self, fn, payload, tag, cost=(1, 0, 0)):
+        self.costs.append(cost)
+        return super().submit(fn, payload, tag)
+
+
+def test_an_executor_that_does_its_own_accounting_is_told_what_each_chunk_needs():
+    costed = _Costed()
+    with Engine(cpus=8) as engine:
+        engine.register("own", costed)
+        payloads = [{"n": 0, "_gpu_required": 1}, {"n": 1}, {"n": 2, "_cpu_required": 3, "_mem_mb": 50}]
+        assert engine.wait(engine.submit("own", _echo, payloads, cpu=2), 30).status == "completed"
+    assert sorted(costed.costs) == [(2, 0, 0), (2, 1, 0), (3, 0, 50)]
+
 def test_content_key_is_the_same_in_another_process():
     payload = {"ligand": "CCO", "receptor": ["1abc", 7], "box": (1.5, 2.0)}
     code = f"from ms_flow.engine import content_key; print(content_key({payload!r}).hex())"
