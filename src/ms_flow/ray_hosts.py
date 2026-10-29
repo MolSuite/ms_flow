@@ -18,6 +18,12 @@ from ms_flow.engine.executors import RayExecutor
 log = logging.getLogger(__name__)
 
 
+# What a machine has, asked in its own shell: Linux, or macOS (no /proc, no nproc).
+_CPUS = "getconf _NPROCESSORS_ONLN"
+_MEMORY_GB = ("awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null"
+              " || echo $(($(sysctl -n hw.memsize) / 1073741824))")
+
+
 def _flag(name: str, asked: int, has: str, least: int = 0, times: int = 1) -> str:
     """The option of `ray start` that gives it `ms_flow.core.settings.models.share(asked, has, least)`,
     worked out by the shell of the machine, where `has` is the command that counts what it has."""
@@ -55,9 +61,9 @@ class RayOverHosts(RayExecutor):
     def __init__(self, hosts, env, join_seconds: float = 90, limits=None, names=None, **init):
         envs = [env] * len(hosts) if isinstance(env, str) else env
         self._hosts = [(Host(address), shlex.quote(f"{there}/bin/ray")) for address, there in zip(hosts, envs, strict=True)]
-        gives = ["".join((_flag("num-cpus", cpus, "nproc", 1),
+        gives = ["".join((_flag("num-cpus", cpus, _CPUS, 1),
                           _flag("num-gpus", gpus, "nvidia-smi --list-gpus 2>/dev/null | wc -l"),
-                          _flag("memory", memory_gb, "awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo", 1, 2 ** 30)))
+                          _flag("memory", memory_gb, _MEMORY_GB, 1, 2 ** 30)))
                  for cpus, gpus, memory_gb in limits or [(0, 0, 0)] * len(hosts)]
         # ponytail: by hostname, so two machines that share one are shown as the first of them.
         called = {socket.gethostname(): "local"}

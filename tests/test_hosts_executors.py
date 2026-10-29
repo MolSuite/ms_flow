@@ -1,4 +1,5 @@
 """The machines and the executors kept by name in the settings, and what the workspace makes of them."""
+import os
 import subprocess
 import sys
 import time
@@ -216,14 +217,24 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     # the head here runs nothing
     assert built("others") == (["pc2"], ["/envs/pc2"], {"num_cpus": 0, "num_gpus": 0, "limits": [(-2, 0, 8)], "names": ["pc2"]})
     # The share of a host is worked out by its shell, as `share` does here.
-    has = int(subprocess.check_output("nproc"))
+    has = os.cpu_count()
     for cpus in (-2, 3, 4096, -4096):
-        said = subprocess.check_output(["sh", "-c", "echo" + ray_hosts._flag("num-cpus", cpus, "nproc", 1)], text=True)
+        said = subprocess.check_output(["sh", "-c", "echo" + ray_hosts._flag("num-cpus", cpus, ray_hosts._CPUS, 1)], text=True)
         assert said.strip() == f"--num-cpus={share(cpus, has, 1)}"
-    assert ray_hosts._flag("num-cpus", 0, "nproc", 1) == ""  # all it has: Ray counts it
+    assert ray_hosts._flag("num-cpus", 0, ray_hosts._CPUS, 1) == ""  # all it has: Ray counts it
     with pytest.raises(ValueError, match="nothing prepares it"):
         built("lab", None)
     assert asked == [("login", "1 of its jobs are in the queue there")] * 3 + [("pc2", None), ("pc3", None), ("pc2", None)]
+
+
+def test_a_mac_counts_its_memory_without_proc(tmp_path):
+    from ms_flow import ray_hosts
+
+    (tmp_path / "sysctl").write_text("#!/bin/sh\necho 17179869184\n")  # what `sysctl -n hw.memsize` says on a 16 GB Mac
+    (tmp_path / "sysctl").chmod(0o755)
+    command = ray_hosts._MEMORY_GB.replace("/proc/meminfo", str(tmp_path / "none"))
+    said = subprocess.check_output(["sh", "-c", command], text=True, env={"PATH": f"{tmp_path}:/usr/bin:/bin"})
+    assert said.strip() == "16"
 
 
 def test_a_machine_works_for_one_executor_at_a_time(tmp_path, monkeypatch):
