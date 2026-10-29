@@ -103,6 +103,7 @@ class JobSnapshot:
     # runs right now is `tasks_running` (one worker each), on `cpu_used` CPUs of the engine's tokens.
     tasks_running: int = 0
     cpu_used: int = 0
+    executor: str | None = None  # the name it was submitted to; None for one recorded without it
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +125,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
-                 "states")
+                 "states", "executor")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -135,7 +136,7 @@ class _Job:
             progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
-                           self.retried, progress, len(self.flying), self.cpu_used)
+                           self.retried, progress, len(self.flying), self.cpu_used, self.executor)
 
 
 class _Chunk:
@@ -332,6 +333,7 @@ class Engine:
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
+        job.executor = executor
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
