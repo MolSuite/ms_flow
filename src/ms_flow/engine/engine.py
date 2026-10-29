@@ -720,14 +720,16 @@ class Engine:
             if slot.suspects and not slot.inflight:
                 self._retry_suspect(slot)
         # A level takes all it can, its jobs in turn, before the next one down gets what is left.
-        # ponytail: strict priority then arrival, no reservation. A job whose chunks need many
-        # CPUs can wait behind a stream of small ones; add ageing if that shows up.
+        # The turn starts at the job running fewest tasks: in arrival order, one freed CPU always
+        # went to the oldest job, and a second job of the same level never got another one.
+        # ponytail: strict priority, no reservation. A job whose chunks need many CPUs can wait
+        # behind a stream of small ones; add ageing if that shows up.
         for _priority, level in itertools.groupby(tuple(self._active), key=lambda j: j.priority):
             level = tuple(level)
             progress = True
             while progress:
                 progress = False
-                for job in level:
+                for job in sorted(level, key=lambda j: j.open):  # stable: ties keep arrival order
                     if self._start_one(job):
                         progress = True
 
