@@ -687,3 +687,26 @@ def test_a_ray_made_from_a_thread_that_ends_goes_on_running():
         time.sleep(12)  # what Ray started dies some seconds after the thread that started it
         ended = engine.wait(engine.submit("ray", workers.row, [{"idx": i} for i in range(4)]), 60)
     assert (ended.status, ended.chunks_done) == ("completed", 4)
+
+
+@pytest.mark.slow
+def test_a_ray_says_where_each_machine_tells_what_it_uses():
+    pytest.importorskip("ray")
+    import urllib.request
+
+    from ms_flow.engine import RayExecutor
+
+    ray = RayExecutor(num_cpus=1)
+    try:
+        urls = ray.nodes()
+        assert list(urls) == ["local"]
+        limit, text = time.monotonic() + 60, ""
+        while "ray_node_cpu_utilization" not in text and time.monotonic() < limit:  # the agent samples every few seconds
+            time.sleep(1)
+            try:
+                text = urllib.request.urlopen(urls["local"], timeout=5).read().decode()
+            except OSError:
+                pass
+        assert "ray_node_mem_total" in text
+    finally:
+        ray.shutdown()

@@ -304,6 +304,14 @@ class WorkspaceJobApiMixin:
         slot = self.engine._executors.get(executor)
         return slot.impl.jobs_there() if hasattr(getattr(slot, "impl", None), "jobs_there") else []
 
+    def node_metrics(self, executor: str) -> dict:
+        """For a Ray executor that is active, the URL where each of its machines says what it is
+        using, by host name: see `RayExecutor.nodes`. Nothing for any other, and never builds the
+        engine. It asks Ray, so not from a thread that cannot wait."""
+        slot = None if self._engine is None else self._engine._executors.get(executor)
+        nodes = getattr(getattr(slot, "impl", None), "nodes", None)
+        return nodes() if nodes is not None else {}
+
     def remove_remote_job(self, executor: str, dir: str) -> None:
         """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
         this session waits for is refused: cancel the job."""
