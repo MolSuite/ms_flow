@@ -80,7 +80,7 @@ def test_hosts_and_executors_are_kept_by_name(tmp_path, monkeypatch):
     kept = SettingsManager()
     assert list(kept.settings.hosts) == list(kept.settings.executors) == ["local"]  # this machine, always
     kept.save_host("laptop", address="192.168.1.2", cpus=-2, tools={"vina": "/opt/vina"})
-    kept.save_host("pc1", address="192.168.1.3")
+    kept.save_host("pc1", address="192.168.1.3", install=["unidock"])
     kept.save_host("local", cpus=-2)
     kept.save_executor("lab", kind="ray", hosts=["local", "pc1"])
     kept.save_executor("hpc", kind="queue", hosts=["laptop"], max_jobs=20)
@@ -89,6 +89,7 @@ def test_hosts_and_executors_are_kept_by_name(tmp_path, monkeypatch):
     assert again.hosts["laptop"].tools == {"vina": "/opt/vina"} and again.hosts["local"].cpus == -2
     assert again.executors["lab"].hosts == ["local", "pc1"] and again.executors["hpc"].max_jobs == 20
     assert again.executors["local"].kind == "loky"
+    assert again.hosts["pc1"].install == ["unidock"] and again.hosts["laptop"].install is None  # None: each one
 
     for wrong, why in (
         (lambda: kept.save_host("pc2", adress="192.168.1.4"), "has no adress"),
