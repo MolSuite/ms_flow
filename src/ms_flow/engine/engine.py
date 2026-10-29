@@ -37,6 +37,8 @@ COMPLETED = "completed"
 COMPLETED_WITH_ERRORS = "completed_with_errors"
 FAILED = "failed"
 CANCELED = "canceled"
+# What `Engine.chunk_states` says of each chunk, one byte each.
+PENDING_CHUNK, RUNNING_CHUNK, DONE_CHUNK, FAILED_CHUNK = range(4)
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
 # Chunks shorter than this share a task, as many as it takes to fill it and at most _PACK_MAX.
@@ -120,7 +122,8 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread")
+                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
+                 "states")
 
     def snapshot(self) -> JobSnapshot:
         total, progress = self.total, None
@@ -138,9 +141,9 @@ class _Chunk:
     """A chunk between dispatch and its result being delivered. Finished ones are only counted."""
 
     __slots__ = ("job", "key", "payload", "cost", "needs", "handle", "alone", "pack", "started", "attempt",
-                 "doomed", "spared")
+                 "doomed", "spared", "n")
 
-    def __init__(self, job: _Job, key, payload, cost, needs):
+    def __init__(self, job: _Job, key, payload, cost, needs, n: int = 0):
         # `needs`: the (cpu, gpu, mem_mb) the chunk asks for. `cost`: the same, when this engine's
         # tokens are the ones that pay it, else None.
         self.job, self.key, self.payload, self.cost, self.needs = job, key, payload, cost, needs
@@ -148,6 +151,7 @@ class _Chunk:
         self.attempt = 1
         self.doomed = None  # why the engine is stopping it, when it is
         self.spared = False  # running on an executor the engine is stopping for another chunk's sake
+        self.n = n  # its place in `job.states`
 
 
 class _Slot:
@@ -353,11 +357,14 @@ class Engine:
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
         job.total = len(chunks) if total is None and hasattr(chunks, "__len__") else total
         job.done = job.failed = job.open = job.seq = job.peak_mem_mb = 0
+        job.states = bytearray()  # a byte per chunk the source gave, in its order; see `chunk_states`
         if key is not None and job.journal is not None:
             resumed = job.journal.claim(key)
             if resumed is not None:
                 job.n, job.skip, job.source = resumed  # `skip`: how many chunks it had done
                 job.done = job.skip
+                # ponytail: what it had done goes first, wherever the source has it.
+                job.states = bytearray([DONE_CHUNK]) * job.skip
         job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
         job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
         job.started_at, job.finished_at, job.finished = time.time(), None, threading.Event()
@@ -395,6 +402,13 @@ class Engine:
             tasks.append(TaskSnapshot(_called(job, chunk.payload), n, chunk.attempt, now - chunk.started,
                                       None if said is None else min(1.0, said / n)))
         return tasks
+
+    def chunk_states(self, job_id: int) -> bytes | None:
+        """A byte per chunk of the job, in the order its source gave them: `PENDING_CHUNK`,
+        `RUNNING_CHUNK` (with its executor, or its result on the way), `DONE_CHUNK` or
+        `FAILED_CHUNK`. Chunks the source has not given yet are not there. None once the job ended."""
+        job = self._jobs.get(job_id)
+        return None if job is None else bytes(job.states)
 
     def jobs(self) -> list[JobSnapshot]:
         ended = list(self._ended.values())  # first: a job ending right now shows twice, never zero times
@@ -567,7 +581,7 @@ class Engine:
             return
         chunk.pack[index] = None  # ended: the task has nothing more to say of it
         if member is chunk:  # the task still goes by this one, so what ends, and may run again, is its twin
-            member = _Chunk(job, chunk.key, chunk.payload, chunk.cost, chunk.needs)
+            member = _Chunk(job, chunk.key, chunk.payload, chunk.cost, chunk.needs, chunk.n)
             member.attempt = chunk.attempt
         self._chunk_ended(member, status, result, error)
 
@@ -617,9 +631,9 @@ class Engine:
         job = chunk.job
         if status == DONE:
             if job.on_result is None and job.on_results is None:
-                self._settle(job, chunk.key, chunk.attempt, None)
+                self._settle(job, chunk.key, chunk.attempt, None, n=chunk.n)
             else:
-                self._deliveries.put((job, chunk.key, chunk.attempt, result))
+                self._deliveries.put((job, chunk.key, chunk.attempt, result, chunk.n))
         elif status == LOST and chunk.doomed:
             self._attempt_failed(chunk, chunk.doomed)
         elif status == LOST and not chunk.alone:
@@ -632,7 +646,7 @@ class Engine:
     def _attempt_failed(self, chunk: _Chunk, error: str) -> None:
         job = chunk.job
         if chunk.attempt > job.retries:
-            return self._settle(job, chunk.key, chunk.attempt, error, _called(job, chunk.payload))
+            return self._settle(job, chunk.key, chunk.attempt, error, _called(job, chunk.payload), chunk.n)
         job.retried += 1
         self._later(job.retry_wait * 2 ** (chunk.attempt - 1), self._requeue, chunk)
         chunk.attempt += 1
@@ -642,15 +656,16 @@ class Engine:
         job = chunk.job
         if job.status == RUNNING:
             job.ready.appendleft(chunk)
+            job.states[chunk.n] = PENDING_CHUNK
             job.open -= 1
             job.seq -= 1
 
     def _on_delivered(self, job: _Job, outcomes: list) -> None:
         """The delivery thread's confirmation: these results reached the job's callback."""
-        for key, attempt, error in outcomes:
-            self._settle(job, key, attempt, error)
+        for key, attempt, error, n in outcomes:
+            self._settle(job, key, attempt, error, n=n)
 
-    def _settle(self, job: _Job, key, attempt: int, error: str | None, label: str | None = None) -> None:
+    def _settle(self, job: _Job, key, attempt: int, error: str | None, label: str | None = None, n: int = 0) -> None:
         """A chunk reached its end: count it and forget it. `label` tells a failed one apart in
         the journal; there is none when its result is what could not be delivered."""
         if job.status != RUNNING:
@@ -658,9 +673,11 @@ class Engine:
             # continues this one must not run it again.
             if error is None and job.journal is not None and job.status in RESUMABLE:
                 job.done += 1
+                job.states[n] = DONE_CHUNK
                 job.journal.chunk_finished(job, key, attempt, None)
             return
         job.open -= 1
+        job.states[n] = DONE_CHUNK if error is None else FAILED_CHUNK
         if job.journal is not None:
             job.journal.chunk_finished(job, key, attempt, error, label)
         if error is None:
@@ -766,7 +783,7 @@ class Engine:
             self._launch(chunk, alone=False)
         else:
             self._settle(job, chunk.key, 1, f"a chunk needing (cpu, gpu, mem_mb)={cost} can never run: "
-                                         f"the engine has {self.tokens.total}")
+                                         f"the engine has {self.tokens.total}", n=chunk.n)
         if 2 * len(ready) <= job.window and not job.room.is_set():
             job.room.set()  # half empty: one wake-up refills it, instead of one per chunk
         return True
@@ -809,6 +826,8 @@ class Engine:
         chunk.doomed, chunk.spared = None, False
         chunk.started = time.perf_counter()  # before it is in `flying`, which `tasks` reads from any thread
         job.flying.add(chunk)
+        for member in chunk.pack or (chunk,):
+            job.states[member.n] = RUNNING_CHUNK
         # Watched: every task where watching one costs nothing. Elsewhere a task of several chunks,
         # which counts them by itself, and a task of one when its job has few (or says so), where
         # how far each one is makes the difference.
@@ -861,7 +880,8 @@ class Engine:
                     key = content_key(payload)
                 if seen is not None and seen(key):  # done before the job was interrupted
                     continue
-                ready.append(_Chunk(job, key, payload, cost, needs))
+                job.states.append(PENDING_CHUNK)  # first: the loop may launch it once it is in `ready`
+                ready.append(_Chunk(job, key, payload, cost, needs, len(job.states) - 1))
                 if remaining is not None:
                     # First at the first chunk that is not done already: what a continued job had
                     # done is mostly what its source brings first, and counting it twice would
@@ -915,13 +935,13 @@ class Engine:
         """Give `batch` to the job's callback. Returns `(key, attempt, error)` for each result."""
         errors = [None] * len(batch)
         if job.on_results is None:
-            for i, (_, key, _, result) in enumerate(batch):
+            for i, (_, key, _, result, _) in enumerate(batch):
                 try:
                     job.on_result(key, result)
                 except Exception:
                     errors[i] = traceback.format_exc()
         else:
-            pairs = [(key, result) for _, key, _, result in batch]
+            pairs = [(key, result) for _, key, _, result, _ in batch]
             try:
                 job.on_results(pairs)
             except Exception:
@@ -933,7 +953,7 @@ class Engine:
                             job.on_results([pair])
                         except Exception:
                             errors[i] = traceback.format_exc()
-        return [(key, attempt, error) for (_, key, attempt, _), error in zip(batch, errors)]
+        return [(key, attempt, error, n) for (_, key, attempt, _, n), error in zip(batch, errors)]
 
     def _announce(self, job: _Job) -> None:
         try:

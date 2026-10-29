@@ -338,6 +338,11 @@ class WorkspaceJobApiMixin:
         `Engine.tasks`. Nothing for a job of another session. Never builds the engine."""
         return self._engine.tasks(job_id) if self._engine is not None and job_id is not None else []
 
+    def job_chunks(self, job_id: int | None) -> bytes | None:
+        """A byte per chunk of a job this session runs: see `Engine.chunk_states`. None for a job
+        of another session or one that ended. Never builds the engine."""
+        return self._engine.chunk_states(job_id) if self._engine is not None and job_id is not None else None
+
     def job_failures(self, key: str, limit: int = 200) -> list[dict]:
         """`attempt`, `error` (the traceback) and `input` (a short repr of the element) of the
         chunks that failed in the job recorded under `key` (`JobSnapshot.key`) in the active
