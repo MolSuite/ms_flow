@@ -198,3 +198,53 @@ def test_a_result_taken_after_the_job_stopped_is_not_run_again(tmp_path, stop):
     with engine:
         assert engine.wait(submit(engine), 30).status == "completed"
     assert sorted(taken, key=int) == [str(i) for i in range(40)]  # each one once, over the two runs
+
+
+def test_what_a_job_used_stays_once_it_ended(tmp_path):
+    import json
+
+    from ms_flow.engine.journal import recorded
+
+    with _engine(tmp_path) as engine:
+        snap = engine.wait(engine.submit("thread", workers.nap, [{"s": 0.05, "i": i} for i in range(8)],
+                                         cpu=2, name="nap", journal="project"), 30)
+    usage = json.loads(recorded(tmp_path / "executor.db")[0]["usage"])
+    assert usage == snap.usage
+    assert usage["peak_cpu"] >= 2 and usage["cpu_s"] >= 2 * 8 * 0.05 * 0.9
+    assert usage["peak_gpu"] == usage["gpu_s"] == 0 and usage["vram_mb"] is None
+
+
+def test_a_version_3_journal_gets_the_usage_column(tmp_path):
+    from ms_flow.engine.journal import recorded
+
+    db = tmp_path / "executor.db"
+    with closing(sqlite3.connect(db)) as old:
+        old.executescript("""
+            CREATE TABLE jobs (n INTEGER PRIMARY KEY, job_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+                status TEXT NOT NULL, spec TEXT NOT NULL, total INTEGER, done INTEGER NOT NULL,
+                failed INTEGER NOT NULL, error TEXT, started_at REAL, finished_at REAL, source TEXT);
+            CREATE TABLE chunks (job INTEGER NOT NULL, key BLOB NOT NULL, status INTEGER NOT NULL,
+                attempt INTEGER NOT NULL, error TEXT, input TEXT, PRIMARY KEY (job, key)) WITHOUT ROWID;
+            INSERT INTO jobs VALUES (1, 'old', 'old', 'completed', '{}', 1, 1, 0, NULL, 1.0, 2.0, NULL);
+            PRAGMA user_version = 3;""")
+    assert [row["job_id"] for row in recorded(db)] == ["old"]  # read as it is, before anyone owns it
+    with _engine(tmp_path) as engine:
+        engine.wait(engine.submit("thread", _boom_on_3, [1], journal="project"), 30)
+    old, new = recorded(db)
+    assert old["usage"] is None and new["usage"] is not None
+
+
+def test_a_job_on_this_machines_gpus_keeps_what_the_cards_did(tmp_path, monkeypatch):
+    from ms_flow.engine import engine as engine_module
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "nvidia-smi").write_text("#!/bin/sh\necho '40, 900'\necho '60, 100'\n")
+    (bin_ / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(engine_module, "_GPU_EVERY", 0.02)
+    with Engine(cpus=4, gpus=1, mem_mb=0) as engine:
+        engine.register("gpu", ThreadExecutor(4, uses_tokens=True))
+        snap = engine.wait(engine.submit("gpu", workers.nap, [{"s": 0.2, "i": i} for i in range(3)], gpu=1), 30)
+    assert snap.usage["peak_gpu"] == 1 and snap.usage["gpu_s"] >= 0.5
+    assert snap.usage["vram_mb"] == 1000 and snap.usage["gpu_util"] == 50.0

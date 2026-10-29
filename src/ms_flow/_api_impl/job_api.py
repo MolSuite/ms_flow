@@ -67,6 +67,14 @@ def _spec_executor(spec: str | None) -> str | None:
         return None
 
 
+def _usage(row: dict) -> dict:
+    """What a recorded job used; empty for one recorded without it (a version 3 journal)."""
+    try:
+        return json.loads(row.get("usage") or "{}")
+    except ValueError:
+        return {}
+
+
 def build_executor(name: str, settings, host_env=None):
     """The executor `settings.executors[name]` describes, or None for the pool on a login node.
 
@@ -343,9 +351,10 @@ class WorkspaceJobApiMixin:
         # submit opens the journal, which is what marks it interrupted.
         listed = [live.pop((row["job_id"], row["started_at"]), None)
                   or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
-                                 row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
+                                 row["error"], (usage := _usage(row)).get("peak_mem_mb", 0), row["started_at"],
+                                 row["finished_at"], row["job_id"], 0,
                                  min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None,
-                                 executor=_spec_executor(row["spec"]))
+                                 executor=_spec_executor(row["spec"]), usage=usage or None)
                   for row in recorded(project.context.path / "executor.db", limit)]
         # One just submitted is not in the file until the journal's next write. Only the active
         # project has jobs that have not ended: closing a project interrupts its own.
