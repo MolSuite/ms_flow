@@ -102,7 +102,7 @@ of a sink, for one that changes the results before a sink writes them.
 
 | Call | What it gives |
 |---|---|
-| `ms.engine.status(job_id)` | `JobSnapshot`: `status`, `chunks_done`, `chunks_failed`, `chunks_total`, `progress`, `error`, `key`... |
+| `ms.engine.status(job_id)` | `JobSnapshot`: `status`, `chunks_done`, `chunks_failed`, `chunks_total`, `progress`, `tasks_running`, `cpu_used`, `error`, `key`... |
 | `ms.jobs()` | Every job of the active project, earlier sessions too, read from its journal; safe to poll |
 | `ms.job_tasks(job_id)` | The tasks in flight of a job of this session |
 | `ms.job_failures(key)` | The elements that failed: `attempt`, `error` (the traceback) and `input` |
