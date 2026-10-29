@@ -308,6 +308,19 @@ class RayExecutor:
         at, names = self._at, self._names or {}
         return {tag: names.get(at[index], at[index]) for index, (_, tag) in list(self._watched.items()) if index in at}
 
+    def nodes(self) -> dict:
+        """Where each node of the cluster says what its machine is using, by the name `hosts`
+        gives it (this machine is `local`): the URL of the metrics Ray exports there, as
+        Prometheus text, CPU, memory and GPUs of the whole machine. Asks Ray, so not from a
+        thread that cannot wait."""
+        here, names, urls = self._ray.get_runtime_context().get_node_id(), self._names or {}, {}
+        # ponytail: two nodes on one machine are shown as the first, the head before any other.
+        for node in sorted(self._ray.nodes(), key=lambda node: node["NodeID"] != here):
+            if node["Alive"]:
+                name = "local" if node["NodeID"] == here else names.get(node["NodeManagerHostname"], node["NodeManagerHostname"])
+                urls.setdefault(name, f"http://{node['NodeManagerAddress']}:{node['MetricsExportPort']}/metrics")
+        return urls
+
     def _ask(self) -> None:
         if self._tally is not None and not self._asking:
             self._asking = True
