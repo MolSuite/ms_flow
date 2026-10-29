@@ -60,6 +60,9 @@ class HostConfig(BaseModel):
     memory_gb: int = Field(default=0, title="Memory (GB)", description=_SHARE)
     tools: Dict[str, str] = Field(
         default_factory=dict, description="Where a program is there, by its name, when it is not the one the app installs.")
+    install: Optional[List[str]] = Field(
+        default=None, title="Programs",
+        description="The programs the app installs there, by name. None: each one it has here.")
 
 
 def _of(kind: str, default: Any, description: str, **limits) -> Any:
