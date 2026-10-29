@@ -336,6 +336,35 @@ def test_a_higher_priority_takes_the_cpus_it_can_before_a_lower_one_gets_any():
 
 
 @pytest.mark.slow
+def test_a_freed_cpu_goes_to_the_job_of_the_level_running_fewest_tasks():
+    """One CPU at a time used to go back to the oldest job: a second job never got one."""
+    started, release = [], threading.Semaphore(0)
+
+    def old(payload):
+        started.append("old")
+        release.acquire(timeout=10)
+
+    def new(payload):
+        started.append("new")
+
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(8, uses_tokens=True))
+        a = engine.submit("thread", old, range(6), cpu=1)
+        deadline = time.monotonic() + 10
+        while len(started) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        b = engine.submit("thread", new, range(3), cpu=1)
+        time.sleep(0.2)  # its chunks are fed, and wait for a CPU
+        release.release()  # one CPU frees
+        deadline = time.monotonic() + 10
+        while len(started) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for _ in range(6):
+            release.release()
+        assert engine.wait(a, 30).status == engine.wait(b, 30).status == "completed"
+    assert started[:3] == ["old", "old", "new"]
+
+
 def test_worker_death_costs_one_chunk():
     with Engine(cpus=4, mem_mb=0) as engine:
         engine.register("process", ProcessExecutor(4))
