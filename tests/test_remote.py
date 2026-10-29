@@ -212,6 +212,11 @@ def test_another_machine_joins_the_ray_of_this_one_and_runs_its_share(tmp_path):
         engine.register("ray", RayOverHosts([host], env))
         job = engine.submit("ray", _where, [{"file": File(str(tmp_path / "said"))} for _ in range(60)],
                             on_results=got.extend, on_error=lambda key, error: errors.append(error))
+        seen = set()
+        while engine.status(job).finished_at is None:
+            seen.update(task.host for task in engine.tasks(job))
+            time.sleep(0.1)
         assert engine.wait(job, 180).status == "completed", errors[:1]
+    assert seen <= {"local", host, None} and host in seen  # None: one not heard of yet
     names = {result.split(":")[0] for key, result in got}
     assert len(names) == 2 and all(result.endswith(":hello") for key, result in got)

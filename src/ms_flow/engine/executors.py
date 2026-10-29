@@ -25,6 +25,8 @@ The engine knows an executor only through this contract:
 - `progress(owner) -> dict`, optional: how many chunks' worth of work each task in flight that
   was submitted with `owner=` that value has done, by its `tag`. With it `submit` and
   `submit_many` take `owner`, and the engine passes it for the tasks worth watching.
+- `hosts() -> dict`, optional: for an executor of several machines, the one each task in flight
+  runs on, by its `tag`, as far as it is known yet.
 - `watches_all`, optional: an executor for which watching a task costs nothing sets it, and every
   task of a job that does not say otherwise is worth watching.
 - `batch`, optional: how many chunks the executor wants in each of its tasks, for the jobs that
@@ -54,6 +56,7 @@ import mmap
 import os
 import pickle
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -216,6 +219,9 @@ class RayExecutor:
     `shared` says that every node sees the disk of this machine, as a cluster started here does.
     Without it each `File` of an element goes once to Ray's object store and a node keeps its
     copy in its temporary directory, and what a result names under a `Dir` comes back with it.
+
+    `names` takes each node's hostname to the name its tasks are shown under in `hosts`; without
+    it the nodes are not asked where they are.
     """
 
     # ponytail: the time limit of a chunk counts from when Ray takes its task, so a job whose
@@ -223,7 +229,8 @@ class RayExecutor:
     # saying when it began, through the tally, is what would count only the run.
     uses_tokens, wants_cost = False, True
 
-    def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None, **init):
+    def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None,
+                 names: dict | None = None, **init):
         import ray
 
         self._ray, self.shared = ray, address is None if shared is None else shared
@@ -233,7 +240,10 @@ class RayExecutor:
         self._flying, self._killed = set(), set()  # the tasks Ray has, and those of them `kill` stopped
         # How far each watched task is: the nodes tell an actor, and what it holds is asked for
         # whenever `progress` is, so that one answers with what the time before brought.
+        # `_watched` holds every task that tells the tally something, by its index: (owner, tag),
+        # `owner` None for one that only says where it runs.
         self._tally, self._watched, self._said, self._asking = None, {}, {}, False
+        self._names, self._at = names, {}  # hostname -> shown name; index -> hostname, as told
         self._ids = itertools.count()
         # What Ray starts on this machine dies with the thread that started it: this one stays
         # until `shutdown`, so whoever makes the executor may do it from a thread that ends.
@@ -274,28 +284,39 @@ class RayExecutor:
         if not self.shared:
             payload = swap(payload, partial(self._mark, dirs, held))
         call, index = call or _call, None
-        if owner is not None:
+        if owner is not None or self._names is not None:
             if self._tally is None:
                 self._tally = self._ray.remote(num_cpus=0)(_Tally).remote()
             index = next(self._ids)
             self._watched[index] = owner, tag
-            call = partial(_told, self._tally, index, call)
+            if owner is not None:
+                call = partial(_told, self._tally, index, call)
+            if self._names is not None:
+                call = partial(_placed, self._tally, index, call)
         ref = run.remote(call, fn, payload)
         self._flying.add(ref)
         ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
         return ref
 
     def progress(self, owner) -> dict:
+        self._ask()
+        said = self._said
+        return {tag: said.get(index, 0.0) for index, (whose, tag) in list(self._watched.items()) if whose == owner}
+
+    def hosts(self) -> dict:
+        self._ask()
+        at, names = self._at, self._names or {}
+        return {tag: names.get(at[index], at[index]) for index, (_, tag) in list(self._watched.items()) if index in at}
+
+    def _ask(self) -> None:
         if self._tally is not None and not self._asking:
             self._asking = True
             self._tally.all.remote().future().add_done_callback(self._heard)
-        said = self._said
-        return {tag: said.get(index, 0.0) for index, (whose, tag) in list(self._watched.items()) if whose == owner}
 
     def _heard(self, future) -> None:
         self._asking = False
         if not future.cancelled() and future.exception() is None:
-            self._said = future.result()
+            self._said, self._at = future.result()
 
     def kill(self) -> None:
         # Everything Ray has, which is what the engine asks for: it could stop one task alone.
@@ -560,19 +581,32 @@ def _apply(call, fn, payload):
 
 
 class _Tally:
-    """The actor of a `RayExecutor` that holds how far each of its watched tasks is."""
+    """The actor of a `RayExecutor` that holds how far each of its watched tasks is, and where it runs."""
 
     def __init__(self):
-        self.done = {}
+        self.done, self.at = {}, {}
 
     def tell(self, index, done):
         self.done[index] = done
 
+    def place(self, index, host):
+        self.at[index] = host
+
     def drop(self, index):
         self.done.pop(index, None)
+        self.at.pop(index, None)
 
     def all(self):
-        return self.done
+        return self.done, self.at
+
+
+def _placed(tally, index, call, fn, payload):
+    """A task on a node that says first which machine that is."""
+    tally.place.remote(index, socket.gethostname())
+    try:
+        return call(fn, payload)
+    finally:
+        tally.drop.remote(index)
 
 
 def _told(tally, index, call, fn, payload):
