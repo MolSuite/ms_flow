@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -57,6 +58,13 @@ def _here(local) -> tuple[int, int, int | None]:
 
     return (share(local.cpus, usable_cpus(), 1), share(local.gpus, gpus_here()),
             share(local.memory_gb * 1024, physical_memory_mb(), 1024) if local.memory_gb else None)
+
+
+def _spec_executor(spec: str | None) -> str | None:
+    try:
+        return json.loads(spec).get("executor")
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def build_executor(name: str, settings, host_env=None):
@@ -327,7 +335,8 @@ class WorkspaceJobApiMixin:
         listed = [live.pop((row["job_id"], row["started_at"]), None)
                   or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
                                  row["error"], 0, row["started_at"], row["finished_at"], row["job_id"], 0,
-                                 min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None)
+                                 min(1.0, (row["done"] + row["failed"]) / row["total"]) if row["total"] else None,
+                                 executor=_spec_executor(row["spec"]))
                   for row in recorded(project.context.path / "executor.db", limit)]
         # One just submitted is not in the file until the journal's next write. Only the active
         # project has jobs that have not ended: closing a project interrupts its own.
