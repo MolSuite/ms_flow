@@ -741,3 +741,26 @@ def test_each_chunk_has_a_byte_that_says_where_it_is():
         gate.set()
         assert engine.wait(job_id, 30).chunks_done == 5
         assert engine.chunk_states(job_id) is None  # an ended job keeps only its counts
+
+
+@pytest.mark.slow
+def test_a_ray_says_where_each_machine_tells_what_it_uses():
+    pytest.importorskip("ray")
+    import urllib.request
+
+    from ms_flow.engine import RayExecutor
+
+    ray = RayExecutor(num_cpus=1)
+    try:
+        urls = ray.nodes()
+        assert list(urls) == ["local"]
+        limit, text = time.monotonic() + 60, ""
+        while "ray_node_cpu_utilization" not in text and time.monotonic() < limit:  # the agent samples every few seconds
+            time.sleep(1)
+            try:
+                text = urllib.request.urlopen(urls["local"], timeout=5).read().decode()
+            except OSError:
+                pass
+        assert "ray_node_mem_total" in text
+    finally:
+        ray.shutdown()
