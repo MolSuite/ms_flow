@@ -331,7 +331,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
 
         # closing the project interrupts its job, with what it delivered written; the same key continues it
         cut = ms.submit(every_ligand, executor="thread", key="again")
-        assert ms.jobs()[-1].id == cut  # seen at once, before the journal has it on disk
+        assert (ms.jobs()[-1].id, ms.jobs()[-1].executor) == (cut, "thread")  # seen at once, before the journal has it on disk
         _until(lambda: ms.engine.status(cut).chunks_done >= 20)
         activity = ms.get_project_activity()
         assert (activity["active"], activity["can_switch_project"], activity["job_ids"]) == (True, False, [cut])
@@ -347,7 +347,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
         past = ms.jobs()
         assert [(job.id, job.status) for job in past] == [(None, "completed"), (None, "interrupted")]
-        assert (past[0].chunks_done, past[0].progress, past[1].key) == (300, 1.0, "again")
+        assert (past[0].chunks_done, past[0].progress, past[1].key, past[1].executor) == (300, 1.0, "again", "thread")
         assert [job.key for job in ms.jobs(limit=1)] == ["again"]
         again = ms.engine.wait(ms.resume("again"), 120)  # on threads, as it was submitted
         assert (again.status, again.chunks_done) == ("completed", 300)
