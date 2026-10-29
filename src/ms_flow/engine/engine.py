@@ -293,8 +293,7 @@ class Engine:
         most two for each worker.
         `thread` says that `fn` spends its time waiting for a program it starts, not in Python:
         an executor that keeps a worker for each task and can spare it (the process pool) runs it
-        on a thread of this process, so no worker holds memory for it. Such a chunk is stopped
-        through the programs it tells of (see `executors.launched`).
+        on a thread of one process it keeps for all of them, so no worker holds memory for it.
         `label` is what a chunk goes by in `tasks` and in a failure, in place of a short repr of
         its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
         dict payload) or a function `(payload)` that returns the text. It runs here, never in a

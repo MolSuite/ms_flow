@@ -41,8 +41,8 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
     `label` is what an element goes by in the monitor and in a failure: a template its keys
     fill (`"dock-R{receptor}-L{ligand}"`) or a function `(element)` that returns the text.
     `thread` is for a function that only waits for a program it starts (a docking binary): on
-    this machine it runs on a thread of the engine's process and no worker is kept for it. It
-    tells of the program with `launched`, which is how it is stopped.
+    this machine it runs on a thread of one process kept for all of them, and no worker is kept
+    for it.
     """
     def mark(fn):
         fn.__task__ = {"cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "retries": retries, "batch": batch,
