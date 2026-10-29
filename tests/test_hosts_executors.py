@@ -211,9 +211,9 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     assert built("slurm2").said["env"] == "/mine"
     assert built("alone") == (None, {"num_cpus": 6, "num_gpus": 1})  # a Ray of this machine alone
     assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"],
-                            {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)]})  # each host gives its share
+                            {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)], "names": ["pc2", "pc3"]})  # each host gives its share
     # the head here runs nothing
-    assert built("others") == (["pc2"], ["/envs/pc2"], {"num_cpus": 0, "num_gpus": 0, "limits": [(-2, 0, 8)]})
+    assert built("others") == (["pc2"], ["/envs/pc2"], {"num_cpus": 0, "num_gpus": 0, "limits": [(-2, 0, 8)], "names": ["pc2"]})
     # The share of a host is worked out by its shell, as `share` does here.
     has = int(subprocess.check_output("nproc"))
     for cpus in (-2, 3, 4096, -4096):

@@ -3,6 +3,7 @@ import os
 import queue
 import sqlite3
 import subprocess
+import socket
 import sys
 import threading
 import time
@@ -617,7 +618,7 @@ def test_the_same_jobs_on_ray(tmp_path):
 
     # Ray's workers import what they run: nothing from this module, which only pytest can find.
     with Engine(cpus=1) as engine:  # a job on Ray spends none of the engine's own CPUs
-        engine.register("ray", RayExecutor(num_cpus=4))
+        engine.register("ray", RayExecutor(num_cpus=4, names={socket.gethostname(): "here"}))
         got = []
         job = engine.submit("ray", workers.row, [{"idx": i} for i in range(6)], cpu=2,
                             on_result=lambda key, result: got.append(result["idx"]))
@@ -644,7 +645,8 @@ def test_the_same_jobs_on_ray(tmp_path):
         while (snap := engine.status(held)).progress != 0.5:
             assert time.monotonic() < deadline, snap
             time.sleep(0.05)
-        assert [task.progress for task in engine.tasks(held)] == [0.5] * 2  # and task by task
+        tasks = engine.tasks(held)  # and task by task, with the machine each one runs on
+        assert [(task.progress, task.host) for task in tasks] == [(0.5, "here")] * 2
         (tmp_path / "gate").touch()
         assert engine.wait(held, 30).progress == 1.0
 

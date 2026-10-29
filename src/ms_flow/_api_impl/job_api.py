@@ -83,6 +83,7 @@ def build_executor(name: str, settings, host_env=None):
         return RayOverHosts([host.address for host in others],
                             [host.env or host_env(host.address, None) for host in others],
                             limits=[(host.cpus, host.gpus, host.memory_gb) for host in others],
+                            names=[name for name in config.hosts if settings.hosts[name].address],
                             num_cpus=cpus, num_gpus=gpus)
     if config.kind == "queue":
         from ms_flow.remote import JOB_SH, RemoteExecutor

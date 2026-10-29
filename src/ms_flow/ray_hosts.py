@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+import socket
 import time
 
 from ms_env import Host, HostError
@@ -44,27 +45,34 @@ def _auth() -> tuple[str, bytes]:
 class RayOverHosts(RayExecutor):
     """`hosts` as `ssh` names them, `env` the path of the environment on each of them: one for
     all, or one for each. `limits` gives for each the (CPUs, GPUs, GB of memory) that are for
-    its tasks, as `HostConfig` counts them: without it a machine gives all it has.
+    its tasks, as `HostConfig` counts them: without it a machine gives all it has. `names`, one
+    for each, is what `hosts` calls the machine a task runs on (this one is `local`); by default
+    its address.
 
     No machine sees the disk of another: the files of an element travel through Ray.
     """
 
-    def __init__(self, hosts, env, join_seconds: float = 90, limits=None, **init):
+    def __init__(self, hosts, env, join_seconds: float = 90, limits=None, names=None, **init):
         envs = [env] * len(hosts) if isinstance(env, str) else env
         self._hosts = [(Host(address), shlex.quote(f"{there}/bin/ray")) for address, there in zip(hosts, envs, strict=True)]
         gives = ["".join((_flag("num-cpus", cpus, "nproc", 1),
                           _flag("num-gpus", gpus, "nvidia-smi --list-gpus 2>/dev/null | wc -l"),
                           _flag("memory", memory_gb, "awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo", 1, 2 ** 30)))
                  for cpus, gpus, memory_gb in limits or [(0, 0, 0)] * len(hosts)]
-        for host, _ray_there in self._hosts:
+        # ponytail: by hostname, so two machines that share one are shown as the first of them.
+        called = {socket.gethostname(): "local"}
+        for (host, _ray_there), name in zip(self._hosts, names or hosts, strict=True):
             # ponytail: Slurm is the one told apart, as on this machine (`job_api._login_node`).
-            if host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ] && echo login || :', timeout=60).strip():
+            said = host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ] && echo @login || hostname',
+                            timeout=60).decode().strip()
+            if said == "@login":
                 raise HostError(f"{host.address} is the login node of a cluster, where nothing is to compute: "
                                 "its queue is who runs jobs there")
+            called.setdefault(said, name)
         # The address of this machine as the others reach it: where their ssh session comes from.
         # ponytail: asked to the first host, so all of them have to be on one network with this machine.
         here = self._hosts[0][0].run("echo ${SSH_CLIENT%% *}", timeout=60).decode().strip()
-        super().__init__(None, shared=False, _node_ip_address=here, **init)
+        super().__init__(None, shared=False, names=called, _node_ip_address=here, **init)
         address = self._ray.get_runtime_context().gcs_address
         auth, token = _auth()
         try:

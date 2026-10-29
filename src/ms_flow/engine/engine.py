@@ -112,6 +112,7 @@ class TaskSnapshot:
     attempt: int
     seconds: float  # since it was handed to the executor
     progress: float | None  # 0 to 1; None for a task that is not watched
+    host: str | None = None  # the machine it runs on, where its executor has several; else None
 
 
 class _Job:
@@ -154,7 +155,7 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives", "threads", "watches_all")
+                 "outlives", "threads", "watches_all", "places")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
@@ -162,6 +163,7 @@ class _Slot:
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
         self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
         self.watches_all = getattr(impl, "watches_all", False)
+        self.places = hasattr(impl, "hosts")
 
 
 class Engine:
@@ -388,12 +390,13 @@ class Engine:
         job = self._jobs.get(job_id)
         flying = sorted(tuple(job.flying), key=lambda chunk: chunk.started) if job is not None else ()
         told = job.slot.impl.progress(job.id) if flying and job.slot.tells else {}
+        at = job.slot.impl.hosts() if flying and job.slot.places else {}
         now, tasks = time.perf_counter(), []
         for chunk in flying:
             pack, said = chunk.pack, told.get(chunk)  # `pack` once: the loop empties it as the task ends
             n = len(pack) if pack else 1
             tasks.append(TaskSnapshot(_called(job, chunk.payload), n, chunk.attempt, now - chunk.started,
-                                      None if said is None else min(1.0, said / n)))
+                                      None if said is None else min(1.0, said / n), at.get(chunk)))
         return tasks
 
     def jobs(self) -> list[JobSnapshot]:
