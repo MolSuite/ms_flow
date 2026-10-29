@@ -51,7 +51,7 @@ _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers fo
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
 _RECOUNT = 30.0  # seconds between two counts of what a source has left
 _GPU_QUERY = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"]
-_GPU_EVERY = 5.0  # seconds between two reads of the cards while a job holds them
+_READ_EVERY = 2.0  # seconds between two reads of the machine while jobs hold its CPUs or GPUs
 
 
 _brief = reprlib.Repr()  # a payload as a failed chunk is told apart: short whatever its size
@@ -108,8 +108,9 @@ class JobSnapshot:
     cpu_used: int = 0
     executor: str | None = None  # the name it was submitted to; None for one recorded without it
     # What it used, kept in the journal once it ends: `cpu_s` and `gpu_s` (CPUs and GPUs held times
-    # the seconds held), `peak_cpu`, `peak_gpu`, `peak_mem_mb`, and while it held this machine's
-    # GPUs `vram_mb` (peak) and `gpu_util` (mean %) of its cards, else None. None when nothing says.
+    # the seconds held), `peak_cpu`, `peak_gpu`, `peak_mem_mb`. Run on this machine, also what the
+    # machine did meanwhile, shared out among the jobs by what each held: `busy_s` (seconds of
+    # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None.
     usage: dict | None = None
 
 
@@ -153,6 +154,23 @@ class _Job:
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
                            self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used())
+
+
+def _busy_seconds() -> float | None:
+    """Seconds this machine's cores have been busy, all of them added, since it started:
+    `/proc/stat`, else psutil (macOS). None when neither is there."""
+    try:
+        with open("/proc/stat") as stat:
+            ticks = [int(v) for v in stat.readline().split()[1:8]]
+        return (sum(ticks) - ticks[3] - ticks[4]) / os.sysconf("SC_CLK_TCK")  # idle and iowait are not busy
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import psutil
+    except ImportError:
+        return None
+    times = psutil.cpu_times()
+    return sum(times) - times.idle
 
 
 def _hold(job: _Job, needs, sign: int) -> None:
@@ -222,7 +240,7 @@ class Engine:
         self._events: queue.SimpleQueue = queue.SimpleQueue()  # into the loop
         self._deliveries: queue.SimpleQueue = queue.SimpleQueue()  # user callbacks, out of the loop
         self._closed = False
-        self._gpu_held, self._gpu_reader = 0, None  # this machine's GPUs that chunks hold; who reads them
+        self._local, self._reader = 0, None  # chunks in flight on this machine's tokens; who reads the machine
         self._threads = [threading.Thread(target=self._loop, name="msflow-engine", daemon=True),
                          threading.Thread(target=self._deliver, name="msflow-delivery", daemon=True)]
         for thread in self._threads:
@@ -402,7 +420,8 @@ class Engine:
         job.flying, job.cpu_used, job.fatal, job.error = set(), 0, None, None
         # ponytail: a job that continues counts what this run uses, not what the earlier ones did.
         # Every key from the start: the journal's writer copies it from another thread.
-        job.usage = {"cpu_s": 0.0, "gpu_s": 0.0, "peak_cpu": 0, "peak_gpu": 0, "vram_mb": None, "gpu_util": None}
+        job.usage = {"cpu_s": 0.0, "gpu_s": 0.0, "peak_cpu": 0, "peak_gpu": 0, "busy_s": None, "vram_mb": None,
+                     "gpu_util": None}
         job.held = [0, 0, time.monotonic(), 0]  # CPUs, GPUs, since when, reads of the cards
         job.ready, job.room, job.hungry, job.fed_all = deque(), threading.Event(), False, False
         job.started_at, job.finished_at, job.finished = time.time(), None, threading.Event()
@@ -636,7 +655,7 @@ class Engine:
         if chunk.cost is not None:
             self.tokens.give(chunk.cost)
             job.cpu_used -= chunk.cost[0]
-            self._gpu_held -= chunk.cost[1]
+            self._local -= 1
         _hold(job, chunk.needs, -1)
         if job.status != RUNNING:
             return
@@ -773,30 +792,44 @@ class Engine:
             job.slot.impl.ended(job.key, status == INTERRUPTED)
         self._deliveries.put((self._announce, (job,)))
 
-    def _on_gpus(self, util: float, vram_mb: float) -> None:
-        for job in self._active:
-            if job.held[1] and job.slot.impl.uses_tokens:  # on this machine's cards
-                usage, job.held[3] = job.usage, job.held[3] + 1
-                usage["vram_mb"] = max(usage["vram_mb"] or 0, int(vram_mb))
+    def _on_machine(self, busy_s: float, cards: list) -> None:
+        """What this machine did over the last read, to the jobs that held its CPUs and GPUs: each
+        gets the part of what it held."""
+        local = [job for job in self._active if job.slot.impl.uses_tokens and (job.held[0] or job.held[1])]
+        cpus, gpus = sum(job.held[0] for job in local), sum(job.held[1] for job in local)
+        for job in local:
+            usage = job.usage
+            if job.held[0]:
+                usage["busy_s"] = (usage["busy_s"] or 0.0) + busy_s * job.held[0] / cpus
+            if job.held[1] and cards:
+                job.held[3] += 1
+                usage["vram_mb"] = max(usage["vram_mb"] or 0, int(sum(c[1] for c in cards) * job.held[1] / gpus))
                 mean = usage["gpu_util"] or 0.0
-                usage["gpu_util"] = mean + (util - mean) / job.held[3]
+                usage["gpu_util"] = mean + (sum(c[0] for c in cards) / len(cards) - mean) / job.held[3]
 
-    def _read_gpus(self) -> None:
-        """A thread of its own: what the cards do, while chunks hold them, for the `usage` of their jobs.
+    def _read_machine(self) -> None:
+        """A thread of its own: how busy this machine's CPUs and GPUs are, for the `usage` of the
+        jobs holding them.
 
-        ponytail: the whole machine's cards, so two jobs on the GPUs at once both get the sum and
-        another program's VRAM counts too. Per process from `--query-compute-apps` if that matters.
+        ponytail: the whole machine, so what other programs do counts too; when jobs share it,
+        each gets the part of what it holds, not what it did; and a job is counted by what it held
+        at each read, so one shorter than `_READ_EVERY` may get nothing. Per process if that matters.
         """
+        before, gpus = _busy_seconds(), self.tokens.total[1] > 0
         while not self._closed:
-            if self._gpu_held:
+            time.sleep(_READ_EVERY)
+            now = _busy_seconds()
+            busy_s = now - before if self._local and now is not None and before is not None else 0.0
+            before, cards = now, []
+            if not self._local:
+                continue
+            if gpus:
                 try:
                     out = subprocess.run(_GPU_QUERY, capture_output=True, text=True, timeout=10).stdout
                     cards = [[float(v) for v in line.split(",")] for line in out.splitlines() if line.strip()]
                 except (OSError, ValueError, subprocess.SubprocessError):
-                    return  # no nvidia-smi: nothing to tell
-                if cards:
-                    self._events.put((self._on_gpus, sum(c[0] for c in cards) / len(cards), sum(c[1] for c in cards)))
-            time.sleep(_GPU_EVERY)
+                    gpus = False  # no nvidia-smi: no cards to tell of
+            self._events.put((self._on_machine, busy_s, cards))
 
     def _dispatch(self) -> None:
         for slot in self._executors.values():
@@ -889,10 +922,10 @@ class Engine:
         if chunk.cost is not None:
             self.tokens.take(chunk.cost)
             job.cpu_used += chunk.cost[0]
-            self._gpu_held += chunk.cost[1]
-            if chunk.cost[1] and self._gpu_reader is None:
-                self._gpu_reader = threading.Thread(target=self._read_gpus, name="msflow-gpus", daemon=True)
-                self._gpu_reader.start()
+            self._local += 1
+            if self._reader is None:
+                self._reader = threading.Thread(target=self._read_machine, name="msflow-machine", daemon=True)
+                self._reader.start()
         _hold(job, chunk.needs, 1)
         slot.inflight += 1
         slot.isolating = chunk.alone = alone

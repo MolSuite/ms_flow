@@ -234,7 +234,14 @@ def test_a_version_3_journal_gets_the_usage_column(tmp_path):
     assert old["usage"] is None and new["usage"] is not None
 
 
-def test_a_job_on_this_machines_gpus_keeps_what_the_cards_did(tmp_path, monkeypatch):
+def _spin(payload):
+    end = time.perf_counter() + payload["s"]
+    while time.perf_counter() < end:
+        pass
+    return payload["i"]
+
+
+def test_a_job_on_this_machine_keeps_what_its_cpus_and_cards_did(tmp_path, monkeypatch):
     from ms_flow.engine import engine as engine_module
 
     bin_ = tmp_path / "bin"
@@ -242,9 +249,12 @@ def test_a_job_on_this_machines_gpus_keeps_what_the_cards_did(tmp_path, monkeypa
     (bin_ / "nvidia-smi").write_text("#!/bin/sh\necho '40, 900'\necho '60, 100'\n")
     (bin_ / "nvidia-smi").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setattr(engine_module, "_GPU_EVERY", 0.02)
-    with Engine(cpus=4, gpus=1, mem_mb=0) as engine:
-        engine.register("gpu", ThreadExecutor(4, uses_tokens=True))
-        snap = engine.wait(engine.submit("gpu", workers.nap, [{"s": 0.2, "i": i} for i in range(3)], gpu=1), 30)
-    assert snap.usage["peak_gpu"] == 1 and snap.usage["gpu_s"] >= 0.5
-    assert snap.usage["vram_mb"] == 1000 and snap.usage["gpu_util"] == 50.0
+    monkeypatch.setattr(engine_module, "_READ_EVERY", 0.05)
+    with Engine(cpus=4, gpus=2, mem_mb=0) as engine:
+        engine.register("local", ThreadExecutor(4, uses_tokens=True))
+        gpu = engine.submit("local", workers.nap, [{"s": 0.3, "i": i} for i in range(2)], gpu=1, cpu=1)
+        cpu = engine.submit("local", _spin, [{"s": 0.6, "i": 0}], cpu=1)
+        gpu, cpu = engine.wait(gpu, 30).usage, engine.wait(cpu, 30).usage
+    assert gpu["peak_gpu"] == 2 and gpu["gpu_s"] >= 0.5
+    assert gpu["vram_mb"] == 1000 and gpu["gpu_util"] == 50.0  # it held both cards
+    assert cpu["vram_mb"] is None and cpu["busy_s"] > 0.15  # a core spinning, shared with the other job while both ran
