@@ -687,3 +687,28 @@ def test_a_ray_made_from_a_thread_that_ends_goes_on_running():
         time.sleep(12)  # what Ray started dies some seconds after the thread that started it
         ended = engine.wait(engine.submit("ray", workers.row, [{"idx": i} for i in range(4)]), 60)
     assert (ended.status, ended.chunks_done) == ("completed", 4)
+
+
+def test_each_chunk_has_a_byte_that_says_where_it_is():
+    from ms_flow.engine.engine import DONE_CHUNK, FAILED_CHUNK, RUNNING_CHUNK
+
+    gate = threading.Event()
+
+    def run(payload):
+        if payload == 2:
+            raise ValueError("no")
+        if payload > 2:
+            gate.wait(30)
+        return payload
+
+    with Engine(cpus=8, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(8))
+        job_id = engine.submit("thread", run, list(range(6)))
+        want = bytes([DONE_CHUNK, DONE_CHUNK, FAILED_CHUNK] + [RUNNING_CHUNK] * 3)
+        deadline = time.monotonic() + 30
+        while engine.chunk_states(job_id) != want:
+            assert time.monotonic() < deadline, engine.chunk_states(job_id)
+            time.sleep(0.01)
+        gate.set()
+        assert engine.wait(job_id, 30).chunks_done == 5
+        assert engine.chunk_states(job_id) is None  # an ended job keeps only its counts
