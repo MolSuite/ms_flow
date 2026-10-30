@@ -198,3 +198,63 @@ def test_a_result_taken_after_the_job_stopped_is_not_run_again(tmp_path, stop):
     with engine:
         assert engine.wait(submit(engine), 30).status == "completed"
     assert sorted(taken, key=int) == [str(i) for i in range(40)]  # each one once, over the two runs
+
+
+def test_what_a_job_used_stays_once_it_ended(tmp_path):
+    import json
+
+    from ms_flow.engine.journal import recorded
+
+    with _engine(tmp_path) as engine:
+        snap = engine.wait(engine.submit("thread", workers.nap, [{"s": 0.05, "i": i} for i in range(8)],
+                                         cpu=2, name="nap", journal="project"), 30)
+    usage = json.loads(recorded(tmp_path / "executor.db")[0]["usage"])
+    assert usage == snap.usage
+    assert usage["peak_cpu"] >= 2 and usage["cpu_s"] >= 2 * 8 * 0.05 * 0.9
+    assert usage["peak_gpu"] == usage["gpu_s"] == 0 and usage["vram_mb"] is None
+
+
+def test_a_version_3_journal_gets_the_usage_column(tmp_path):
+    from ms_flow.engine.journal import recorded
+
+    db = tmp_path / "executor.db"
+    with closing(sqlite3.connect(db)) as old:
+        old.executescript("""
+            CREATE TABLE jobs (n INTEGER PRIMARY KEY, job_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+                status TEXT NOT NULL, spec TEXT NOT NULL, total INTEGER, done INTEGER NOT NULL,
+                failed INTEGER NOT NULL, error TEXT, started_at REAL, finished_at REAL, source TEXT);
+            CREATE TABLE chunks (job INTEGER NOT NULL, key BLOB NOT NULL, status INTEGER NOT NULL,
+                attempt INTEGER NOT NULL, error TEXT, input TEXT, PRIMARY KEY (job, key)) WITHOUT ROWID;
+            INSERT INTO jobs VALUES (1, 'old', 'old', 'completed', '{}', 1, 1, 0, NULL, 1.0, 2.0, NULL);
+            PRAGMA user_version = 3;""")
+    assert [row["job_id"] for row in recorded(db)] == ["old"]  # read as it is, before anyone owns it
+    with _engine(tmp_path) as engine:
+        engine.wait(engine.submit("thread", _boom_on_3, [1], journal="project"), 30)
+    old, new = recorded(db)
+    assert old["usage"] is None and new["usage"] is not None
+
+
+def _spin(payload):
+    end = time.perf_counter() + payload["s"]
+    while time.perf_counter() < end:
+        pass
+    return payload["i"]
+
+
+def test_a_job_on_this_machine_keeps_what_its_cpus_and_cards_did(tmp_path, monkeypatch):
+    from ms_flow.engine import engine as engine_module
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "nvidia-smi").write_text("#!/bin/sh\necho '40, 900'\necho '60, 100'\n")
+    (bin_ / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(engine_module, "_READ_EVERY", 0.05)
+    with Engine(cpus=4, gpus=2, mem_mb=0) as engine:
+        engine.register("local", ThreadExecutor(4, uses_tokens=True))
+        gpu = engine.submit("local", workers.nap, [{"s": 0.3, "i": i} for i in range(2)], gpu=1, cpu=1)
+        cpu = engine.submit("local", _spin, [{"s": 0.6, "i": 0}], cpu=1)
+        gpu, cpu = engine.wait(gpu, 30).usage, engine.wait(cpu, 30).usage
+    assert gpu["peak_gpu"] == 2 and gpu["gpu_s"] >= 0.5
+    assert gpu["vram_mb"] == 1000 and gpu["gpu_util"] == 50.0  # it held both cards
+    assert cpu["vram_mb"] is None and cpu["busy_s"] > 0.15  # a core spinning, shared with the other job while both ran

@@ -6,6 +6,7 @@ as not done and run again. A chunk is written once, when it ends, and never its 
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -19,7 +20,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-VERSION = 3
+VERSION = 4
 CHUNK_DONE, CHUNK_FAILED = 1, 2
 INTERRUPTED = "interrupted"
 RESUMABLE = (INTERRUPTED, "canceled")  # the job statuses that keep their done chunks: these continue
@@ -33,7 +34,8 @@ CREATE TABLE jobs (
     spec TEXT NOT NULL,           -- JSON: executor, function, options, and `origin` (see `Engine.submit`)
     total INTEGER, done INTEGER NOT NULL, failed INTEGER NOT NULL,
     error TEXT, started_at REAL, finished_at REAL,
-    source TEXT                   -- JSON: what its source asked to keep, given back when it continues
+    source TEXT,                  -- JSON: what its source asked to keep, given back when it continues
+    usage TEXT                    -- JSON: what it used, see `JobSnapshot.usage`
 );
 CREATE TABLE chunks (
     job INTEGER NOT NULL, key BLOB NOT NULL,
@@ -42,8 +44,8 @@ CREATE TABLE chunks (
     PRIMARY KEY (job, key)
 ) WITHOUT ROWID;
 """
-_JOB_COUNTERS = ("UPDATE jobs SET status = ?, total = ?, done = ?, failed = ?, error = ?, finished_at = ?, source = ? "
-                 "WHERE n = ?")
+_JOB_COUNTERS = ("UPDATE jobs SET status = ?, total = ?, done = ?, failed = ?, error = ?, finished_at = ?, source = ?, "
+                 "usage = ? WHERE n = ?")
 
 
 class Busy(RuntimeError):
@@ -90,7 +92,7 @@ def _read(path, query: str, args=()) -> list[dict]:
     if not Path(path).exists():
         return []
     with closing(sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)) as db:
-        if db.execute("PRAGMA user_version").fetchone()[0] != VERSION:
+        if db.execute("PRAGMA user_version").fetchone()[0] not in (3, VERSION):  # 3: without `usage`
             return []
         db.row_factory = sqlite3.Row
         return [dict(row) for row in db.execute(query, args)]
@@ -125,6 +127,8 @@ class Journal:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if not version and not db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]:
                 db.executescript(f"PRAGMA auto_vacuum = INCREMENTAL; {_SCHEMA} PRAGMA user_version = {VERSION};")
+            elif version == 3:  # one column more, so a project's history stays
+                db.executescript(f"ALTER TABLE jobs ADD COLUMN usage TEXT; PRAGMA user_version = {VERSION};")
             elif version != VERSION:
                 raise RuntimeError(f"{self.path} is not a version {VERSION} journal: move it away to start a new one")
             # Whatever never ended belonged to a process that is gone: the lock says so.
@@ -260,9 +264,9 @@ class Journal:
                         job = record[0]
                         if len(record) == 1:
                             live[job.n] = job
-                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            db.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                        (job.n, job.uid, job.name, job.status, job.spec, job.total, job.done,
-                                        job.failed, job.error, job.started_at, job.finished_at, job.source))
+                                        job.failed, job.error, job.started_at, job.finished_at, job.source, None))
                             # one that continues runs its failures again
                             db.execute("DELETE FROM chunks WHERE job = ? AND status = ?", (job.n, CHUNK_FAILED))
                         else:
@@ -288,4 +292,5 @@ class Journal:
 
 
 def _counters(job) -> tuple:
-    return job.status, job.total, job.done, job.failed, job.error, job.finished_at, job.source, job.n
+    return (job.status, job.total, job.done, job.failed, job.error, job.finished_at, job.source,
+            json.dumps(job.used()), job.n)
