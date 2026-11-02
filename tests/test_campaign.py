@@ -63,7 +63,7 @@ class _Collect:
 def screen(params, project):
     said = Path(os.environ["CAMPAIGN_FILE"])
     out = Dir(said.parent / "work")
-    return [Stage("vs", square, [{"n": n, "f": File(said), "out": out} for n in range(params.n)],
+    return [Stage("vs", square, [{"n": n, "f": File(said), "out": out, "_cpu_required": 1} for n in range(params.n)],
                   reduce=partial(best, k=2)),
             Stage("off", negate, From("vs", list), deliver="none", reduce=count),
             Stage("count", negate, From("off", nothing, (File(said),)), deliver="none"),

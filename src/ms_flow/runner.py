@@ -246,8 +246,10 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
             for index in range(total):
                 # Plain paths from here on: whatever runs the task shares this disk.
                 payload = swap(pickle.load(file), here)
-                index_of[content_key(payload)] = index  # ponytail: equal payloads are one element, as in a journal
-                yield payload
+                key = content_key(payload)
+                index_of[key] = index  # ponytail: equal payloads are one element, as in a journal
+                # Said, not left to the engine: it keys a dict without its per-chunk costs.
+                yield {**payload, "_key": key} if type(payload) is dict else payload
 
     def failed(key, error):
         with open(folder / "errors.jsonl", "a") as file:
