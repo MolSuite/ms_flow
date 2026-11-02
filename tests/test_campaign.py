@@ -9,7 +9,7 @@ import pytest
 from pydantic import BaseModel
 
 from ms_flow.campaign import From, Stage, campaign
-from ms_flow.engine import Engine, File, Flow, ThreadExecutor, task
+from ms_flow.engine import Dir, Engine, File, Flow, ThreadExecutor, task
 from ms_flow.remote import RemoteExecutor
 
 pytestmark = pytest.mark.slow
@@ -30,7 +30,10 @@ def square(element, params):
     if element["n"] == 3:
         raise ValueError("three is not for squaring")
     time.sleep(params.nap)
-    return {"stage": "vs", "n": element["n"], "v": element["n"] ** 2, "said": Path(element["f"]).read_text()}
+    wrote = Path(element["out"], f"{element['n']}.txt")
+    wrote.write_text("left there")
+    return {"stage": "vs", "n": element["n"], "v": element["n"] ** 2, "said": Path(element["f"]).read_text(),
+            "wrote": str(wrote)}
 
 
 def best(results, k):
@@ -42,7 +45,8 @@ def negate(row):
     return {"stage": "off", "n": row["n"], "v": -row["v"]}
 
 
-def nothing(left):
+def nothing(left, said):
+    assert Path(said).read_text() == "from here"  # an argument's file travelled too
     return []
 
 
@@ -58,9 +62,11 @@ class _Collect:
 @campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
 def screen(params, project):
     said = Path(os.environ["CAMPAIGN_FILE"])
-    return [Stage("vs", square, [{"n": n, "f": File(said)} for n in range(params.n)], reduce=partial(best, k=2)),
+    out = Dir(said.parent / "work")
+    return [Stage("vs", square, [{"n": n, "f": File(said), "out": out} for n in range(params.n)],
+                  reduce=partial(best, k=2)),
             Stage("off", negate, From("vs", list), deliver="none", reduce=count),
-            Stage("count", negate, From("off", nothing), deliver="none"),
+            Stage("count", negate, From("off", nothing, (File(said),)), deliver="none"),
             Stage("again", negate, From("vs", list), reduce=count, deliver="reduced")]
 
 
@@ -100,6 +106,8 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         assert ended.status == "completed_with_errors" and ended.chunks_failed == 1, ended.error
         assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
         assert {row["said"] for row in GOT if row["stage"] == "vs"} == {"from here"}  # the file travelled
+        assert all(row["wrote"].startswith(str(tmp_path / "far")) for row in GOT if row["stage"] == "vs")
+        assert not (tmp_path / "work").exists()  # what a task writes in a Dir stays there
         assert [row for row in GOT if row["stage"] != "vs"] == [{"stage": "count", "n": 2}]  # `none` stays there
         [first] = _dirs(tmp_path)
         assert (tmp_path / "far" / first / "ingested").exists()

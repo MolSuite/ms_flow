@@ -187,8 +187,9 @@ def _stages(engine, home: Path, spec: dict) -> str:
             else:
                 source = folder / "elements.bin"
                 if not (folder / "elements.json").exists():
-                    earlier, make = step["from"]
-                    total = _elements(source, make(_left(home / "stages" / earlier)))
+                    earlier, make, args = step["from"]
+                    args = swap(args, lambda mark: type(mark)(os.path.join(home, mark)))  # sent with the campaign
+                    total = _elements(source, make(_left(home / "stages" / earlier), *args))
                     (folder / "elements.json").write_text(json.dumps({"total": total}))
                 total = json.loads((folder / "elements.json").read_text())["total"]
             ended = _run_job(engine, home, folder, step["fn"], source, total, f"stage:{step['name']}", step["needs"],

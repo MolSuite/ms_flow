@@ -9,8 +9,9 @@
     workspace.submit(screen, params, executor="hpc")      # an executor of kind `queue`
 
 A stage runs its task over its source: what the source function gives for the first, and what
-`From(stage, fn)` makes there of an earlier stage for the others (`fn` gets what that stage's
-`reduce` made of its results or, without one, the iterator of its results). `deliver` is what
+`From(stage, fn, args)` makes there of an earlier stage for the others (`fn` gets what that
+stage's `reduce` made of its results or, without one, the iterator of its results, and then
+`args`). `deliver` is what
 of a stage comes back: each result as it is written there (`stream`), what its `reduce` made
 (`reduced`), or nothing (`none`). Every element that failed for good comes back as a failed
 chunk, whatever the stage.
@@ -27,8 +28,9 @@ ones and what was sent (`manifest.sha`). It is then
 - complete: only what this side has not got yet comes.
 
 Each attempt has its own directory, `c<identity>-<n>` in the host's work directory, and what
-travels is the files of the elements, once each, by their sha256 (`Stage.digests` are the ones
-already known). A directory goes once all of it came back, or it was canceled, and
+travels is the files of the elements and of the `args` of `From`, once each, by their sha256
+(`Stage.digests` are the ones already known). A `Dir` is a directory there for a task to write
+in, and stays there: only results come back. A directory goes once all of it came back, or it was canceled, and
 `keep_after` days passed (see `RemoteExecutor`), when a campaign is submitted to that host.
 """
 from __future__ import annotations
@@ -63,10 +65,12 @@ _CHUNK_NEEDS = ("cpu", "gpu", "mem_mb", "retries", "batch", "batched")
 
 @dataclasses.dataclass(frozen=True)
 class From:
-    """The elements of a stage: what `fn` makes of what the stage `stage` left."""
+    """The elements of a stage: what `fn` makes of what the stage `stage` left, and of `args`
+    (whose files travel with the campaign)."""
 
     stage: str
     fn: Callable
+    args: tuple = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,11 +182,11 @@ class Campaign:
 
         self._tmp = Path(tempfile.mkdtemp(prefix="msflow-campaign-"))
         try:
-            carried, known = {}, dict(stages[0].digests or {})
+            carried, made, known = {}, {}, dict(stages[0].digests or {})
 
             def carry(mark):
-                if isinstance(mark, Dir):
-                    raise TypeError("what comes back of a campaign is its results, not files: no Dir in its elements")
+                if isinstance(mark, Dir):  # made there, under the campaign's directory, and left there
+                    return Dir(made.setdefault(mark, f"out/{len(made)}"))
                 if mark not in carried:
                     carried[mark] = f"files/{known.get(mark) or _sha256(mark)}/{os.path.basename(mark)}"
                 return File(carried[mark])
@@ -190,7 +194,8 @@ class Campaign:
             listed = [{"name": stage.name, "fn": bound(stage.task),
                        "needs": {need: stage.task.__task__[need] for need in _CHUNK_NEEDS},
                        "reduce": stage.reduce,
-                       "from": None if place == 0 else (stage.source.stage, stage.source.fn)}
+                       "from": None if place == 0 else (stage.source.stage, stage.source.fn,
+                                                        swap(tuple(stage.source.args), carry))}
                       for place, stage in enumerate(stages)]
             stage_campaign(self._tmp, listed, (swap(payload, carry) for payload in stages[0].source),
                            part_seconds=remote.part_seconds)
