@@ -289,19 +289,30 @@ class Flow:
         results, and an element is done once its rows are in.
         A job that goes to a journal always has a key, its own or one made here, and is recorded
         with what it was submitted with: see `resume`.
+        A campaign (see `ms_flow.campaign`) is submitted to an executor of kind `queue` and
+        followed from here on a thread, under its identity as its key: when a job of this engine
+        follows it already, that job's id is returned.
         """
         spec = job.__job__
         fn, output = spec["task"], spec["output"]
+        if spec["params_model"] is not None:
+            params = spec["params_model"].model_validate(params or {})
+        asked, far = executor, None
+        if "campaign" in spec:
+            from ms_flow.campaign import prepare
+
+            far, running = prepare(self.engine, job, params, executor, self.project, engine.get("journal"))
+            if running is not None:
+                return running
+            engine["key"], executor = far.key, "thread"
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)
         needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"], "cpu": cpu or fn.__task__["cpu"],
                  "thread": fn.__task__.get("thread", False) if thread is None else thread}
-        if spec["params_model"] is not None:
-            params = spec["params_model"].model_validate(params or {})
         if engine.get("journal") is not None:
             engine["key"] = engine.get("key") or uuid.uuid4().hex
-            engine["origin"] = _origin(job, params, {"executor": executor, "batch": batch, "cpu": cpu, "thread": thread, **{
+            engine["origin"] = _origin(job, params, {"executor": asked, "batch": batch, "cpu": cpu, "thread": thread, **{
                 name: value for name, value in engine.items() if name not in ("journal", "key")}})
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
@@ -317,13 +328,15 @@ class Flow:
             with self._lock:
                 self._writing.pop(snapshot.id, None)
             try:
+                if far is not None:
+                    far.ended(snapshot)
                 if spec["finalize"] is not None:
                     spec["finalize"](params, self.project, snapshot)
             finally:
                 if on_terminal is not None:
                     on_terminal(snapshot)
 
-        source = job(params, self.project)
+        source = far if far is not None else job(params, self.project)
         reads = spec["reads"] | frozenset(getattr(source, "reads", ()))
         with self._lock:  # so `ended` cannot run before the job is in `_writing`
             after = [*after, *(job_id for job_id, tables in self._writing.items() if tables & reads)]

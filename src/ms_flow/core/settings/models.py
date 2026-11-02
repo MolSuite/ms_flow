@@ -58,6 +58,10 @@ class HostConfig(BaseModel):
     cpus: int = Field(default=0, title="CPUs", description=_SHARE)
     gpus: int = Field(default=0, title="GPUs", description=_SHARE)
     memory_gb: int = Field(default=0, title="Memory (GB)", description=_SHARE)
+    keep_after: float = Field(
+        default=7, ge=0, title="Keep campaigns (days)",
+        description="How long a campaign's directory stays in the work directory once all of it came back or "
+                    "it was canceled. 0: it goes then.")
     tools: Dict[str, str] = Field(
         default_factory=dict, description="Where a program is there, by its name, when it is not the one the app installs.")
     install: Optional[List[str]] = Field(
@@ -83,7 +87,7 @@ class ExecutorConfig(BaseModel):
         default_factory=lambda: ["local"],
         description="`ray`: the machines of its cluster, `local` being this one. `queue`: the login node alone, "
                     "which is `local` when this runs on it.")
-    scheduler: Literal["slurm", "none"] = _of("queue", "slurm", "who keeps the queue.")
+    scheduler: Literal["slurm", "sge", "none"] = _of("queue", "slurm", "who keeps the queue.")
     setup: str = _of("queue", "", "the shell lines that prepare the environment before the runner starts.")
     runner: str = _of("queue", "", "arguments for the runner, like `--ray auto` or `--cpus 16`.")
     template: str = _of("queue", "", "a file with the script the queue runs. Empty is the one built in.")

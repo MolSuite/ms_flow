@@ -1,0 +1,145 @@
+"""Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
+import os
+import sys
+import time
+from functools import partial
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
+
+from ms_flow.campaign import From, Stage, campaign
+from ms_flow.engine import Engine, File, Flow, ThreadExecutor, task
+from ms_flow.remote import RemoteExecutor
+
+pytestmark = pytest.mark.slow
+
+_ROOT = Path(__file__).resolve().parents[1]
+GOT = []  # what the campaign's writer was given, here
+
+
+class Params(BaseModel):
+    n: int = 6
+    nap: float = 0
+    run_id: str = ""
+
+
+@task()
+def square(element, params):
+    assert params.run_id is None  # volatile: not the tasks' business
+    if element["n"] == 3:
+        raise ValueError("three is not for squaring")
+    time.sleep(params.nap)
+    return {"stage": "vs", "n": element["n"], "v": element["n"] ** 2, "said": Path(element["f"]).read_text()}
+
+
+def best(results, k):
+    return sorted(results, key=lambda row: row["v"])[-k:]
+
+
+@task()
+def negate(row):
+    return {"stage": "off", "n": row["n"], "v": -row["v"]}
+
+
+def nothing(left):
+    return []
+
+
+def count(results):
+    return {"stage": "count", "n": sum(1 for _ in results)}
+
+
+class _Collect:
+    def write(self, results):
+        GOT.extend(results)
+
+
+@campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
+def screen(params, project):
+    said = Path(os.environ["CAMPAIGN_FILE"])
+    return [Stage("vs", square, [{"n": n, "f": File(said)} for n in range(params.n)], reduce=partial(best, k=2)),
+            Stage("off", negate, From("vs", list), deliver="none", reduce=count),
+            Stage("count", negate, From("off", nothing), deliver="none"),
+            Stage("again", negate, From("vs", list), reduce=count, deliver="reduced")]
+
+
+def _far(tmp_path, **options):
+    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, poll_s=0.2, part_seconds=0.1, runner="--cpus 2",
+                          setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}:{_ROOT / 'tests'}:{os.environ.get('PYTHONPATH', '')}",
+                          **options)
+
+
+def _engine(tmp_path, far):
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    engine.attach("j", tmp_path / "j.db")
+    return engine, Flow(engine, None)
+
+
+def _dirs(tmp_path):
+    return sorted(path.name for path in (tmp_path / "far").glob("c*-*"))
+
+
+def _until(check, seconds=60):
+    limit = time.monotonic() + seconds
+    while not check():
+        assert time.monotonic() < limit
+        time.sleep(0.1)
+    return True
+
+
+def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    GOT.clear()
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        ended = engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far", journal="j"), 120)
+        assert ended.status == "completed_with_errors" and ended.chunks_failed == 1, ended.error
+        assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
+        assert {row["said"] for row in GOT if row["stage"] == "vs"} == {"from here"}  # the file travelled
+        assert [row for row in GOT if row["stage"] != "vs"] == [{"stage": "count", "n": 2}]  # `none` stays there
+        [first] = _dirs(tmp_path)
+        assert (tmp_path / "far" / first / "ingested").exists()
+        queued = (tmp_path / "far" / first / "queue.id").read_text()
+
+        # Another run's id is the same campaign: what is there comes again, nothing runs again.
+        GOT.clear()
+        again = engine.wait(flow.submit(screen, {"run_id": "b"}, executor="far", journal="j"), 120)
+        assert again.status == "completed_with_errors" and len(GOT) == 6
+        assert _dirs(tmp_path) == [first] and (tmp_path / "far" / first / "queue.id").read_text() == queued
+
+        # Canceled here, it is canceled there; submitted again, it is a new attempt.
+        GOT.clear()
+        slow = flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j")
+        _until(lambda: len(_dirs(tmp_path)) == 2 and GOT)
+        engine.cancel(slow)
+        assert engine.wait(slow, 60).status == "canceled"
+        [canceled] = set(_dirs(tmp_path)) - {first}
+        _until(lambda: (tmp_path / "far" / canceled / "cancelled").exists())
+        GOT.clear()
+        done = engine.wait(flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j"), 120)
+        assert done.status == "completed_with_errors" and len([row for row in GOT if row["stage"] == "vs"]) == 39
+        assert canceled.endswith("-0") and set(_dirs(tmp_path)) == {first, canceled, canceled[:-1] + "1"}
+
+        # Once all of it is here, a directory goes at once with `keep_after` 0.
+        engine.executor("far").keep_after = 0
+        assert engine.wait(flow.submit(screen, {"run_id": "c"}, executor="far", journal="j"), 120).chunks_done
+        assert first not in _dirs(tmp_path)
+
+    # Closed while it runs, it goes on there; submitted again, only what this side has not got comes.
+    GOT.clear()
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        flow.submit(screen, {"n": 30, "nap": 0.3}, executor="far", journal="j")
+        _until(lambda: len(GOT) >= 3)
+    before = len(GOT)
+    assert before < 30  # it was closed halfway
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        resumed = engine.wait(flow.submit(screen, {"n": 30, "nap": 0.3}, executor="far", journal="j"), 120)
+        assert resumed.status == "completed_with_errors"
+    vs = [row["n"] for row in GOT if row["stage"] == "vs"]
+    assert sorted(vs) == [n for n in range(30) if n != 3] and len(GOT) > before  # each one once
