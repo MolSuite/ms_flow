@@ -83,7 +83,6 @@ class ExecutorConfig(BaseModel):
         default_factory=lambda: ["local"],
         description="`ray`: the machines of its cluster, `local` being this one. `queue`: the login node alone, "
                     "which is `local` when this runs on it.")
-    on_login_node: bool = _of("loky", False, "let the pool run on the login node of a cluster.")
     scheduler: Literal["slurm", "none"] = _of("queue", "slurm", "who keeps the queue.")
     setup: str = _of("queue", "", "the shell lines that prepare the environment before the runner starts.")
     runner: str = _of("queue", "", "arguments for the runner, like `--ray auto` or `--cpus 16`.")
