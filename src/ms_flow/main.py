@@ -75,6 +75,9 @@ class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
             specs=coerce_project_resource_specs(project_resources),
         )
 
+        from ms_flow._api_impl.job_api import warn_login_node
+
+        warn_login_node(self.app_logger)
         self._runtime_state = ProjectRuntimeState()
         self._engine = self._flow = None  # see `Workspace.engine` and `Workspace.submit`
         # see `Workspace.activate`: who put the pool of this machine aside, who is starting, one at a time

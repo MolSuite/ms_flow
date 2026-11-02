@@ -5,13 +5,37 @@ import os
 import shutil
 from pathlib import Path
 
-_LOGIN_NODE = ("this is the login node of a cluster, where nothing is to compute: send the job to a queue "
-               "(`executors.local.on_login_node` forces the pool of this machine)")
+LOGIN_NODE = ("this looks like the login node of a %s cluster: what runs here on this machine shares it with "
+              "every user of the cluster. Send the jobs to its queue: an executor of kind `queue` whose host is "
+              "`local` submits them from here")
 
 
-def _login_node() -> bool:
-    # ponytail: Slurm is the one told apart; the commands of another scheduler when a cluster has one.
-    return shutil.which("sbatch") is not None and "SLURM_JOB_ID" not in os.environ
+def _login_node() -> str:
+    """The scheduler of the cluster this is the login node of (`slurm`, `sge`), or nothing.
+
+    Slurm sets `SLURMD_NODENAME` on the node that runs a job step, so a shell of `salloc`,
+    which stays on the login node with the variables of its job, is still one.
+    """
+    if shutil.which("sbatch") and "SLURMD_NODENAME" not in os.environ:
+        return "slurm"
+    if shutil.which("qsub") and "SGE_ROOT" in os.environ and "JOB_ID" not in os.environ:
+        return "sge"
+    return ""
+
+
+def warn_login_node(log=None) -> str:
+    """Warn, once for each call, when this is the login node of a cluster; nothing is refused
+    for it. Returns the warning, or nothing."""
+    scheduler = _login_node()
+    if not scheduler:
+        return ""
+    import warnings
+
+    said = LOGIN_NODE % ("Slurm" if scheduler == "slurm" else "SGE")
+    warnings.warn(said, stacklevel=3)
+    if log is not None:
+        log.warning(said)
+    return said
 
 
 def _jobs_in_queue(address: str, workdir: str, scheduler: str) -> str:
@@ -31,13 +55,9 @@ def blocked(name: str, settings, active) -> str:
 
     A machine works for one executor at a time, and this process joins one Ray. The pool of
     this machine is not in the way of a Ray that takes this machine: it is put aside for it
-    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it, and it
-    is the only one started on the login node of a cluster: a Ray has its head there even
-    when none of its tasks run on it.
+    (see `Workspace.activate`). A queue computes nothing on its host, so it shares it.
     """
     asked = settings.executors[name]
-    if _login_node() and (asked.kind == "ray" or asked.kind == "loky" and not asked.on_login_node):
-        return _LOGIN_NODE
     for other in active:
         config = settings.executors.get(other)  # `thread` is nobody's
         if other == name or config is None or "queue" in (asked.kind, config.kind):
@@ -76,7 +96,7 @@ def _usage(row: dict) -> dict:
 
 
 def build_executor(name: str, settings, host_env=None):
-    """The executor `settings.executors[name]` describes, or None for the pool on a login node.
+    """The executor `settings.executors[name]` describes.
 
     A host with no environment named gets it from `host_env` (see `Workspace.host_env`).
     """
@@ -112,8 +132,6 @@ def build_executor(name: str, settings, host_env=None):
                               setup=config.setup, runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
                               poll_s=config.poll_seconds, shared=config.shared_disk, env=env)
-    if _login_node() and not config.on_login_node:
-        return None
     from ms_flow.engine import ProcessExecutor
 
     return ProcessExecutor(_here(hosts[0])[0])
@@ -145,17 +163,14 @@ class WorkspaceJobApiMixin:
         return self._engine
 
     def _local_back(self) -> None:
-        executor = build_executor("local", self.settings_manager.settings)
-        if executor is not None:
-            self._engine.register("local", executor)
+        self._engine.register("local", build_executor("local", self.settings_manager.settings))
 
     def _active(self) -> set[str]:
         """The executors that take jobs now. Never builds the engine: before its first use
         nothing does but the pool of this machine."""
         if self._engine is not None:
             return {name for name in self._engine._executors if name != "thread"}
-        pool = self.settings_manager.settings.executors["local"]
-        return {"local"} if pool.on_login_node or not _login_node() else set()
+        return {"local"}
 
     def executors(self) -> list[dict]:
         """One row for each executor kept: `name`, `kind`, `hosts`, `default`, and `state`:
@@ -200,10 +215,7 @@ class WorkspaceJobApiMixin:
                         raise ValueError(f"`{name}` takes this machine, and its pool has jobs that have not ended") from None
                 try:
                     host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, on_line))
-                    executor = build_executor(name, settings, host_env)
-                    if executor is None:
-                        raise RuntimeError(_LOGIN_NODE)
-                    engine.register(name, executor)
+                    engine.register(name, build_executor(name, settings, host_env))
                 except BaseException:
                     if aside:
                         self._local_back()
@@ -283,7 +295,6 @@ class WorkspaceJobApiMixin:
         if name not in self._engine._executors:
             raise RuntimeError(
                 f"the pool of this machine is aside while `{self._aside}` has it" if name == "local" and self._aside
-                else _LOGIN_NODE if name == "local" and _login_node()
                 else f"`{name}` is not active: see `Workspace.activate`")
 
     def origin(self, key: str) -> dict:

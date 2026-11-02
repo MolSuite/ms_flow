@@ -124,13 +124,14 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
     from ms_flow.remote import RemoteExecutor
 
     _home(tmp_path, monkeypatch)
-    monkeypatch.setattr(job_api, "_login_node", lambda: True)
-    ms = Workspace(app_id="role")
+    monkeypatch.setattr(job_api, "_login_node", lambda: "slurm")
+    with pytest.warns(UserWarning, match="login node of a Slurm cluster"):  # warned, and nothing refused for it
+        ms = Workspace(app_id="role")
     try:
         ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
-        with pytest.raises(RuntimeError, match="login node"):  # no pool there, and the threads are still here
-            ms.submit(_numbers)
         assert isinstance(ms.engine.executor("thread"), ThreadExecutor)
+        assert isinstance(ms.engine.executor("local"), ProcessExecutor)
+        ms.deactivate("local")
 
         # The queue of this machine, with the environment this test runs in.
         ms.save_host("local", env=sys.prefix, workdir=str(tmp_path / "far"))
@@ -147,19 +148,14 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
             ms.save_host("local", cpus=2)
         ms.deactivate("far")
         ms.save_host("local", cpus=2)
-        ms.save_executor("local", kind="loky", on_login_node=True)  # said in so many words
         ms.activate("local")
         assert isinstance(ms.engine.executor("local"), ProcessExecutor) and ms.engine.executor("local").capacity == 2
         done = ms.engine.wait(ms.submit(_numbers), 120)
         assert (done.status, done.chunks_done) == ("completed", 3)
 
-        # A Ray of this machine is not for a login node. Elsewhere the pool is aside while it runs,
-        # and back after it.
+        # The pool is aside while a Ray of this machine runs, and back after it.
         ms.save_executor("alone", kind="ray")
-        assert {row["name"]: row["state"] for row in ms.executors()}["alone"] == "blocked"
-        with pytest.raises(ValueError, match="login node"):
-            ms.activate("alone")
-        monkeypatch.setattr(job_api, "_login_node", lambda: False)
+        assert {row["name"]: row["state"] for row in ms.executors()}["alone"] == "off"
         ms.activate("alone")
         assert ms.engine.executor("alone").capacity == 2
         assert {row["name"]: row["state"] for row in ms.executors()} == {"local": "blocked", "far": "off", "alone": "on"}
@@ -330,3 +326,24 @@ def test_a_machine_joins_with_the_token_of_this_ray_through_stdin(monkeypatch):
                           capture_output=True, text=True, check=True).stdout
     words, stdin = eval(said)
     assert stdin == b"a" * 32 and "a" * 32 not in words and words.endswith('RAY_AUTH_TOKEN="$(cat)" ')
+
+
+def test_a_login_node_is_told_apart(monkeypatch):
+    from ms_flow._api_impl import job_api
+
+    there = {"sbatch"}
+    monkeypatch.setattr(job_api.shutil, "which", lambda name: name in there and f"/bin/{name}")
+    for name in ("SLURMD_NODENAME", "SGE_ROOT", "JOB_ID"):
+        monkeypatch.delenv(name, raising=False)
+    assert job_api._login_node() == "slurm"
+    monkeypatch.setenv("SLURM_JOB_ID", "7")  # a shell of `salloc` is still on the login node
+    assert job_api._login_node() == "slurm"
+    monkeypatch.setenv("SLURMD_NODENAME", "node1")
+    assert job_api._login_node() == "" and job_api.warn_login_node() == ""
+    there = {"qsub"}
+    assert job_api._login_node() == ""  # no SGE_ROOT: not an SGE cluster
+    monkeypatch.setenv("SGE_ROOT", "/opt/sge")
+    with pytest.warns(UserWarning, match="SGE"):
+        assert job_api.warn_login_node()
+    monkeypatch.setenv("JOB_ID", "3")
+    assert job_api._login_node() == ""

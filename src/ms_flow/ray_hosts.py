@@ -68,13 +68,14 @@ class RayOverHosts(RayExecutor):
         # ponytail: by hostname, so two machines that share one are shown as the first of them.
         called = {socket.gethostname(): "local"}
         for (host, _ray_there), name in zip(self._hosts, names or hosts, strict=True):
-            # ponytail: Slurm is the one told apart, as on this machine (`job_api._login_node`).
-            said = host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ] && echo @login || hostname',
-                            timeout=60).decode().strip()
-            if said == "@login":
-                raise HostError(f"{host.address} is the login node of a cluster, where nothing is to compute: "
-                                "its queue is who runs jobs there")
-            called.setdefault(said, name)
+            # ponytail: Slurm is the one told apart there (`job_api._login_node` tells SGE too); warned, not refused.
+            said = host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURMD_NODENAME" ] && echo @login; hostname',
+                            timeout=60).decode().split()
+            if said[0] == "@login":
+                said.pop(0)
+                log.warning("%s is the login node of a Slurm cluster: the Ray tasks that run there share it with "
+                            "every user of the cluster; its queue is the one to run jobs there", host.address)
+            called.setdefault(said[0], name)
         # The address of this machine as the others reach it: where their ssh session comes from.
         # ponytail: asked to the first host, so all of them have to be on one network with this machine.
         here = self._hosts[0][0].run("echo ${SSH_CLIENT%% *}", timeout=60).decode().strip()
