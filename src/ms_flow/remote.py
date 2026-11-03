@@ -37,20 +37,50 @@ log = logging.getLogger(__name__)
 
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
-# `cancel` stops the job `{id}`.
+# `cancel` stops the job `{id}`; `state` prints `CANCELLED` for the job `{id}` once it left the
+# queue because somebody canceled it (and maybe something else), nothing when that is not known.
 SCHEDULERS = {
     # Its ids are process ids, which the system gives out again: one counts only while it is this.
     "none": {"submit": "setsid nohup sh job.sh > runner.log 2>&1 < /dev/null & echo $!",
              "alive": "ps -ww -o pid=,args= -p {ids} | awk '/job.sh|ms_flow.runner/ {{print $1}}'",
-             "cancel": "ps -ww -o args= -p {id} | grep -q -e job.sh -e ms_flow.runner && kill -- -{id}"},
-    # ponytail: written from Slurm's manual and never run against a cluster.
+             "cancel": "ps -ww -o args= -p {id} | grep -q -e job.sh -e ms_flow.runner && kill -- -{id}",
+             "state": ":"},
     "slurm": {"submit": "sbatch --parsable job.sh", "alive": "squeue -h -o %i -t PD,CF,R,CG,S,RQ,RS -j {ids}",
-              "cancel": "scancel {id}"},
+              "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1"},
+    # ponytail: written from the manual of Grid Engine and never run against one.
+    "sge": {"submit": "qsub -terse -cwd -S /bin/bash job.sh", "alive": "qstat | awk 'NR > 2 {{print $1}}'",
+            "cancel": "qdel {id}", "state": "qacct -j {id} | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"}}'"},
 }
 
-# What the queue runs, in the directory of the job. A cluster's own asks the queue for what it
-# needs (`#SBATCH` lines) and starts Ray on its nodes before the last line.
+# What the queue runs, in the directory of the job: the runner with a pool of processes.
 JOB_SH = "#!/bin/sh\n@setup@\nexec @python@ -m ms_flow.runner . @runner@\n"
+
+# What a cluster's queue runs: Ray on every node of the job, one node too, and the runner on it.
+# The site's `#SBATCH` (`#$`) lines go first in `@setup@`. The Ray of each job takes the port
+# `MS_FLOW_RAY_PORT` (6379), and `MS_FLOW_RAY_IP` is the address its nodes reach the first one at
+# (by default its first one).
+# ponytail: two jobs of one account on one node take the same port; their own port in each when
+# a site shares nodes.
+_RAY_HEAD = """port=${MS_FLOW_RAY_PORT:-6379}
+ip=${MS_FLOW_RAY_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
+ip=${ip:-$(hostname -i | awk '{print $1}')}
+ray start --head --node-ip-address="$ip" --port="$port" --num-cpus="$cpus" --temp-dir="/tmp/ray_$job" \\
+    --include-dashboard=false >/dev/null
+trap 'ray stop --force >/dev/null 2>&1' EXIT
+"""
+TEMPLATES = {
+    "none": JOB_SH,
+    "slurm": "#!/bin/bash\n@setup@\nset -e\njob=$SLURM_JOB_ID cpus=${SLURM_CPUS_ON_NODE:-1} n=${SLURM_JOB_NUM_NODES:-1}\n"
+             + _RAY_HEAD +
+             'if [ "$n" -gt 1 ]; then\n'
+             '    srun --nodes=$((n - 1)) --ntasks=$((n - 1)) --exclude="$SLURMD_NODENAME" sh -c \\\n'
+             '        "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
+             'fi\n'
+             '@python@ -m ms_flow.runner . --ray "$ip:$port" --nodes "$n" @runner@\n',
+    # ponytail: one node; a parallel environment over several is the site's own template.
+    "sge": "#!/bin/bash\n@setup@\nset -e\njob=$JOB_ID cpus=${NSLOTS:-1}\n" + _RAY_HEAD
+           + '@python@ -m ms_flow.runner . --ray "$ip:$port" @runner@\n',
+}
 
 
 class _Task:
@@ -117,6 +147,9 @@ class RemoteExecutor:
     given, unless `shared` says that the other side sees the disk of this one (as it does without
     a `host`).
 
+    `keep_after` is how many days a campaign's directory stays there (see `ms_flow.campaign`)
+    once all of it came back or it was canceled: 0 removes it then.
+
     What it has there of a job with a key (see `outlives` in `ms_flow.engine.executors`) stays
     until the engine says the job ended: closing leaves it running, and the job submitted again
     with its key, from this process or another, waits for the elements that are already there
@@ -130,14 +163,16 @@ class RemoteExecutor:
     def __init__(self, host: str | None = None, *, workdir: str = "ms_flow_jobs", scheduler: str = "none",
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
-                 part_seconds: float = 30, shared: bool | None = None, env: str = ""):
+                 part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
-            setup = f'export PATH={shlex.quote(env + "/bin")}:"$PATH"\n{setup}'
+            # after the setup: a queue reads its directives (`#SBATCH ...`) only above the first command
+            setup = f'{setup}\nexport PATH={shlex.quote(env + "/bin")}:"$PATH"'
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
+        self.keep_after = keep_after
         self._inbox, self._wake, self._closed = queue.SimpleQueue(), threading.Event(), False
         # The watching thread's own: the tasks not answered, the jobs it has there, the groups of
         # the jobs with a key, and what is to be run there at the end of a round.
@@ -207,7 +242,7 @@ class RemoteExecutor:
     def remove_there(self, dir: str) -> None:
         """Take the job in `dir` (as `jobs_there` names it) out of the queue and remove what it
         has there. Not one this executor is waiting for: that is for canceling its job."""
-        if not re.fullmatch(r"[0-9a-f]+(-\d+)?", dir):
+        if not re.fullmatch(r"c?[0-9a-f]+(-\d+)?", dir):  # `c`: a campaign
             raise ValueError(f"not a directory of a job: {dir!r}")
         if dir in {queued.dir for queued in tuple(self._jobs)}:
             raise ValueError(f"{dir} belongs to a job that is running here: cancel the job")

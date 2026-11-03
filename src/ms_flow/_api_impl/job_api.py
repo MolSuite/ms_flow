@@ -122,16 +122,17 @@ def build_executor(name: str, settings, host_env=None):
                             names=[name for name in config.hosts if settings.hosts[name].address],
                             num_cpus=cpus, num_gpus=gpus)
     if config.kind == "queue":
-        from ms_flow.remote import JOB_SH, RemoteExecutor
+        from ms_flow.remote import TEMPLATES, RemoteExecutor
 
         host, env = hosts[0], hosts[0].env
         if host.address and not env and host_env is not None:
             env = host_env(host.address, lambda: _jobs_in_queue(host.address, host.workdir, config.scheduler))
         return RemoteExecutor(host.address or None, workdir=host.workdir, scheduler=config.scheduler,
-                              template=Path(config.template).read_text() if config.template else JOB_SH,
+                              template=Path(config.template).read_text() if config.template else TEMPLATES[config.scheduler],
                               setup=config.setup, runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
-                              poll_s=config.poll_seconds, shared=config.shared_disk, env=env)
+                              poll_s=config.poll_seconds, shared=config.shared_disk, env=env,
+                              keep_after=host.keep_after)
     from ms_flow.engine import ProcessExecutor
 
     return ProcessExecutor(_here(hosts[0])[0])
