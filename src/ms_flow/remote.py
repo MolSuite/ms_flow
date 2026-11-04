@@ -56,31 +56,29 @@ SCHEDULERS = {
 # What the queue runs, in the directory of the job: the runner with a pool of processes.
 JOB_SH = "#!/bin/sh\n@setup@\nexec @python@ -m ms_flow.runner . @runner@\n"
 
-# What a cluster's queue runs: Ray on every node of the job, one node too, and the runner on it.
-# The site's `#SBATCH` (`#$`) lines go first in `@setup@`. The Ray of each job takes the port
-# `MS_FLOW_RAY_PORT` (6379), and `MS_FLOW_RAY_IP` is the address its nodes reach the first one at
-# (by default its first one).
-# ponytail: two jobs of one account on one node take the same port; their own port in each when
-# a site shares nodes.
-_RAY_HEAD = """port=${MS_FLOW_RAY_PORT:-6379}
-ip=${MS_FLOW_RAY_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
-ip=${ip:-$(hostname -i | awk '{print $1}')}
-ray start --head --node-ip-address="$ip" --port="$port" --num-cpus="$cpus" --temp-dir="/tmp/ray_$job" \\
-    --include-dashboard=false >/dev/null
-trap 'ray stop --force >/dev/null 2>&1' EXIT
-"""
+# What a cluster's queue runs, on one node: the runner with a pool of processes, on the CPUs (and
+# cards) the queue gave it. On several: Ray on every node of the job and the runner on the first.
+# The site's `#SBATCH` (`#$`) lines go first in `@setup@`. The Ray of each job takes a free port
+# (`MS_FLOW_RAY_PORT` to choose one), and `MS_FLOW_RAY_IP` is the address its nodes reach the first
+# one at (by default its first one). What the job ends stops its own Ray, never another job's.
 TEMPLATES = {
     "none": JOB_SH,
     "slurm": "#!/bin/bash\n@setup@\nset -e\njob=$SLURM_JOB_ID cpus=${SLURM_CPUS_ON_NODE:-1} n=${SLURM_JOB_NUM_NODES:-1}\n"
-             + _RAY_HEAD +
-             'if [ "$n" -gt 1 ]; then\n'
-             '    srun --nodes=$((n - 1)) --ntasks=$((n - 1)) --exclude="$SLURMD_NODENAME" sh -c \\\n'
-             '        "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
-             'fi\n'
+             'if [ "$n" -le 1 ]; then exec @python@ -m ms_flow.runner . --cpus "$cpus" @runner@; fi\n'
+             "port=${MS_FLOW_RAY_PORT:-$(@python@ -c 'import socket; s = socket.socket(); s.bind((\"\", 0)); "
+             "print(s.getsockname()[1])')}\n"
+             "ip=${MS_FLOW_RAY_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}\n"
+             "ip=${ip:-$(hostname -i | awk '{print $1}')}\n"
+             # First: a Ray that started halfway is stopped too. `ray stop` would stop every Ray of the node.
+             "trap 'p=$(pgrep -d, -f \"/tmp/ray_$job/\"); [ -z \"$p\" ] || "
+             "{ pkill -KILL -P \"$p\"; pkill -KILL -f \"/tmp/ray_$job/\"; }' EXIT\n"
+             'ray start --head --node-ip-address="$ip" --port="$port" --num-cpus="$cpus" --temp-dir="/tmp/ray_$job" \\\n'
+             "    --include-dashboard=false >/dev/null\n"
+             'srun --nodes=$((n - 1)) --ntasks=$((n - 1)) --exclude="$SLURMD_NODENAME" sh -c \\\n'
+             '    "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
              '@python@ -m ms_flow.runner . --ray "$ip:$port" --nodes "$n" @runner@\n',
     # ponytail: one node; a parallel environment over several is the site's own template.
-    "sge": "#!/bin/bash\n@setup@\nset -e\njob=$JOB_ID cpus=${NSLOTS:-1}\n" + _RAY_HEAD
-           + '@python@ -m ms_flow.runner . --ray "$ip:$port" @runner@\n',
+    "sge": '#!/bin/bash\n@setup@\nexec @python@ -m ms_flow.runner . --cpus "${NSLOTS:-1}" @runner@\n',
 }
 
 

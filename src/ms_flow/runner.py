@@ -1,6 +1,6 @@
 """The far side of a remote executor: run the elements a directory holds and leave there what they gave.
 
-    python -m ms_flow.runner <dir> [--ray ADDRESS [--nodes N]] [--cpus N]
+    python -m ms_flow.runner <dir> [--ray ADDRESS [--nodes N]] [--cpus N] [--gpus N]
 
 `<dir>` is what `stage` wrote: `spec.json` (the task, by the name of its module and its own, its
 params as data, and what an element needs) and `elements.jsonl` (the payloads, a line each). The
@@ -268,7 +268,7 @@ def _tell(home: Path, **progress) -> None:
     os.replace(home / "progress.tmp", home / "progress.json")
 
 
-def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1) -> str:
+def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1, gpus: int | None = None) -> str:
     """Run the job staged in `home` to its end. Returns the status it ended with."""
     home = Path(home).resolve()
     spec = json.loads((home / "spec.json").read_text())
@@ -278,9 +278,11 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1) -
     if ray is not None and nodes > 1:
         _wait_for_nodes(ray, nodes)
     cpus = cpus or usable_cpus()
-    with Engine(cpus=cpus) as engine:
+    if gpus is None:  # the cards the queue gave this job
+        gpus = len([card for card in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if card.strip()])
+    with Engine(cpus=cpus, gpus=gpus if ray is None else 0) as engine:
         # Every node of a cluster's allocation sees its disk: Ray carries no file.
-        engine.register("run", ProcessExecutor(cpus) if ray is None else RayExecutor(ray, shared=True))
+        engine.register("run", ProcessExecutor(cpus, gpus=gpus) if ray is None else RayExecutor(ray, shared=True))
         engine.attach("journal", home / "journal.db")
         if "stages" in spec:
             return _stages(engine, home, spec)
@@ -430,6 +432,7 @@ def main(argv=None) -> int:
     parser.add_argument("--ray", help="address of a running Ray cluster, or `auto`; without it, a process pool here")
     parser.add_argument("--nodes", type=int, default=1, help="with `--ray`: how many nodes to wait for in it")
     parser.add_argument("--cpus", type=int, help="processes of the pool; by default, the CPUs this job was given")
+    parser.add_argument("--gpus", type=int, help="cards of the pool; by default, those in CUDA_VISIBLE_DEVICES")
     args = parser.parse_args(argv)
     home = Path(args.dir)
     try:
@@ -441,7 +444,7 @@ def main(argv=None) -> int:
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # what a queue sends before it kills
     try:
-        status = run(home, args.ray, args.cpus, args.nodes)
+        status = run(home, args.ray, args.cpus, args.nodes, args.gpus)
     except Exception:  # it never got to run: say so where whoever watches looks
         _tell(home, status="failed", error=traceback.format_exc())
         raise
