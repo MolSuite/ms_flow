@@ -223,7 +223,7 @@ class RemoteExecutor:
         found = {}
         for name, data in _untar(self.remote.run(
                 f"cd {self.workdir} 2>/dev/null || exit 0; f=$(ls */spec.json */record.json */queue.id "
-                "*/progress.json */failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f")).items():
+                "*/progress.json */failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f 2>/dev/null; :")).items():
             folder, _, file = name.partition("/")
             found.setdefault(folder, {})[file] = data
         ids = {folder: _job_id(has["queue.id"]) for folder, has in found.items() if has.get("queue.id", b"").strip()}
@@ -324,7 +324,7 @@ class RemoteExecutor:
         """Find the jobs an earlier run left there for this group. One command."""
         files = _untar(self.remote.run(
             f"cd {self.workdir} 2>/dev/null || exit 0; f=$(ls {group.stem}-*/record.json {group.stem}-*/queue.id "
-            f"{group.stem}-*/errors.jsonl {group.stem}-*/failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f"))
+            f"{group.stem}-*/errors.jsonl {group.stem}-*/failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f 2>/dev/null; :"))
         for name in sorted(files):
             folder, _, file = name.partition("/")
             group.n = max(group.n, int(folder.rpartition("-")[2]) + 1)
