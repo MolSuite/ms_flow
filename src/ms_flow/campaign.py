@@ -231,6 +231,9 @@ class Campaign:
     def unreachable(self) -> str | None:
         return self.remote.unreachable
 
+    def reconnect(self) -> None:
+        self.remote.reconnect()
+
     def ended(self, snapshot) -> None:
         """The job that follows it ended: a campaign canceled here is canceled there, and one
         that is all here is kept for `keep_after` days. Interrupted or failed, it is left as it is."""

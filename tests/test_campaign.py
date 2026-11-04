@@ -216,7 +216,7 @@ def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch)
         left = _outage(far, 4)
         job = flow.submit(screen, {"run_id": "a"}, executor="far", journal="j")
         _until(lambda: engine.status(job).unreachable)
-        far.reconnect()
+        engine.reconnect(job)  # through the campaign it follows
         ended = engine.wait(job, 120)
     assert ended.status == "completed_with_errors" and left == [0] and ended.unreachable is None, ended.error
     assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]

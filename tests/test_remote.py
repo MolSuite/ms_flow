@@ -246,6 +246,6 @@ def test_a_job_waits_for_a_host_that_does_not_answer_and_goes_on_once_it_does(tm
         job = engine.submit("far", workers.nap, [{"s": 0, "n": i} for i in range(3)])
         assert _until(lambda: engine.status(job).unreachable, 30)  # from the third miss on
         assert "Connection refused" in engine.status(job).unreachable
-        far.reconnect()  # not the five minutes a fifth miss would wait
+        engine.reconnect(job)  # not the five minutes a fifth miss would wait
         ended = engine.wait(job, 60)
     assert (ended.status, ended.chunks_done, ended.unreachable, left) == ("completed", 3, None, [0])

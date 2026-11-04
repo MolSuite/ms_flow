@@ -513,6 +513,15 @@ class Engine:
         elif job_id not in self._ended:
             raise KeyError(job_id)
 
+    def reconnect(self, job_id: int) -> None:
+        """Ask the other machine of the job again now, not when the wait after its last miss ends.
+        Nothing for a job that runs here or ended."""
+        job = self._jobs.get(job_id)
+        if job is None and job_id not in self._ended:
+            raise KeyError(job_id)
+        if job is not None and hasattr(job.far, "reconnect"):
+            job.far.reconnect()
+
     def close(self) -> None:
         """Interrupt what is running, let pending callbacks finish and stop the executors."""
         if self._closed:
