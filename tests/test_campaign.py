@@ -220,3 +220,40 @@ def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch)
         ended = engine.wait(job, 120)
     assert ended.status == "completed_with_errors" and left == [0] and ended.unreachable is None, ended.error
     assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
+
+
+def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatch):
+    from ms_flow import locations
+    from ms_flow.campaign import Campaign
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    (tmp_path / "p" / "in").mkdir()
+    (tmp_path / "p" / "in" / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "p" / "in" / "said.txt"))
+    sent, send = [], Campaign._send
+    monkeypatch.setattr(Campaign, "_send", lambda self, there, files, *a: (sent.extend(files), send(self, there, files, *a)))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    flow = Flow(engine, project)
+    with engine:
+        assert engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far"), 120).status == "completed_with_errors"
+        there = Path(locations.root(far, project))
+        assert (there / "in" / "said.txt").read_text() == "from here" and sent.count("in/said.txt") == 1
+        assert {row["said"] for row in GOT if row["stage"] == "vs"} == {"from here"}
+        assert list(locations.known(project, locations.host_of(far))) == ["in/said.txt"]
+
+        # another campaign of the project finds it there
+        assert engine.wait(flow.submit(screen, {"n": 5}, executor="far"), 120).status == "completed_with_errors"
+        assert sent.count("in/said.txt") == 1 and len(_dirs(tmp_path)) == 2
+
+        # gone from there (a purged scratch): reconcile says so, and the next campaign sends it again
+        (there / "in" / "said.txt").unlink()
+        assert locations.reconcile(project, far) == ["in/said.txt"]
+        assert locations.known(project, locations.host_of(far)) == {}
+        assert engine.wait(flow.submit(screen, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
+        assert sent.count("in/said.txt") == 2 and (there / "in" / "said.txt").exists()

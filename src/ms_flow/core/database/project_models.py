@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -55,6 +55,30 @@ class ProjectOperationRun(SQLModel, table=True):
     params_json: str = "{}"
     created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
     finished_at: Optional[datetime] = Field(default=None, sa_type=DateTime)
+
+
+class ProjectMeta(SQLModel, table=True):
+    """What ms_flow keeps of the project itself: `uid`, the name of its folder on other machines."""
+
+    __tablename__ = "ms_project_meta"
+
+    key: str = Field(primary_key=True)
+    value: str = ""
+
+
+class RemoteLocation(SQLModel, table=True):
+    """A file of the project that is on another machine too, at the same path under the project's
+    folder there (see `ms_flow.locations`): as it was when it was last verified there."""
+
+    __tablename__ = "ms_locations"
+    __table_args__ = (UniqueConstraint("host", "path"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    host: str = Field(index=True)  # "<address>:<work directory>", this machine's address being ""
+    path: str = ""  # in the project, with "/"
+    size: int = 0
+    sha256: str = ""
+    verified_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
 
 
 class PayloadVolume(SQLModel, table=True):
