@@ -1,5 +1,6 @@
 """Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -190,3 +191,14 @@ def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeyp
         assert again.status == "completed_with_errors", again.error
         assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
         assert _dirs(tmp_path) == [first, first[:-1] + "1"] and (tmp_path / "far" / first / "lost").exists()
+
+        # Its whole directory gone while it runs: canceled there, and a new attempt again.
+        GOT.clear()
+        slow = flow.submit(screen, {"n": 20, "nap": 0.2}, executor="far", journal="j")
+        _until(lambda: GOT)
+        [running] = set(_dirs(tmp_path)) - {first, first[:-1] + "1"}
+        shutil.rmtree(tmp_path / "far" / running)
+        ended = engine.wait(slow, 120)
+        assert ended.status == "completed_with_errors", ended.error
+        assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(20) if n != 3}
+        assert running[:-1] + "1" in _dirs(tmp_path)

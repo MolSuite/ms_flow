@@ -166,7 +166,7 @@ class Campaign:
         spec = job.__job__
         stages = list(job(params, project))
         _check(stages)
-        self.remote, self.stages, self.dir, self.n = remote, stages, None, 0
+        self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self._stop = threading.Event()
         # What the tasks over there get: the params without the volatile ones.
         volatile = spec["campaign"]
@@ -288,6 +288,7 @@ class Campaign:
             self.n = tried[-1]
             self.dir = f"{self.stem}-{self.n}"
             look = self._look(self.dir)
+            self.job = look["id"]
             if look["state"].startswith("CANCELLED") and not look["cancelled"]:  # by the queue's own command
                 self._run(f"touch {self.remote.workdir}/{self.dir}/cancelled")
                 look["cancelled"] = True
@@ -330,7 +331,7 @@ class Campaign:
         raise OSError(f"campaign {self.dir}: what was sent is not what arrived: {', '.join(wrong[:5])}")
 
     def _submit(self) -> None:
-        self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
+        self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
 
     def _follow(self):
         """Every round, one command: the progress, whether the job is in the queue, and whatever
@@ -342,7 +343,7 @@ class Campaign:
         while not self._stop.is_set():
             asked = " ".join(f"{name}:{parts[name]}" for name in streamed)
             files = _untar(self._run(
-                f"cd {self.remote.workdir}/{self.dir} || exit 1; t=.poll.$$; "
+                f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; t=.poll.$$; "
                 "cat progress.json > $t.told 2>/dev/null; id=$(cat queue.id 2>/dev/null); "
                 f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -x \"$id\"; }} > $t.alive 2>/dev/null; "
                 "echo $t.told > $t; echo $t.alive >> $t; "
@@ -371,19 +372,23 @@ class Campaign:
                     made = unplain(json.loads(files[f"stages/{name}/reduced.json"]))
                     yield {"_key": f"{self.n}:{name}:reduced", "result": made}
             # The progress was read before the parts were listed: complete, nothing is left out,
-            # unless something removed it there (a scratch purge).
-            if self._complete(told):
+            # unless something removed it there (a scratch purge). Nothing at all: no directory.
+            gone = None
+            if not files:
+                gone = "its directory is no longer there"
+            elif self._complete(told):
                 left = told.get("left", {})
                 lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
                 lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
                 if not lost and not reduced:
                     return
+                gone = "it ended there, but what it made is not all there any longer"
+            if gone:
                 if again:
-                    raise RuntimeError(f"campaign {self.dir} ended there, but what it made is not all there any "
-                                       f"longer, twice{self._kept()}")
-                log.warning("campaign %s ended there, but what it made is not all there any longer (purged?): "
-                            "it starts again as a new attempt", self.dir)
-                self._run(f"touch {self.remote.workdir}/{self.dir}/lost")
+                    raise RuntimeError(f"campaign {self.dir}: {gone}, twice{self._kept()}")
+                log.warning("campaign %s: %s (purged?): it starts again as a new attempt", self.dir, gone)
+                self._run(f"cd {self.remote.workdir}/{self.dir} 2>/dev/null && touch lost; "
+                          f"[ -z '{self.job}' ] || {{ {queue['cancel'].format(id=self.job)}; }} >/dev/null 2>&1; :")
                 self.n += 1
                 self._attempt()
                 parts, errors = dict.fromkeys(streamed, 0), dict.fromkeys(errors, 0)
@@ -414,5 +419,4 @@ class Campaign:
             self._stop.wait(self.remote.poll_s)
 
     def _kept(self) -> str:
-        return (f"\nits directory is kept: {self.remote.workdir}/{self.dir} on "
-                f"{self.remote.remote.address or 'this machine'} (see runner.log)")
+        return self.remote._said(self.dir)

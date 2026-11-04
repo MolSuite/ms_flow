@@ -34,6 +34,7 @@ from ms_flow.engine.files import Dir, File, swap
 from ms_flow.runner import part_number, read_part, stage
 
 log = logging.getLogger(__name__)
+_GONE = "MS_FLOW_GONE"  # what `_said` hears when the directory is not there
 
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
@@ -388,6 +389,21 @@ class RemoteExecutor:
         return _job_id(self.remote.run(
             f"{first} && id=$({self.queue['submit']}) && echo \"$id\" > queue.id && echo \"$id\"", data))
 
+    def _said(self, dir: str) -> str:
+        """Where the job's directory is and the last lines its queue's output and the runner wrote,
+        or that it is gone: what an error from over there ends with."""
+        where = f"{self.workdir}/{dir} on {self.remote.address or 'this machine'}"
+        try:
+            said = self.remote.run(
+                f"cd {self.workdir}/{dir} 2>/dev/null || {{ echo {_GONE}; exit 0; }}; "
+                "for f in $(ls -t slurm-*.out job.sh.[oe][0-9]* runner.log 2>/dev/null | head -n 3); do "
+                "echo \"--- $f\"; tail -n 20 \"$f\"; done; :").decode(errors="replace").strip()
+        except Exception:  # ponytail: the error it ends goes without them
+            return f"\nits directory is kept: {where}"
+        if said == _GONE:
+            return f"\nits directory {where} is no longer there (removed by a purge of the scratch?)"
+        return f"\nits directory is kept: {where}" + (f"; the last it wrote:\n{said}" if said else "")
+
     def _cancel(self, task: _Task) -> None:
         self._tasks.discard(task)
         for queued in self._jobs:
@@ -477,8 +493,7 @@ class RemoteExecutor:
             queued.id = self._queue(f"cd {self.workdir}/{queued.dir}")
         else:
             why = told.get("error") or "the job left the queue before its end, no further than when it was sent"
-            why += (f"\nits directory is kept: {self.workdir}/{queued.dir} on {self.remote.address or 'this machine'} "
-                    "(see runner.log)")
+            why += self._said(queued.dir)
             queued.over = queued.kept = True
             self._orders.append(f"touch {queued.dir}/failed;")  # so that no later run waits for it
             for index in tuple(queued.left):

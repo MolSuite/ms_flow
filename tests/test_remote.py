@@ -110,6 +110,7 @@ def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
         ended = engine.wait(engine.submit("far", workers.nap, [{"s": 0, "n": i} for i in range(3)]), 60)
     assert ended.status in ("failed", "completed_with_errors") and ended.chunks_done == 0
     assert len(list((tmp_path / "far").iterdir())) == 1  # kept, to look at its runner.log
+    assert "No module named" in ended.error and "--- runner.log" in ended.error, ended.error  # its last lines
 
 
 def _napping(engine, tmp_path, got, **options):
