@@ -419,9 +419,16 @@ class RemoteExecutor:
         self._jobs.append(queued)
 
     def _queue(self, first: str, data=b"") -> str:
+        """Queue the job of the directory `first` goes to, unless its job is in the queue already
+        (another client of the same campaign queued it): one at a time, under a lock that a client
+        killed while holding it holds for 30 s at most. Its id either way."""
         # In `$( )`: a `&` in what submits must not send what comes before it to the background too.
+        alive = self.queue["alive"].format(ids="$id")
         return _job_id(self.remote.run(
-            f"{first} && id=$({self.queue['submit']}) && echo \"$id\" > queue.id && echo \"$id\"", data))
+            f"{first} && {{ for i in $(seq 30); do mkdir .queueing 2>/dev/null && break; sleep 1; done; "
+            f"id=$(cat queue.id 2>/dev/null); if [ -n \"$id\" ] && {{ {alive}; }} 2>/dev/null | grep -qx \"$id\"; "
+            f"then echo \"$id\"; else id=$({self.queue['submit']}) && echo \"$id\" > queue.id && echo \"$id\"; fi; "
+            "s=$?; rmdir .queueing 2>/dev/null; exit $s; }", data))
 
     def _said(self, dir: str) -> str:
         """Where the job's directory is and the last lines its queue's output and the runner wrote,

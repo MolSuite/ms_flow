@@ -50,7 +50,7 @@ import traceback
 from functools import partial
 from pathlib import Path
 
-from ms_flow.engine import Engine, ProcessExecutor, RayExecutor, content_key
+from ms_flow.engine import Busy, Engine, ProcessExecutor, RayExecutor, content_key
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.tokens import usable_cpus
 from ms_flow.payloads import Payload, PayloadGroup, PayloadPart, _packed_group
@@ -445,6 +445,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))  # what a queue sends before it kills
     try:
         status = run(home, args.ray, args.cpus, args.nodes, args.gpus)
+    except Busy as busy:  # another runner has it (two clients queued it): that one says how it goes
+        print(f"nothing to do: {busy}")
+        return 0
     except Exception:  # it never got to run: say so where whoever watches looks
         _tell(home, status="failed", error=traceback.format_exc())
         raise
