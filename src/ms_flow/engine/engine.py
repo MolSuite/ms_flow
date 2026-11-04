@@ -75,14 +75,35 @@ def _called(job, payload) -> str:
 def content_key(payload) -> bytes:
     """16 bytes that identify a chunk by what it carries, the same in every run.
 
-    Equal keys mean equal payloads. The reverse is not promised: a payload built another
-    way (dict order, a set) gets another key, so on resume it is repeated, never skipped.
+    Equal keys mean equal payloads. The reverse is not promised: a payload that is not data
+    (see `_canonical`) is keyed by its pickle, and one built another way (a set) gets another
+    key, so on resume it is repeated, never skipped.
     """
     try:
-        data = pickle.dumps(payload, protocol=4)
-    except Exception:
-        return uuid.uuid4().bytes  # nothing to recognise it by in another run
+        data = json.dumps(_canonical(payload), sort_keys=True, separators=(",", ":")).encode()
+    except Exception:  # not data, or a model that does not dump
+        try:
+            data = pickle.dumps(payload, protocol=4)
+        except Exception:
+            return uuid.uuid4().bytes  # nothing to recognise it by in another run
     return hashlib.blake2b(data, digest_size=16).digest()
+
+
+def _canonical(value):
+    """`value` as JSON with its types told apart, or a `TypeError`: the same text in every
+    process, where a pickle is not (the order of a set of strings changes with each one)."""
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, str):  # File, Dir
+        return {"$" + type(value).__name__: str.__str__(value)}
+    if type(value) in (list, tuple):
+        items = [_canonical(item) for item in value]
+        return items if type(value) is list else {"$tuple": items}
+    if type(value) is dict and all(type(key) is str for key in value):
+        return {key: _canonical(item) for key, item in value.items()}
+    if hasattr(value, "model_dump"):
+        return {"$" + type(value).__qualname__: _canonical(value.model_dump(mode="json"))}
+    raise TypeError(type(value).__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +133,9 @@ class JobSnapshot:
     # machine did meanwhile, shared out among the jobs by what each held: `busy_s` (seconds of
     # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None.
     usage: dict | None = None
+    # While it runs and the other machine it waits for does not answer: since when, and what was
+    # said. It goes on by itself once that machine answers (or sooner, with its executor's `reconnect`).
+    unreachable: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +157,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
-                 "states", "executor", "usage", "held")
+                 "states", "executor", "usage", "held", "far")
 
     def used(self) -> dict:
         """`usage` up to now, with what it holds at this moment counted until now."""
@@ -153,7 +177,8 @@ class _Job:
             progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
-                           self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used())
+                           self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
+                           None if self.finished_at else getattr(self.far, "unreachable", None))
 
 
 def _busy_seconds() -> float | None:
@@ -382,6 +407,7 @@ class Engine:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
         job.executor = executor
+        job.far = chunks if hasattr(type(chunks), "unreachable") else slot.impl  # what tells of another machine
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
@@ -486,6 +512,15 @@ class Engine:
             self._events.put((self._on_stop_job, job, CANCELED))
         elif job_id not in self._ended:
             raise KeyError(job_id)
+
+    def reconnect(self, job_id: int) -> None:
+        """Ask the other machine of the job again now, not when the wait after its last miss ends.
+        Nothing for a job that runs here or ended."""
+        job = self._jobs.get(job_id)
+        if job is None and job_id not in self._ended:
+            raise KeyError(job_id)
+        if job is not None and hasattr(job.far, "reconnect"):
+            job.far.reconnect()
 
     def close(self) -> None:
         """Interrupt what is running, let pending callbacks finish and stop the executors."""

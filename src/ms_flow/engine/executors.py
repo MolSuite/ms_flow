@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import math
 import mmap
 import os
 import pickle
@@ -118,11 +119,13 @@ class ProcessExecutor:
     count against the same `capacity`.
     A worker, or that process, with nothing to do for `idle` seconds leaves, with the memory of
     what it imported, and one is started again when there is work for it; `None` keeps them all.
+    With `gpus`, a task that needs some runs with `CUDA_VISIBLE_DEVICES` set to the cards it
+    holds, of those this process sees, the least held first; it runs in a worker, never on a thread.
     """
 
     uses_tokens = threads = watches_all = True  # watching: a float in a file the worker has mapped
 
-    def __init__(self, max_workers: int, idle: float | None = 60.0):
+    def __init__(self, max_workers: int, idle: float | None = 60.0, gpus: int = 0):
         from loky.process_executor import BrokenProcessPool, ProcessPoolExecutor
 
         self.capacity = max_workers
@@ -133,15 +136,21 @@ class ProcessExecutor:
         self._slots = _Slots()
         self._idle = idle
         self._host, self._hosting = None, threading.Lock()  # the `_Host`, started with the first task for it
+        seen = os.environ.get("CUDA_VISIBLE_DEVICES", "").replace(" ", "").split(",")
+        names = [name for name in seen if name] or [str(card) for card in range(gpus)]
+        self.wants_cost, self._held, self._carding = gpus > 0, dict.fromkeys(names[:gpus], 0.0), threading.Lock()
 
     def bind(self, on_done) -> None:
         self._on_done = on_done
 
-    def submit(self, fn, payload, tag, call=None, owner=None, thread=False):
+    def submit(self, fn, payload, tag, call=None, owner=None, thread=False, cost=None):
         index = None if owner is None else self._slots.take(owner, tag)
         task = (call or _call, fn, payload)
         if index is not None:
             task = (_watched, self._slots.path, index, *task)
+        cards = self._take_cards(cost[1] if cost else 0)
+        if cards:
+            task, thread = (_on_cards, ",".join(cards), *task), False
         if thread:
             with self._hosting:
                 if self._host is None or self._host.over:
@@ -156,10 +165,27 @@ class ProcessExecutor:
             self._pool = self._new_pool()
             future = self._pool.submit(*task)
         future.add_done_callback(partial(self._finished, tag, index))
+        if cards:
+            future.add_done_callback(lambda _: self._free_cards(cards, cost[1]))
         return future
 
-    def submit_many(self, fn, payloads, tag, whole=False, owner=None, thread=False):
-        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner, thread)
+    def submit_many(self, fn, payloads, tag, whole=False, owner=None, thread=False, cost=None):
+        return self.submit(fn, payloads, tag, _call_whole if whole else _call_many, owner, thread, cost)
+
+    def _take_cards(self, gpu: float) -> list:
+        # The engine's tokens keep the sum of what is held within the cards: here, only which ones.
+        if not gpu or not self._held:
+            return []
+        with self._carding:
+            cards = sorted(self._held, key=self._held.get)[:max(1, math.ceil(gpu))]
+            for card in cards:
+                self._held[card] += gpu / len(cards)
+        return cards
+
+    def _free_cards(self, cards: list, gpu: float) -> None:
+        with self._carding:
+            for card in cards:
+                self._held[card] -= gpu / len(cards)
 
     def progress(self, owner) -> dict:
         slots = self._slots
@@ -587,6 +613,11 @@ def _watched(path, index, call, fn, payload):
 
 def _call(fn, payload):
     return fn(payload), _peak_mb()
+
+
+def _on_cards(cards, call, *task):
+    os.environ["CUDA_VISIBLE_DEVICES"] = cards  # what the programs it starts see too
+    return call(*task)
 
 
 def _apply(call, fn, payload):

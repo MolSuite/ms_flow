@@ -110,6 +110,7 @@ def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
         ended = engine.wait(engine.submit("far", workers.nap, [{"s": 0, "n": i} for i in range(3)]), 60)
     assert ended.status in ("failed", "completed_with_errors") and ended.chunks_done == 0
     assert len(list((tmp_path / "far").iterdir())) == 1  # kept, to look at its runner.log
+    assert "No module named" in ended.error and "--- runner.log" in ended.error, ended.error  # its last lines
 
 
 def _napping(engine, tmp_path, got, **options):
@@ -220,3 +221,31 @@ def test_another_machine_joins_the_ray_of_this_one_and_runs_its_share(tmp_path):
     assert seen <= {"local", host, None} and host in seen  # None: one not heard of yet
     names = {result.split(":")[0] for key, result in got}
     assert len(names) == 2 and all(result.endswith(":hello") for key, result in got)
+
+
+def _outage(far, rounds):
+    """The other machine does not answer the next `rounds` rounds of asking; `seen` is what the jobs said."""
+    from ms_env import HostError
+    run, left = far.remote.run, [rounds]
+
+    def flaky(command, data=b"", timeout=600):
+        if ".poll." in command and left[0]:
+            left[0] -= 1
+            raise HostError("ssh: connect to host far port 22: Connection refused")
+        return run(command, data, timeout)
+
+    far.remote.run = flaky
+    return left
+
+
+def test_a_job_waits_for_a_host_that_does_not_answer_and_goes_on_once_it_does(tmp_path):
+    far = _far(tmp_path)
+    left = _outage(far, 4)
+    with Engine(cpus=2) as engine:
+        engine.register("far", far)
+        job = engine.submit("far", workers.nap, [{"s": 0, "n": i} for i in range(3)])
+        assert _until(lambda: engine.status(job).unreachable, 30)  # from the third miss on
+        assert "Connection refused" in engine.status(job).unreachable
+        engine.reconnect(job)  # not the five minutes a fifth miss would wait
+        ended = engine.wait(job, 60)
+    assert (ended.status, ended.chunks_done, ended.unreachable, left) == ("completed", 3, None, [0])

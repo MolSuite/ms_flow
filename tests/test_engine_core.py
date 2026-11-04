@@ -27,6 +27,11 @@ def _echo(payload):
     return payload
 
 
+def _card(payload):
+    time.sleep(0.3)  # long enough for the two cards to be held at once
+    return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+
 def _sizes(payloads):
     """A batched function: every payload learns how many travelled with it."""
     if "short" in payloads:
@@ -416,6 +421,22 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         died = engine.wait(engine.submit("process", workers.die_on_7, payloads), 120)
         assert (died.status, died.chunks_done, died.chunks_failed) == ("completed_with_errors", 2999, 1)
         assert "worker process died" in died.error and pool.tasks < 1500 and engine.tokens.free[0] == 4
+
+
+@pytest.mark.slow
+def test_a_task_that_needs_a_card_sees_the_one_it_holds(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,7")  # what the queue gave the job
+    got = {}
+    with Engine(cpus=4, gpus=2, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(4, gpus=2))
+        for thread in (False, True):  # one on a thread goes to a worker all the same
+            got.clear()
+            snap = engine.wait(engine.submit("process", _card, list(range(6)), gpu=1, thread=thread,
+                                             on_result=got.__setitem__), 60)
+            assert snap.chunks_done == 6 and sorted(got.values()) == ["5"] * 3 + ["7"] * 3
+        got.clear()
+        engine.wait(engine.submit("process", _card, list(range(4)), gpu=0.5, on_result=got.__setitem__), 60)
+        assert sorted(got.values()) == ["5", "5", "7", "7"]
 
 
 @pytest.mark.slow

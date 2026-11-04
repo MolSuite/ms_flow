@@ -1,5 +1,7 @@
 """Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
 import os
+import shutil
+import subprocess
 import sys
 import time
 from functools import partial
@@ -151,3 +153,70 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         assert resumed.status == "completed_with_errors"
     vs = [row["n"] for row in GOT if row["stage"] == "vs"]
     assert sorted(vs) == [n for n in range(30) if n != 3] and len(GOT) > before  # each one once
+
+
+_KEYS = """
+import sys
+from {module} import Params, screen, _far
+from ms_flow.campaign import Campaign
+from ms_flow.engine import content_key
+far = Campaign(_far(__import__("pathlib").Path(sys.argv[1])), screen, Params(n=4, run_id="r"), None)
+print(far.key, content_key({{"p": Params(n=4), "f": __import__("ms_flow.engine").engine.File("x")}}).hex())
+far.close()
+"""
+
+
+def test_the_identity_is_the_same_in_every_process(tmp_path):
+    # A pickle of params is not: the order of the set of fields it holds changes with the hash seed.
+    (tmp_path / "said.txt").write_text("from here")
+    code = _KEYS.format(module=__name__)
+    env = {**os.environ, "CAMPAIGN_FILE": str(tmp_path / "said.txt"), "PYTHONPATH": os.pathsep.join(sys.path)}
+    keys = {subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, check=True,
+                           cwd=tmp_path, env={**env, "PYTHONHASHSEED": seed}).stdout
+            for seed in ("1", "2", "3")}
+    assert len(keys) == 1, keys
+
+
+def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        assert engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far", journal="j"), 120).chunks_done
+        [first] = _dirs(tmp_path)
+        for part in (tmp_path / "far" / first / "stages" / "vs" / "results").glob("part-*"):
+            part.unlink()  # what a scratch purge does to old files
+        GOT.clear()
+        again = engine.wait(flow.submit(screen, {"run_id": "b"}, executor="far", journal="j"), 120)
+        assert again.status == "completed_with_errors", again.error
+        assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
+        assert _dirs(tmp_path) == [first, first[:-1] + "1"] and (tmp_path / "far" / first / "lost").exists()
+
+        # Its whole directory gone while it runs: canceled there, and a new attempt again.
+        GOT.clear()
+        slow = flow.submit(screen, {"n": 20, "nap": 0.2}, executor="far", journal="j")
+        _until(lambda: GOT)
+        [running] = set(_dirs(tmp_path)) - {first, first[:-1] + "1"}
+        gone = tmp_path / "far" / running  # what its runner writes meanwhile may stop one rmtree
+        _until(lambda: shutil.rmtree(gone, ignore_errors=True) or not gone.exists())
+        ended = engine.wait(slow, 120)
+        assert ended.status == "completed_with_errors", ended.error
+        assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(20) if n != 3}
+        assert running[:-1] + "1" in _dirs(tmp_path)
+
+
+def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch):
+    from test_remote import _outage
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine, flow = _engine(tmp_path, far)
+    with engine:
+        left = _outage(far, 4)
+        job = flow.submit(screen, {"run_id": "a"}, executor="far", journal="j")
+        _until(lambda: engine.status(job).unreachable)
+        engine.reconnect(job)  # through the campaign it follows
+        ended = engine.wait(job, 120)
+    assert ended.status == "completed_with_errors" and left == [0] and ended.unreachable is None, ended.error
+    assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]

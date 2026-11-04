@@ -72,6 +72,7 @@ testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
     "slow: tarda segundos (benchmarks y escenarios de concurrencia). Excluir con -m 'not slow'.",
+    "lab: needs the vHPC lab (MS_FLOW_LAB=<its lab/ dir>); skipped without it. Run with -m lab.",
 ]
 # Quieten the multiprocessing fork warning emitted by process-pool benchmarks.
 filterwarnings = [

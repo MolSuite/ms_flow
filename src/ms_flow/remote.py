@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import shlex
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -31,9 +32,19 @@ from ms_env import Host, HostError
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
 from ms_flow.engine.files import Dir, File, swap
-from ms_flow.runner import read_part, stage
+from ms_flow.runner import part_number, read_part, stage
 
 log = logging.getLogger(__name__)
+_GONE = "MS_FLOW_GONE"  # what `_said` hears when the directory is not there
+# What ssh says when it did not get to the other machine, not what a command there said.
+_NOT_THERE = re.compile(r"ssh: |Connection (refused|timed out|reset|closed)|kex_exchange|Broken pipe|"
+                        r"Could not resolve|No route to host|Network is unreachable|: 255$")
+
+
+def unreachable(error: BaseException) -> bool:
+    """Whether `error` is the other machine not answering, which asking again later may mend."""
+    return isinstance(error, subprocess.TimeoutExpired) or (
+        isinstance(error, HostError) and bool(_NOT_THERE.search(str(error))))
 
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
@@ -55,31 +66,29 @@ SCHEDULERS = {
 # What the queue runs, in the directory of the job: the runner with a pool of processes.
 JOB_SH = "#!/bin/sh\n@setup@\nexec @python@ -m ms_flow.runner . @runner@\n"
 
-# What a cluster's queue runs: Ray on every node of the job, one node too, and the runner on it.
-# The site's `#SBATCH` (`#$`) lines go first in `@setup@`. The Ray of each job takes the port
-# `MS_FLOW_RAY_PORT` (6379), and `MS_FLOW_RAY_IP` is the address its nodes reach the first one at
-# (by default its first one).
-# ponytail: two jobs of one account on one node take the same port; their own port in each when
-# a site shares nodes.
-_RAY_HEAD = """port=${MS_FLOW_RAY_PORT:-6379}
-ip=${MS_FLOW_RAY_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
-ip=${ip:-$(hostname -i | awk '{print $1}')}
-ray start --head --node-ip-address="$ip" --port="$port" --num-cpus="$cpus" --temp-dir="/tmp/ray_$job" \\
-    --include-dashboard=false >/dev/null
-trap 'ray stop --force >/dev/null 2>&1' EXIT
-"""
+# What a cluster's queue runs, on one node: the runner with a pool of processes, on the CPUs (and
+# cards) the queue gave it. On several: Ray on every node of the job and the runner on the first.
+# The site's `#SBATCH` (`#$`) lines go first in `@setup@`. The Ray of each job takes a free port
+# (`MS_FLOW_RAY_PORT` to choose one), and `MS_FLOW_RAY_IP` is the address its nodes reach the first
+# one at (by default its first one). What the job ends stops its own Ray, never another job's.
 TEMPLATES = {
     "none": JOB_SH,
     "slurm": "#!/bin/bash\n@setup@\nset -e\njob=$SLURM_JOB_ID cpus=${SLURM_CPUS_ON_NODE:-1} n=${SLURM_JOB_NUM_NODES:-1}\n"
-             + _RAY_HEAD +
-             'if [ "$n" -gt 1 ]; then\n'
-             '    srun --nodes=$((n - 1)) --ntasks=$((n - 1)) --exclude="$SLURMD_NODENAME" sh -c \\\n'
-             '        "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
-             'fi\n'
+             'if [ "$n" -le 1 ]; then exec @python@ -m ms_flow.runner . --cpus "$cpus" @runner@; fi\n'
+             "port=${MS_FLOW_RAY_PORT:-$(@python@ -c 'import socket; s = socket.socket(); s.bind((\"\", 0)); "
+             "print(s.getsockname()[1])')}\n"
+             "ip=${MS_FLOW_RAY_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}\n"
+             "ip=${ip:-$(hostname -i | awk '{print $1}')}\n"
+             # First: a Ray that started halfway is stopped too. `ray stop` would stop every Ray of the node.
+             "trap 'p=$(pgrep -d, -f \"/tmp/ray_$job/\"); [ -z \"$p\" ] || "
+             "{ pkill -KILL -P \"$p\"; pkill -KILL -f \"/tmp/ray_$job/\"; }' EXIT\n"
+             'ray start --head --node-ip-address="$ip" --port="$port" --num-cpus="$cpus" --temp-dir="/tmp/ray_$job" \\\n'
+             "    --include-dashboard=false >/dev/null\n"
+             'srun --nodes=$((n - 1)) --ntasks=$((n - 1)) --exclude="$SLURMD_NODENAME" sh -c \\\n'
+             '    "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
              '@python@ -m ms_flow.runner . --ray "$ip:$port" --nodes "$n" @runner@\n',
     # ponytail: one node; a parallel environment over several is the site's own template.
-    "sge": "#!/bin/bash\n@setup@\nset -e\njob=$JOB_ID cpus=${NSLOTS:-1}\n" + _RAY_HEAD
-           + '@python@ -m ms_flow.runner . --ray "$ip:$port" @runner@\n',
+    "sge": '#!/bin/bash\n@setup@\nexec @python@ -m ms_flow.runner . --cpus "${NSLOTS:-1}" @runner@\n',
 }
 
 
@@ -163,7 +172,8 @@ class RemoteExecutor:
     def __init__(self, host: str | None = None, *, workdir: str = "ms_flow_jobs", scheduler: str = "none",
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
-                 part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7):
+                 part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
+                 poll_timeout: float = 120):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
@@ -172,7 +182,10 @@ class RemoteExecutor:
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
-        self.keep_after = keep_after
+        self.keep_after, self.poll_timeout = keep_after, poll_timeout
+        # While the other machine does not answer: since when and what was said, for whoever shows
+        # the jobs; `retries` grows with each `reconnect`.
+        self.unreachable, self.retries, self._misses, self._since = None, 0, 0, None
         self._inbox, self._wake, self._closed = queue.SimpleQueue(), threading.Event(), False
         # The watching thread's own: the tasks not answered, the jobs it has there, the groups of
         # the jobs with a key, and what is to be run there at the end of a round.
@@ -206,6 +219,25 @@ class RemoteExecutor:
         self._wake.set()
         return what
 
+    def reconnect(self) -> None:
+        """Ask the other machine again now, not when the wait after the last miss ends."""
+        self.retries += 1
+        self._wake.set()
+
+    def _reached(self, error: BaseException | None = None) -> float:
+        """After asking the other machine: how long until asking again. Each miss in a row waits
+        twice as long, up to five minutes, and from the third `unreachable` says so."""
+        if error is None:
+            if self.unreachable:
+                log.info("%s answers again", self.remote.address or "this machine")
+            self.unreachable, self._misses, self._since = None, 0, None
+            return self.poll_s
+        self._misses += 1
+        self._since = self._since or time.strftime("%H:%M")
+        if self._misses >= 3:
+            self.unreachable = f"{self.remote.address or 'this machine'} has not answered since {self._since}: {error}"
+        return min(self.poll_s * 2 ** self._misses, 300.0)
+
     def shutdown(self) -> None:
         self._closed = True
         self._wake.set()
@@ -222,7 +254,7 @@ class RemoteExecutor:
         found = {}
         for name, data in _untar(self.remote.run(
                 f"cd {self.workdir} 2>/dev/null || exit 0; f=$(ls */spec.json */record.json */queue.id "
-                "*/progress.json */failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f")).items():
+                "*/progress.json */failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f 2>/dev/null; :")).items():
             folder, _, file = name.partition("/")
             found.setdefault(folder, {})[file] = data
         ids = {folder: _job_id(has["queue.id"]) for folder, has in found.items() if has.get("queue.id", b"").strip()}
@@ -253,7 +285,7 @@ class RemoteExecutor:
     # --- The one thread that talks to the other machine --------------------------------
 
     def _watch(self) -> None:
-        due = 0.0
+        due, retries = 0.0, self.retries
         while True:
             live = [queued for queued in self._jobs if not queued.over]
             woken = self._wake.wait(max(0.0, due - time.monotonic()) if live else None)
@@ -273,11 +305,14 @@ class RemoteExecutor:
                 except Exception:
                     log.warning("could not reach %s", self.remote.address or "this machine", exc_info=True)
             live = [queued for queued in self._jobs if not queued.over]
+            if retries != self.retries:
+                due, retries = 0.0, self.retries
             if live and not closed and (time.monotonic() >= due or (woken and any(q.ending for q in live))):
-                due = time.monotonic() + self.poll_s
                 try:
                     self._poll(live)
-                except Exception:  # the network, most likely: the next round asks again
+                    due = time.monotonic() + self._reached()
+                except Exception as error:  # the network, most likely: a later round asks again
+                    due = time.monotonic() + self._reached(error)
                     log.warning("could not ask %s about its jobs", self.remote.address or "this machine", exc_info=True)
             if closed:  # what only waited for its job to leave the queue by itself waits no longer
                 for group in {queued.group for queued in self._jobs if queued.group.done}:
@@ -323,7 +358,7 @@ class RemoteExecutor:
         """Find the jobs an earlier run left there for this group. One command."""
         files = _untar(self.remote.run(
             f"cd {self.workdir} 2>/dev/null || exit 0; f=$(ls {group.stem}-*/record.json {group.stem}-*/queue.id "
-            f"{group.stem}-*/errors.jsonl {group.stem}-*/failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f"))
+            f"{group.stem}-*/errors.jsonl {group.stem}-*/failed 2>/dev/null); [ -z \"$f\" ] || tar cf - $f 2>/dev/null; :"))
         for name in sorted(files):
             folder, _, file = name.partition("/")
             group.n = max(group.n, int(folder.rpartition("-")[2]) + 1)
@@ -384,9 +419,31 @@ class RemoteExecutor:
         self._jobs.append(queued)
 
     def _queue(self, first: str, data=b"") -> str:
+        """Queue the job of the directory `first` goes to, unless its job is in the queue already
+        (another client of the same campaign queued it): one at a time, under a lock that a client
+        killed while holding it holds for 30 s at most. Its id either way."""
         # In `$( )`: a `&` in what submits must not send what comes before it to the background too.
+        alive = self.queue["alive"].format(ids="$id")
         return _job_id(self.remote.run(
-            f"{first} && id=$({self.queue['submit']}) && echo \"$id\" > queue.id && echo \"$id\"", data))
+            f"{first} && {{ for i in $(seq 30); do mkdir .queueing 2>/dev/null && break; sleep 1; done; "
+            f"id=$(cat queue.id 2>/dev/null); if [ -n \"$id\" ] && {{ {alive}; }} 2>/dev/null | grep -qx \"$id\"; "
+            f"then echo \"$id\"; else id=$({self.queue['submit']}) && echo \"$id\" > queue.id && echo \"$id\"; fi; "
+            "s=$?; rmdir .queueing 2>/dev/null; exit $s; }", data))
+
+    def _said(self, dir: str) -> str:
+        """Where the job's directory is and the last lines its queue's output and the runner wrote,
+        or that it is gone: what an error from over there ends with."""
+        where = f"{self.workdir}/{dir} on {self.remote.address or 'this machine'}"
+        try:
+            said = self.remote.run(
+                f"cd {self.workdir}/{dir} 2>/dev/null || {{ echo {_GONE}; exit 0; }}; "
+                "for f in $(ls -t slurm-*.out job.sh.[oe][0-9]* runner.log 2>/dev/null | head -n 3); do "
+                "echo \"--- $f\"; tail -n 20 \"$f\"; done; :").decode(errors="replace").strip()
+        except Exception:  # ponytail: the error it ends goes without them
+            return f"\nits directory is kept: {where}"
+        if said == _GONE:
+            return f"\nits directory {where} is no longer there (removed by a purge of the scratch?)"
+        return f"\nits directory is kept: {where}" + (f"; the last it wrote:\n{said}" if said else "")
 
     def _cancel(self, task: _Task) -> None:
         self._tasks.discard(task)
@@ -434,13 +491,15 @@ class RemoteExecutor:
         # part of results that is new. A part is listed only once it has its name, so it is whole.
         alive = self.queue["alive"].format(ids=",".join(queued.id for queued in jobs))
         asked = " ".join(f"{queued.dir}:{queued.parts}" for queued in jobs)
+        # ponytail: a round longer than `poll_timeout` is a miss, also one that was only slow (a
+        # backlog of parts after an outage on a slow link); a cap of parts per round if that shows.
         files = _untar(self.remote.run(
             f"cd {self.workdir} || exit 1; t=.poll.$$; {{ {alive}; }} > $t.alive 2>/dev/null; echo $t.alive > $t; "
             f"for a in {asked}; do d=${{a%:*}}; n=${{a#*:}}; "
             "ls $d/results 2>/dev/null | awk -v d=$d -v n=$n -F'[-.]' "
             "'/^part-/ && $2 + 0 > n {print d \"/results/\" $0}'; "
             "for f in $d/progress.json $d/errors.jsonl; do [ -f $f ] && echo $f; done; done >> $t; "
-            "tar cf - -T $t 2>/dev/null; rm -f $t $t.alive"))
+            "tar cf - -T $t 2>/dev/null; rm -f $t $t.alive", timeout=self.poll_timeout))
         in_queue = set(next(data for name, data in files.items() if name.endswith(".alive")).decode().split())
         for queued in jobs:
             self._read(queued, files, queued.id in in_queue)
@@ -456,7 +515,7 @@ class RemoteExecutor:
         for index, result in pairs:
             self._answer(queued, index, DONE, result, None)
         if parts:
-            queued.parts = max(queued.parts, int(parts[-1][-9:-4]))
+            queued.parts = max(queued.parts, part_number(parts[-1]))
         lines = files.get(f"{queued.dir}/errors.jsonl", b"").splitlines()
         for line in lines[queued.errors:]:
             row = json.loads(line)
@@ -477,8 +536,7 @@ class RemoteExecutor:
             queued.id = self._queue(f"cd {self.workdir}/{queued.dir}")
         else:
             why = told.get("error") or "the job left the queue before its end, no further than when it was sent"
-            why += (f"\nits directory is kept: {self.workdir}/{queued.dir} on {self.remote.address or 'this machine'} "
-                    "(see runner.log)")
+            why += self._said(queued.dir)
             queued.over = queued.kept = True
             self._orders.append(f"touch {queued.dir}/failed;")  # so that no later run waits for it
             for index in tuple(queued.left):
