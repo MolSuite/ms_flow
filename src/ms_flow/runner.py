@@ -2,11 +2,12 @@
 
     python -m ms_flow.runner <dir> [--ray ADDRESS [--nodes N]] [--cpus N]
 
-`<dir>` is what `stage` wrote: `fn.bin` (the function, pickled: it has to be importable here),
-`spec.json` (what an element needs) and `elements.bin` (the payloads, one pickle after another). The runner leaves in it:
+`<dir>` is what `stage` wrote: `spec.json` (the task, by the name of its module and its own, its
+params as data, and what an element needs) and `elements.jsonl` (the payloads, a line each). The
+runner leaves in it:
 
-- `results/part-00001.bin`...: `(index, result)` pickles, `index` being the place of the element
-  in `elements.bin`. A part that is there is whole and never changes.
+- `results/part-00001.jsonl`...: a line `[index, result]` each, `index` being the place of the
+  element in `elements.jsonl`. A part that is there is whole and never changes.
 - `progress.json`: `{total, done, failed, running, status, error, home, at}`.
 - `errors.jsonl`: a line `{index, error}` for each element that failed for good.
 - `journal.db`: run again on the same directory, it goes on from where it was stopped.
@@ -14,37 +15,159 @@
 A `File` in an element that is not a whole path is one that came with the job, under `<dir>`,
 and a `Dir` that is not a whole path is made under `<dir>` for the task to write in.
 
-A campaign (`stage_campaign`, see `ms_flow.campaign`) has `stages.bin` too: its stages run one
-after the other, each a job of its own in the journal, the first over `elements.bin` and each of
+A campaign (`stage_campaign`, see `ms_flow.campaign`) has its stages in `spec.json`: they run one
+after the other, each a job of its own in the journal, the first over `elements.jsonl` and each of
 the others over what its `From` makes of an earlier one, made once into
-`stages/<name>/elements.bin`. A stage leaves under `stages/<name>/` its `results/` and
-`errors.jsonl` as above, `reduced.bin` (what its `reduce` made of its results) and `done` once it
+`stages/<name>/elements.jsonl`. A stage leaves under `stages/<name>/` its `results/` and
+`errors.jsonl` as above, `reduced.json` (what its `reduce` made of its results) and `done` once it
 ended. `progress.json` says which `stage` runs and how many are done (`stages_done`).
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
 the elements run in a process pool on this machine; with it, on the Ray cluster at that address
 (`auto`: the one running on this node), which whoever wrote the job script started, once
 `--nodes` nodes are in it.
+
+Nothing that travels is a pickle: what comes back from there is read here, and a pickle read is
+code run. Functions and the class of the params go by name (`module:qualname`, found by import
+there), and everything else is data: dicts (whose keys are strings, numbers, booleans or None),
+lists, strings, numbers, booleans, None, bytes, `File`, `Dir` and the payloads of
+`ms_flow.payloads`. Anything else (an object) is refused when the job is staged, or fails its
+element when a task returns it.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import importlib
 import json
 import os
-import pickle
 import signal
 import sys
 import threading
 import time
 import traceback
+from functools import partial
 from pathlib import Path
 
 from ms_flow.engine import Engine, ProcessExecutor, RayExecutor, content_key
-from ms_flow.engine.files import Dir, swap
+from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.tokens import usable_cpus
+from ms_flow.payloads import Payload, PayloadGroup, PayloadPart, _packed_group
 
-_PYTHON = "%d.%d" % sys.version_info[:2]
+_FORMAT = 2  # what `stage` writes; 1 was pickles
 _GOING = ("waiting", "running")
+_DATA = "data (dicts, lists, strings, numbers, booleans, None, bytes, File, Dir and payloads)"
+
+
+def named(name: str):
+    """What `module:qualname` names, imported."""
+    module, _, qualname = name.partition(":")
+    found = importlib.import_module(module)
+    for part in qualname.split("."):
+        found = getattr(found, part)
+    return found
+
+
+def _name(thing) -> str:
+    name = f"{thing.__module__}:{thing.__qualname__}"
+    try:
+        same = thing.__module__ != "__main__" and named(name) is thing
+    except (ImportError, AttributeError):
+        same = False
+    if not same:
+        raise TypeError(f"{thing!r} goes by its name and is not found by it ({name}): define it at the top of a "
+                        "module the other side imports")
+    return name
+
+
+def plain(value, where: str, refs: bool = False, _groups=None):
+    """`value` as JSON holds it, `File`, `Dir`, bytes and payloads marked (a payload compressed,
+    as a pickle of it is, and a group that several parts share once). With `refs`, also functions
+    (a `partial` with its arguments) and pydantic models, by name: what this side writes for the
+    other, never what it reads from there. Not data, a `TypeError` that says `where` it is."""
+    groups = {} if _groups is None else _groups
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, File):
+        return {"$file": str.__str__(value)}
+    if isinstance(value, Dir):
+        return {"$dir": str.__str__(value)}
+    for kind in (str, int, float):  # a StrEnum, an IntEnum, a numpy float
+        if isinstance(value, kind):
+            return kind(value) if kind is not str else str.__str__(value)
+    if type(value) in (bytes, bytearray):
+        return {"$bytes": base64.b64encode(value).decode()}
+    if type(value) is Payload:
+        packed = value.packed()
+        return {"$payload": [plain(packed.data, where), packed.kind, packed.series, packed.codec, packed.raw_length]}
+    if type(value) is PayloadPart:
+        return {"$part": value.index, "of": plain(value.group, where, refs, groups)}
+    if type(value) is PayloadGroup:
+        if id(value) in groups:
+            return {"$group": groups[id(value)][0]}
+        groups[id(value)] = len(groups), value  # held: an id is not reused while this runs
+        whole, sizes = value.packed()
+        return {"$group": groups[id(value)][0], "payload": plain(whole, where), "sizes": sizes}
+    if type(value) in (list, tuple):
+        return [plain(item, f"{where}[{at}]", refs, groups) for at, item in enumerate(value)]
+    if type(value) is dict:
+        if all(type(key) is str for key in value):
+            return {key: plain(item, f"{where}.{key}", refs, groups) for key, item in value.items()}
+        odd = next((key for key in value if key is not None and type(key) not in (str, int, float, bool)), None)
+        if odd is not None:
+            raise TypeError(f"{where}: the key {odd!r} is not a string, a number, a boolean or None")
+        # JSON would make every key a string: the pairs, then.
+        return {"$items": [[key, plain(item, f"{where}[{key!r}]", refs, groups)] for key, item in value.items()]}
+    if refs and hasattr(value, "model_dump"):
+        return {"$model": _name(type(value)), "data": value.model_dump(mode="json")}
+    if refs and isinstance(value, partial):
+        return {"$call": _name(value.func), "args": plain(value.args, where, refs),
+                "kwargs": plain(value.keywords, where, refs)}
+    if refs and callable(value):
+        return {"$call": _name(value)}
+    raise TypeError(f"{where}: a {type(value).__name__} is not {_DATA}; what is not goes as a File")
+
+
+def unplain(value, refs: bool = False, _groups=None):
+    """What `plain` made, back. Names are followed only with `refs`: this side never imports
+    what came from the other."""
+    groups = {} if _groups is None else _groups
+    if type(value) is list:
+        return [unplain(item, refs, groups) for item in value]
+    if type(value) is not dict:
+        return value
+    if len(value) == 1 and "$file" in value:
+        return File(value["$file"])
+    if len(value) == 1 and "$dir" in value:
+        return Dir(value["$dir"])
+    if len(value) == 1 and "$bytes" in value:
+        return base64.b64decode(value["$bytes"])
+    if len(value) == 1 and "$payload" in value:
+        data, kind, series, codec, raw_length = value["$payload"]
+        return Payload(unplain(data), kind, series, codec, None, raw_length)
+    if len(value) == 1 and "$items" in value:
+        return {key: unplain(item, refs, groups) for key, item in value["$items"]}
+    if "$part" in value:
+        return PayloadPart(unplain(value["of"], refs, groups), value["$part"])
+    if "$group" in value:
+        if "payload" in value:
+            groups[value["$group"]] = _packed_group(unplain(value["payload"]), value["sizes"])
+        return groups[value["$group"]]
+    if refs and "$model" in value:
+        # A None is put back as it was, unchecked: the volatile params of a campaign are None
+        # whatever their type says (see `ms_flow.campaign`).
+        data = value["data"]
+        model = named(value["$model"]).model_validate({key: item for key, item in data.items() if item is not None})
+        return model.model_copy(update={key: None for key, item in data.items() if item is None})
+    if refs and "$call" in value:
+        fn = named(value["$call"])
+        args, kwargs = unplain(value.get("args", []), refs), unplain(value.get("kwargs", {}), refs)
+        return partial(fn, *args, **kwargs) if args or kwargs else fn
+    return {key: unplain(item, refs, groups) for key, item in value.items()}
+
+
+def _line(value, where: str) -> str:
+    return json.dumps(plain(value, where), sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def stage(home, fn, payloads, *, batched: bool = False, part_seconds: float = 30, **needs) -> int:
@@ -55,11 +178,11 @@ def stage(home, fn, payloads, *, batched: bool = False, part_seconds: float = 30
     """
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True)
-    total = _elements(home / "elements.bin", payloads)
-    (home / "fn.bin").write_bytes(pickle.dumps(fn))
-    spec = {"fn": repr(fn), "total": total, "batched": batched, "python": _PYTHON, "part_seconds": part_seconds,
-            "submit": needs}
-    (home / "spec.json").write_text(json.dumps(spec))
+    call = plain(fn, "the task", refs=True)
+    total = _elements(home / "elements.jsonl", payloads)
+    spec = {"format": _FORMAT, "fn": call["$call"], "call": call, "total": total, "batched": batched,
+            "part_seconds": part_seconds, "submit": needs}
+    (home / "spec.json").write_text(json.dumps(spec, sort_keys=True))
     return total
 
 
@@ -74,33 +197,39 @@ def stage_campaign(home, stages: list[dict], payloads, *, part_seconds: float = 
     """
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True)
-    total = _elements(home / "elements.bin", payloads)
-    (home / "stages.bin").write_bytes(pickle.dumps(stages))
-    (home / "spec.json").write_text(json.dumps({"fn": " > ".join(stage["name"] for stage in stages), "total": total,
-                                                "python": _PYTHON, "part_seconds": part_seconds,
-                                                "stages": [stage["name"] for stage in stages]}))
+    listed = plain(stages, "the stages", refs=True)
+    total = _elements(home / "elements.jsonl", payloads)
+    (home / "spec.json").write_text(json.dumps({"format": _FORMAT, "fn": " > ".join(stage["name"] for stage in stages),
+                                                "total": total, "part_seconds": part_seconds, "stages": listed},
+                                               sort_keys=True))
     return total
 
 
 def _elements(path: Path, payloads) -> int:
-    """Write `payloads` to `path`, one pickle after another, whole or not at all. Returns how many."""
+    """Write `payloads` to `path`, a line each, whole or not at all. Returns how many."""
     total = 0
-    with open(path.with_suffix(".tmp"), "wb") as file:
+    with open(path.with_suffix(".tmp"), "w") as file:
         for payload in payloads:
-            pickle.dump(payload, file)
+            file.write(_line(payload, f"element {total}"))
             total += 1
     os.replace(path.with_suffix(".tmp"), path)
     return total
 
 
 def read_part(file) -> list:
-    """The `(index, result)` pairs of a results file."""
+    """The `(index, result)` pairs of a results file (opened as bytes)."""
     pairs = []
-    try:
-        while True:
-            pairs.append(pickle.load(file))
-    except (EOFError, pickle.UnpicklingError):  # the end, or where a run that was killed stopped writing
-        return pairs
+    for line in file:
+        if not line.endswith(b"\n"):  # where a run that was killed stopped writing
+            break
+        index, result = json.loads(line)
+        pairs.append((index, unplain(result)))
+    return pairs
+
+
+def part_number(name: str) -> int:
+    """The number in the name of a part, `.../part-00012.jsonl`."""
+    return int(name.rpartition("-")[2].partition(".")[0])
 
 
 class _Parts:
@@ -111,17 +240,16 @@ class _Parts:
         self.folder, self.seconds, self.lock = folder, seconds, threading.Lock()
         folder.mkdir(exist_ok=True)
         self.open, self.file, self.since = folder / "open.tmp", None, 0.0
-        self.n = len(list(folder.glob("part-*.bin")))
+        self.n = len(list(folder.glob("part-*.jsonl")))
         if self.open.exists():  # a run that was killed: what it wrote is in its journal as done
             self.file = open(self.open, "ab")
             self.roll(force=True)
 
-    def write(self, pairs: list) -> None:
+    def write(self, lines: list) -> None:
         with self.lock:
             if self.file is None:
                 self.file, self.since = open(self.open, "wb"), time.monotonic()
-            for pair in pairs:
-                pickle.dump(pair, self.file)
+            self.file.write("".join(lines).encode())
             self.file.flush()
             os.fsync(self.file.fileno())
 
@@ -131,7 +259,7 @@ class _Parts:
                 self.file.close()
                 self.file = None
                 self.n += 1
-                os.replace(self.open, self.folder / f"part-{self.n:05d}.bin")
+                os.replace(self.open, self.folder / f"part-{self.n:05d}.jsonl")
 
 
 def _tell(home: Path, **progress) -> None:
@@ -143,9 +271,9 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1) -
     """Run the job staged in `home` to its end. Returns the status it ended with."""
     home = Path(home).resolve()
     spec = json.loads((home / "spec.json").read_text())
-    if spec["python"] != _PYTHON:
-        raise RuntimeError(f"staged with Python {spec['python']} and this is {_PYTHON}: what one pickles the "
-                           "other may not read")
+    if spec.get("format") != _FORMAT:
+        raise RuntimeError(f"{home} was staged by another ms_flow (format {spec.get('format', 1)}, this one reads "
+                           f"{_FORMAT}): submit the job again")
     if ray is not None and nodes > 1:
         _wait_for_nodes(ray, nodes)
     cpus = cpus or usable_cpus()
@@ -153,10 +281,10 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1) -
         # Every node of a cluster's allocation sees its disk: Ray carries no file.
         engine.register("run", ProcessExecutor(cpus) if ray is None else RayExecutor(ray, shared=True))
         engine.attach("journal", home / "journal.db")
-        if (home / "stages.bin").exists():
+        if "stages" in spec:
             return _stages(engine, home, spec)
-        fn = pickle.loads((home / "fn.bin").read_bytes())
-        return _run_job(engine, home, home, fn, home / "elements.bin", spec["total"], "job",
+        fn = unplain(spec["call"], refs=True)
+        return _run_job(engine, home, home, fn, home / "elements.jsonl", spec["total"], "job",
                         {"batched": spec["batched"], **spec["submit"]}, spec["part_seconds"])
 
 
@@ -176,16 +304,16 @@ def _wait_for_nodes(address: str, nodes: int, seconds: float = 300) -> None:
 
 
 def _stages(engine, home: Path, spec: dict) -> str:
-    stages = pickle.loads((home / "stages.bin").read_bytes())
+    stages = unplain(spec["stages"], refs=True)
     status = "completed"
     for place, step in enumerate(stages):
         folder = home / "stages" / step["name"]
         folder.mkdir(parents=True, exist_ok=True)
         if not (folder / "done").exists():
             if place == 0:
-                source, total = home / "elements.bin", spec["total"]
+                source, total = home / "elements.jsonl", spec["total"]
             else:
-                source = folder / "elements.bin"
+                source = folder / "elements.jsonl"
                 if not (folder / "elements.json").exists():
                     earlier, make, args = step["from"]
                     args = swap(args, lambda mark: type(mark)(os.path.join(home, mark)))  # sent with the campaign
@@ -198,8 +326,9 @@ def _stages(engine, home: Path, spec: dict) -> str:
             if not ended.startswith("completed"):
                 return ended
             if step["reduce"] is not None:
-                (folder / "reduced.tmp").write_bytes(pickle.dumps(step["reduce"](_results(folder))))
-                os.replace(folder / "reduced.tmp", folder / "reduced.bin")
+                made = step["reduce"](_results(folder))
+                (folder / "reduced.tmp").write_text(_line(made, f"what the reduce of {step['name']} made"))
+                os.replace(folder / "reduced.tmp", folder / "reduced.json")
             (folder / "done").touch()
         if (folder / "errors.jsonl").exists():
             status = "completed_with_errors"
@@ -215,7 +344,7 @@ def _stages(engine, home: Path, spec: dict) -> str:
 def _results(folder: Path):
     """The results a stage left, each once: a part a killed run wrote twice says it twice."""
     seen = set()
-    for part in sorted((folder / "results").glob("part-*.bin")):
+    for part in sorted((folder / "results").glob("part-*.jsonl")):
         with open(part, "rb") as file:
             for index, result in read_part(file):
                 if index not in seen:
@@ -225,9 +354,18 @@ def _results(folder: Path):
 
 def _left(folder: Path):
     """What a stage that ended left for the next: what its `reduce` made, or its results."""
-    if (folder / "reduced.bin").exists():
-        return pickle.loads((folder / "reduced.bin").read_bytes())
+    if (folder / "reduced.json").exists():
+        return unplain(json.loads((folder / "reduced.json").read_text()))
     return _results(folder)
+
+
+def _returns_data(fn, batched, payload):
+    """What `fn` returns as `plain` makes it, there where it ran: what is not data fails its
+    element, and a payload is compressed by the process that made it."""
+    result = fn(payload)
+    if batched:
+        return [plain(one, "what the task returned") for one in result]
+    return plain(result, "what the task returned")
 
 
 def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key: str, needs: dict,
@@ -242,10 +380,10 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
         return os.path.join(home, mark)
 
     def elements():
-        with open(source, "rb") as file:
+        with open(source) as file:
             for index in range(total):
                 # Plain paths from here on: whatever runs the task shares this disk.
-                payload = swap(pickle.load(file), here)
+                payload = swap(unplain(json.loads(file.readline())), here)
                 key = content_key(payload)
                 index_of[key] = index  # ponytail: equal payloads are one element, as in a journal
                 # Said, not left to the engine: it keys a dict without its per-chunk costs.
@@ -261,8 +399,9 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
               status=status, error=None if now.status in _GOING else now.error, **said)
 
     job = engine.submit(
-        "run", fn, elements(), total=total, journal="journal", key=key,
-        on_results=lambda pairs: parts.write([(index_of[key], result) for key, result in pairs]),
+        "run", partial(_returns_data, fn, needs.get("batched", False)), elements(), total=total, journal="journal",
+        key=key,
+        on_results=lambda pairs: parts.write([_line([index_of[key], result], "a result") for key, result in pairs]),
         on_error=failed, **needs)
     try:
         while True:

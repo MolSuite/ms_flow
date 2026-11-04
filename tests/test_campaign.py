@@ -1,5 +1,6 @@
 """Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
 import os
+import subprocess
 import sys
 import time
 from functools import partial
@@ -151,3 +152,25 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         assert resumed.status == "completed_with_errors"
     vs = [row["n"] for row in GOT if row["stage"] == "vs"]
     assert sorted(vs) == [n for n in range(30) if n != 3] and len(GOT) > before  # each one once
+
+
+_KEYS = """
+import sys
+from {module} import Params, screen, _far
+from ms_flow.campaign import Campaign
+from ms_flow.engine import content_key
+far = Campaign(_far(__import__("pathlib").Path(sys.argv[1])), screen, Params(n=4, run_id="r"), None)
+print(far.key, content_key({{"p": Params(n=4), "f": __import__("ms_flow.engine").engine.File("x")}}).hex())
+far.close()
+"""
+
+
+def test_the_identity_is_the_same_in_every_process(tmp_path):
+    # A pickle of params is not: the order of the set of fields it holds changes with the hash seed.
+    (tmp_path / "said.txt").write_text("from here")
+    code = _KEYS.format(module=__name__)
+    env = {**os.environ, "CAMPAIGN_FILE": str(tmp_path / "said.txt"), "PYTHONPATH": os.pathsep.join(sys.path)}
+    keys = {subprocess.run([sys.executable, "-c", code, str(tmp_path)], capture_output=True, text=True, check=True,
+                           cwd=tmp_path, env={**env, "PYTHONHASHSEED": seed}).stdout
+            for seed in ("1", "2", "3")}
+    assert len(keys) == 1, keys

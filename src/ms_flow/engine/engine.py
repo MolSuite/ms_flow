@@ -75,14 +75,35 @@ def _called(job, payload) -> str:
 def content_key(payload) -> bytes:
     """16 bytes that identify a chunk by what it carries, the same in every run.
 
-    Equal keys mean equal payloads. The reverse is not promised: a payload built another
-    way (dict order, a set) gets another key, so on resume it is repeated, never skipped.
+    Equal keys mean equal payloads. The reverse is not promised: a payload that is not data
+    (see `_canonical`) is keyed by its pickle, and one built another way (a set) gets another
+    key, so on resume it is repeated, never skipped.
     """
     try:
-        data = pickle.dumps(payload, protocol=4)
-    except Exception:
-        return uuid.uuid4().bytes  # nothing to recognise it by in another run
+        data = json.dumps(_canonical(payload), sort_keys=True, separators=(",", ":")).encode()
+    except Exception:  # not data, or a model that does not dump
+        try:
+            data = pickle.dumps(payload, protocol=4)
+        except Exception:
+            return uuid.uuid4().bytes  # nothing to recognise it by in another run
     return hashlib.blake2b(data, digest_size=16).digest()
+
+
+def _canonical(value):
+    """`value` as JSON with its types told apart, or a `TypeError`: the same text in every
+    process, where a pickle is not (the order of a set of strings changes with each one)."""
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, str):  # File, Dir
+        return {"$" + type(value).__name__: str.__str__(value)}
+    if type(value) in (list, tuple):
+        items = [_canonical(item) for item in value]
+        return items if type(value) is list else {"$tuple": items}
+    if type(value) is dict and all(type(key) is str for key in value):
+        return {key: _canonical(item) for key, item in value.items()}
+    if hasattr(value, "model_dump"):
+        return {"$" + type(value).__qualname__: _canonical(value.model_dump(mode="json"))}
+    raise TypeError(type(value).__name__)
 
 
 @dataclass(frozen=True, slots=True)

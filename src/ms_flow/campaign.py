@@ -42,7 +42,6 @@ import io
 import json
 import logging
 import os
-import pickle
 import re
 import shutil
 import tarfile
@@ -55,7 +54,7 @@ from typing import Any, Callable, Optional
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
 from ms_flow.remote import RemoteExecutor, _untar
-from ms_flow.runner import read_part, stage_campaign
+from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
 log = logging.getLogger(__name__)
 
@@ -199,7 +198,7 @@ class Campaign:
                       for place, stage in enumerate(stages)]
             stage_campaign(self._tmp, listed, (swap(payload, carry) for payload in stages[0].source),
                            part_seconds=remote.part_seconds)
-            manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "stages.bin", "elements.bin")}
+            manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "elements.jsonl")}
             manifest.update({there: there.split("/")[1] for there in carried.values()})
             (self._tmp / "manifest.sha").write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(manifest.items())))
             (self._tmp / "job.sh").write_text(remote.script)
@@ -346,7 +345,7 @@ class Campaign:
                 "echo $t.told > $t; echo $t.alive >> $t; "
                 f"for a in {asked}; do s=${{a%:*}}; n=${{a#*:}}; ls stages/$s/results 2>/dev/null | "
                 "awk -v d=stages/$s/results -v n=$n -F'[-.]' '/^part-/ && $2 + 0 > n {print d \"/\" $0}'; done >> $t; "
-                f"for f in stages/*/errors.jsonl {' '.join(f'stages/{name}/reduced.bin' for name in sorted(reduced))}; "
+                f"for f in stages/*/errors.jsonl {' '.join(f'stages/{name}/reduced.json' for name in sorted(reduced))}; "
                 "do [ -f \"$f\" ] && echo \"$f\"; done >> $t; tar cf - -T $t 2>/dev/null; rm -f $t $t.told $t.alive"))
             told = json.loads(next((data for name, data in files.items() if name.endswith(".told")), b"") or b"{}")
             alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
@@ -356,7 +355,7 @@ class Campaign:
                     for index, result in read_part(io.BytesIO(files[file])):
                         yield {"_key": f"{self.n}:{name}:{index}", "result": result}
                 if new:
-                    parts[name] = int(new[-1][-9:-4])
+                    parts[name] = part_number(new[-1])
             for stage in self.stages:
                 lines = files.get(f"stages/{stage.name}/errors.jsonl", b"").splitlines()
                 for line in lines[errors[stage.name]:]:
@@ -364,9 +363,10 @@ class Campaign:
                     yield {"_key": f"{self.n}:{stage.name}:e{row['index']}", "error": f"stage {stage.name}: {row['error']}"}
                 errors[stage.name] = len(lines)
             for name in sorted(reduced):
-                if f"stages/{name}/reduced.bin" in files:
+                if f"stages/{name}/reduced.json" in files:
                     reduced.discard(name)
-                    yield {"_key": f"{self.n}:{name}:reduced", "result": pickle.loads(files[f"stages/{name}/reduced.bin"])}
+                    made = unplain(json.loads(files[f"stages/{name}/reduced.json"]))
+                    yield {"_key": f"{self.n}:{name}:reduced", "result": made}
             # The progress was read before the parts were listed: complete, nothing is left out.
             if self._complete(told):
                 return

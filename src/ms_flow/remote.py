@@ -31,7 +31,7 @@ from ms_env import Host, HostError
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
 from ms_flow.engine.files import Dir, File, swap
-from ms_flow.runner import read_part, stage
+from ms_flow.runner import part_number, read_part, stage
 
 log = logging.getLogger(__name__)
 
@@ -456,7 +456,7 @@ class RemoteExecutor:
         for index, result in pairs:
             self._answer(queued, index, DONE, result, None)
         if parts:
-            queued.parts = max(queued.parts, int(parts[-1][-9:-4]))
+            queued.parts = max(queued.parts, part_number(parts[-1]))
         lines = files.get(f"{queued.dir}/errors.jsonl", b"").splitlines()
         for line in lines[queued.errors:]:
             row = json.loads(line)
