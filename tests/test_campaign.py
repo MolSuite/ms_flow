@@ -174,3 +174,19 @@ def test_the_identity_is_the_same_in_every_process(tmp_path):
                            cwd=tmp_path, env={**env, "PYTHONHASHSEED": seed}).stdout
             for seed in ("1", "2", "3")}
     assert len(keys) == 1, keys
+
+
+def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        assert engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far", journal="j"), 120).chunks_done
+        [first] = _dirs(tmp_path)
+        for part in (tmp_path / "far" / first / "stages" / "vs" / "results").glob("part-*"):
+            part.unlink()  # what a scratch purge does to old files
+        GOT.clear()
+        again = engine.wait(flow.submit(screen, {"run_id": "b"}, executor="far", journal="j"), 120)
+        assert again.status == "completed_with_errors", again.error
+        assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
+        assert _dirs(tmp_path) == [first, first[:-1] + "1"] and (tmp_path / "far" / first / "lost").exists()

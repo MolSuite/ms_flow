@@ -219,7 +219,7 @@ class Campaign:
         try:
             self._sweep()
             self._place()
-            self.close()  # all of it is there now
+            # What was sent stays here until the end: an attempt that lost what it made goes again.
             yield from self._follow()
         finally:
             self.close()
@@ -252,7 +252,7 @@ class Campaign:
 
     def _sweep(self) -> None:
         minutes = int(self.remote.keep_after * 1440)
-        self._run(f"cd {self.remote.workdir} 2>/dev/null || exit 0; for m in c*-*/ingested c*-*/cancelled; do "
+        self._run(f"cd {self.remote.workdir} 2>/dev/null || exit 0; for m in c*-*/ingested c*-*/cancelled c*-*/lost; do "
                   f"[ -f \"$m\" ] && [ -n \"$(find \"$m\" -mmin +{minutes})\" ] && rm -rf \"${{m%/*}}\"; done; :")
 
     def _look(self, dir: str) -> dict:
@@ -260,13 +260,13 @@ class Campaign:
         queue = self.remote.queue
         said = self._run(
             f"cd {self.remote.workdir}/{dir} 2>/dev/null || exit 0; id=$(cat queue.id 2>/dev/null); echo \"id=$id\"; "
-            "[ -f cancelled ] && echo cancelled; [ -f progress.json ] && echo \"told=$(cat progress.json)\"; "
+            "[ -f cancelled ] && echo cancelled; [ -f lost ] && echo lost; [ -f progress.json ] && echo \"told=$(cat progress.json)\"; "
             f"[ -n \"$id\" ] && {{ {{ {queue['alive'].format(ids='$id')}; }} 2>/dev/null | grep -qx \"$id\" && echo alive; "
             f"echo \"state=$({{ {queue['state'].format(id='$id')}; }} 2>/dev/null)\"; }}; :").decode()
-        look = {"id": "", "told": {}, "cancelled": False, "alive": False, "state": ""}
+        look = {"id": "", "told": {}, "cancelled": False, "lost": False, "alive": False, "state": ""}
         for line in said.splitlines():
             name, _, value = line.partition("=")
-            if name in ("cancelled", "alive"):
+            if name in ("cancelled", "lost", "alive"):
                 look[name] = True
             elif name == "told":
                 try:
@@ -292,7 +292,7 @@ class Campaign:
                 self._run(f"touch {self.remote.workdir}/{self.dir}/cancelled")
                 look["cancelled"] = True
             # ponytail: one whose runner failed (its code, not its allocation) starts afresh too.
-            fresh = look["cancelled"] or look["told"].get("status") == "failed"
+            fresh = look["cancelled"] or look["lost"] or look["told"].get("status") == "failed"
             if not fresh:
                 if look["alive"] or self._complete(look["told"]):
                     return
@@ -300,6 +300,9 @@ class Campaign:
                 self._submit()
                 return
             self.n += 1
+        self._attempt()
+
+    def _attempt(self) -> None:
         self.dir = f"{self.stem}-{self.n}"
         self._upload(list(self._local), make=True)
         self._fill()
@@ -335,7 +338,7 @@ class Campaign:
         streamed = [stage.name for stage in self.stages if stage.deliver == "stream"]
         reduced = {stage.name for stage in self.stages if stage.deliver == "reduced"}
         parts, errors = dict.fromkeys(streamed, 0), {stage.name: 0 for stage in self.stages}
-        queue, ending, was = self.remote.queue, False, None
+        queue, ending, was, again = self.remote.queue, False, None, False
         while not self._stop.is_set():
             asked = " ".join(f"{name}:{parts[name]}" for name in streamed)
             files = _untar(self._run(
@@ -367,9 +370,26 @@ class Campaign:
                     reduced.discard(name)
                     made = unplain(json.loads(files[f"stages/{name}/reduced.json"]))
                     yield {"_key": f"{self.n}:{name}:reduced", "result": made}
-            # The progress was read before the parts were listed: complete, nothing is left out.
+            # The progress was read before the parts were listed: complete, nothing is left out,
+            # unless something removed it there (a scratch purge).
             if self._complete(told):
-                return
+                left = told.get("left", {})
+                lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
+                lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
+                if not lost and not reduced:
+                    return
+                if again:
+                    raise RuntimeError(f"campaign {self.dir} ended there, but what it made is not all there any "
+                                       f"longer, twice{self._kept()}")
+                log.warning("campaign %s ended there, but what it made is not all there any longer (purged?): "
+                            "it starts again as a new attempt", self.dir)
+                self._run(f"touch {self.remote.workdir}/{self.dir}/lost")
+                self.n += 1
+                self._attempt()
+                parts, errors = dict.fromkeys(streamed, 0), dict.fromkeys(errors, 0)
+                reduced = {stage.name for stage in self.stages if stage.deliver == "reduced"}
+                again, ending, was = True, False, None
+                continue
             if told.get("status") == "failed":
                 raise RuntimeError(f"campaign {self.dir} failed there: {told.get('error')}{self._kept()}")
             if alive:

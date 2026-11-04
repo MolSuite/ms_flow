@@ -20,7 +20,8 @@ after the other, each a job of its own in the journal, the first over `elements.
 the others over what its `From` makes of an earlier one, made once into
 `stages/<name>/elements.jsonl`. A stage leaves under `stages/<name>/` its `results/` and
 `errors.jsonl` as above, `reduced.json` (what its `reduce` made of its results) and `done` once it
-ended. `progress.json` says which `stage` runs and how many are done (`stages_done`).
+ended, which says how many parts and lines of errors it left. `progress.json` says which `stage`
+runs and how many are done (`stages_done`), and at the end what each left (`left`).
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
 the elements run in a process pool on this machine; with it, on the Ray cluster at that address
@@ -329,7 +330,11 @@ def _stages(engine, home: Path, spec: dict) -> str:
                 made = step["reduce"](_results(folder))
                 (folder / "reduced.tmp").write_text(_line(made, f"what the reduce of {step['name']} made"))
                 os.replace(folder / "reduced.tmp", folder / "reduced.json")
-            (folder / "done").touch()
+            # What it left, for whoever takes it to see that all of it came (and nothing was purged).
+            errors = folder / "errors.jsonl"
+            (folder / "done").write_text(json.dumps({
+                "parts": len(list((folder / "results").glob("part-*.jsonl"))),
+                "errors": len(errors.read_text().splitlines()) if errors.exists() else 0}))
         if (folder / "errors.jsonl").exists():
             status = "completed_with_errors"
     try:
@@ -337,7 +342,8 @@ def _stages(engine, home: Path, spec: dict) -> str:
     except (OSError, ValueError):
         told = {}
     told.pop("home", None), told.pop("at", None)
-    _tell(home, **{**told, "status": status, "stage": None, "stages_done": len(stages), "running": 0})
+    left = {step["name"]: json.loads((home / "stages" / step["name"] / "done").read_text()) for step in stages}
+    _tell(home, **{**told, "status": status, "stage": None, "stages_done": len(stages), "running": 0, "left": left})
     return status
 
 
