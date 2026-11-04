@@ -197,8 +197,26 @@ def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeyp
         slow = flow.submit(screen, {"n": 20, "nap": 0.2}, executor="far", journal="j")
         _until(lambda: GOT)
         [running] = set(_dirs(tmp_path)) - {first, first[:-1] + "1"}
-        shutil.rmtree(tmp_path / "far" / running)
+        gone = tmp_path / "far" / running  # what its runner writes meanwhile may stop one rmtree
+        _until(lambda: shutil.rmtree(gone, ignore_errors=True) or not gone.exists())
         ended = engine.wait(slow, 120)
         assert ended.status == "completed_with_errors", ended.error
         assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(20) if n != 3}
         assert running[:-1] + "1" in _dirs(tmp_path)
+
+
+def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch):
+    from test_remote import _outage
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine, flow = _engine(tmp_path, far)
+    with engine:
+        left = _outage(far, 4)
+        job = flow.submit(screen, {"run_id": "a"}, executor="far", journal="j")
+        _until(lambda: engine.status(job).unreachable)
+        far.reconnect()
+        ended = engine.wait(job, 120)
+    assert ended.status == "completed_with_errors" and left == [0] and ended.unreachable is None, ended.error
+    assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]

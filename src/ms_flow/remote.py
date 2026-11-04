@@ -18,6 +18,7 @@ import os
 import queue
 import re
 import shlex
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -35,6 +36,15 @@ from ms_flow.runner import part_number, read_part, stage
 
 log = logging.getLogger(__name__)
 _GONE = "MS_FLOW_GONE"  # what `_said` hears when the directory is not there
+# What ssh says when it did not get to the other machine, not what a command there said.
+_NOT_THERE = re.compile(r"ssh: |Connection (refused|timed out|reset|closed)|kex_exchange|Broken pipe|"
+                        r"Could not resolve|No route to host|Network is unreachable|: 255$")
+
+
+def unreachable(error: BaseException) -> bool:
+    """Whether `error` is the other machine not answering, which asking again later may mend."""
+    return isinstance(error, subprocess.TimeoutExpired) or (
+        isinstance(error, HostError) and bool(_NOT_THERE.search(str(error))))
 
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
@@ -162,7 +172,8 @@ class RemoteExecutor:
     def __init__(self, host: str | None = None, *, workdir: str = "ms_flow_jobs", scheduler: str = "none",
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
-                 part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7):
+                 part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
+                 poll_timeout: float = 120):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
@@ -171,7 +182,10 @@ class RemoteExecutor:
         self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
-        self.keep_after = keep_after
+        self.keep_after, self.poll_timeout = keep_after, poll_timeout
+        # While the other machine does not answer: since when and what was said, for whoever shows
+        # the jobs; `retries` grows with each `reconnect`.
+        self.unreachable, self.retries, self._misses, self._since = None, 0, 0, None
         self._inbox, self._wake, self._closed = queue.SimpleQueue(), threading.Event(), False
         # The watching thread's own: the tasks not answered, the jobs it has there, the groups of
         # the jobs with a key, and what is to be run there at the end of a round.
@@ -204,6 +218,25 @@ class RemoteExecutor:
         self._inbox.put(what)
         self._wake.set()
         return what
+
+    def reconnect(self) -> None:
+        """Ask the other machine again now, not when the wait after the last miss ends."""
+        self.retries += 1
+        self._wake.set()
+
+    def _reached(self, error: BaseException | None = None) -> float:
+        """After asking the other machine: how long until asking again. Each miss in a row waits
+        twice as long, up to five minutes, and from the third `unreachable` says so."""
+        if error is None:
+            if self.unreachable:
+                log.info("%s answers again", self.remote.address or "this machine")
+            self.unreachable, self._misses, self._since = None, 0, None
+            return self.poll_s
+        self._misses += 1
+        self._since = self._since or time.strftime("%H:%M")
+        if self._misses >= 3:
+            self.unreachable = f"{self.remote.address or 'this machine'} has not answered since {self._since}: {error}"
+        return min(self.poll_s * 2 ** self._misses, 300.0)
 
     def shutdown(self) -> None:
         self._closed = True
@@ -252,7 +285,7 @@ class RemoteExecutor:
     # --- The one thread that talks to the other machine --------------------------------
 
     def _watch(self) -> None:
-        due = 0.0
+        due, retries = 0.0, self.retries
         while True:
             live = [queued for queued in self._jobs if not queued.over]
             woken = self._wake.wait(max(0.0, due - time.monotonic()) if live else None)
@@ -272,11 +305,14 @@ class RemoteExecutor:
                 except Exception:
                     log.warning("could not reach %s", self.remote.address or "this machine", exc_info=True)
             live = [queued for queued in self._jobs if not queued.over]
+            if retries != self.retries:
+                due, retries = 0.0, self.retries
             if live and not closed and (time.monotonic() >= due or (woken and any(q.ending for q in live))):
-                due = time.monotonic() + self.poll_s
                 try:
                     self._poll(live)
-                except Exception:  # the network, most likely: the next round asks again
+                    due = time.monotonic() + self._reached()
+                except Exception as error:  # the network, most likely: a later round asks again
+                    due = time.monotonic() + self._reached(error)
                     log.warning("could not ask %s about its jobs", self.remote.address or "this machine", exc_info=True)
             if closed:  # what only waited for its job to leave the queue by itself waits no longer
                 for group in {queued.group for queued in self._jobs if queued.group.done}:
@@ -448,13 +484,15 @@ class RemoteExecutor:
         # part of results that is new. A part is listed only once it has its name, so it is whole.
         alive = self.queue["alive"].format(ids=",".join(queued.id for queued in jobs))
         asked = " ".join(f"{queued.dir}:{queued.parts}" for queued in jobs)
+        # ponytail: a round longer than `poll_timeout` is a miss, also one that was only slow (a
+        # backlog of parts after an outage on a slow link); a cap of parts per round if that shows.
         files = _untar(self.remote.run(
             f"cd {self.workdir} || exit 1; t=.poll.$$; {{ {alive}; }} > $t.alive 2>/dev/null; echo $t.alive > $t; "
             f"for a in {asked}; do d=${{a%:*}}; n=${{a#*:}}; "
             "ls $d/results 2>/dev/null | awk -v d=$d -v n=$n -F'[-.]' "
             "'/^part-/ && $2 + 0 > n {print d \"/results/\" $0}'; "
             "for f in $d/progress.json $d/errors.jsonl; do [ -f $f ] && echo $f; done; done >> $t; "
-            "tar cf - -T $t 2>/dev/null; rm -f $t $t.alive"))
+            "tar cf - -T $t 2>/dev/null; rm -f $t $t.alive", timeout=self.poll_timeout))
         in_queue = set(next(data for name, data in files.items() if name.endswith(".alive")).decode().split())
         for queued in jobs:
             self._read(queued, files, queued.id in in_queue)

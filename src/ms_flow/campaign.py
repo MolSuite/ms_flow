@@ -47,13 +47,14 @@ import shutil
 import tarfile
 import tempfile
 import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
-from ms_flow.remote import RemoteExecutor, _untar
+from ms_flow.remote import RemoteExecutor, _untar, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
 log = logging.getLogger(__name__)
@@ -217,8 +218,7 @@ class Campaign:
 
     def __iter__(self):
         try:
-            self._sweep()
-            self._place()
+            self._patiently(lambda: (self._sweep(), self._place()))  # finding it there again does not repeat it
             # What was sent stays here until the end: an attempt that lost what it made goes again.
             yield from self._follow()
         finally:
@@ -226,6 +226,10 @@ class Campaign:
 
     def close(self) -> None:
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    @property
+    def unreachable(self) -> str | None:
+        return self.remote.unreachable
 
     def ended(self, snapshot) -> None:
         """The job that follows it ended: a campaign canceled here is canceled there, and one
@@ -247,8 +251,27 @@ class Campaign:
 
     # --- Over there ----------------------------------------------------------------------
 
-    def _run(self, command: str, data=b"") -> bytes:
-        return self.remote.remote.run(command, data)
+    def _run(self, command: str, data=b"", timeout: float = 600) -> bytes:
+        return self.remote.remote.run(command, data, timeout)
+
+    def _patiently(self, ask):
+        """What `ask()` gives, asked again while the other machine does not answer (see
+        `RemoteExecutor.unreachable`); any other error, or one when this campaign ended, is raised."""
+        while True:
+            try:
+                made = ask()
+            except Exception as error:
+                if not unreachable(error):
+                    raise
+                log.warning("campaign %s: %s does not answer: %s", self.dir, self.remote.remote.address or "this machine", error)
+                wait, retries = time.monotonic() + self.remote._reached(error), self.remote.retries
+                while time.monotonic() < wait and retries == self.remote.retries and not self._stop.is_set():
+                    self._stop.wait(1)
+                if self._stop.is_set():
+                    raise
+                continue
+            self.remote._reached()
+            return made
 
     def _sweep(self) -> None:
         minutes = int(self.remote.keep_after * 1440)
@@ -342,7 +365,7 @@ class Campaign:
         queue, ending, was, again = self.remote.queue, False, None, False
         while not self._stop.is_set():
             asked = " ".join(f"{name}:{parts[name]}" for name in streamed)
-            files = _untar(self._run(
+            command = (
                 f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; t=.poll.$$; "
                 "cat progress.json > $t.told 2>/dev/null; id=$(cat queue.id 2>/dev/null); "
                 f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -x \"$id\"; }} > $t.alive 2>/dev/null; "
@@ -350,7 +373,8 @@ class Campaign:
                 f"for a in {asked}; do s=${{a%:*}}; n=${{a#*:}}; ls stages/$s/results 2>/dev/null | "
                 "awk -v d=stages/$s/results -v n=$n -F'[-.]' '/^part-/ && $2 + 0 > n {print d \"/\" $0}'; done >> $t; "
                 f"for f in stages/*/errors.jsonl {' '.join(f'stages/{name}/reduced.json' for name in sorted(reduced))}; "
-                "do [ -f \"$f\" ] && echo \"$f\"; done >> $t; tar cf - -T $t 2>/dev/null; rm -f $t $t.told $t.alive"))
+                "do [ -f \"$f\" ] && echo \"$f\"; done >> $t; tar cf - -T $t 2>/dev/null; rm -f $t $t.told $t.alive")
+            files = self._patiently(lambda: _untar(self._run(command, timeout=self.remote.poll_timeout)))
             told = json.loads(next((data for name, data in files.items() if name.endswith(".told")), b"") or b"{}")
             alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
             for name in streamed:
@@ -403,7 +427,7 @@ class Campaign:
                 ending = True
                 continue
             else:
-                state = self._look(self.dir)["state"]
+                state = self._patiently(lambda: self._look(self.dir))["state"]
                 if state.startswith("CANCELLED"):
                     self._run(f"touch {self.remote.workdir}/{self.dir}/cancelled")
                     raise RuntimeError(f"campaign {self.dir} was canceled in the queue{self._kept()}")

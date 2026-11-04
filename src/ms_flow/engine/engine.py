@@ -133,6 +133,9 @@ class JobSnapshot:
     # machine did meanwhile, shared out among the jobs by what each held: `busy_s` (seconds of
     # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None.
     usage: dict | None = None
+    # While it runs and the other machine it waits for does not answer: since when, and what was
+    # said. It goes on by itself once that machine answers (or sooner, with its executor's `reconnect`).
+    unreachable: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +157,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
-                 "states", "executor", "usage", "held")
+                 "states", "executor", "usage", "held", "far")
 
     def used(self) -> dict:
         """`usage` up to now, with what it holds at this moment counted until now."""
@@ -174,7 +177,8 @@ class _Job:
             progress = min(1.0, (self.done + self.failed + running) / total) if total else 1.0
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
-                           self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used())
+                           self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
+                           None if self.finished_at else getattr(self.far, "unreachable", None))
 
 
 def _busy_seconds() -> float | None:
@@ -403,6 +407,7 @@ class Engine:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
         job.executor = executor
+        job.far = chunks if hasattr(type(chunks), "unreachable") else slot.impl  # what tells of another machine
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
