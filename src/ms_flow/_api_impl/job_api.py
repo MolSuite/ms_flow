@@ -123,15 +123,15 @@ def build_executor(name: str, settings, host_env=None):
                             num_cpus=cpus, num_gpus=gpus)
     if config.kind == "queue":
         from ms_flow.remote import TEMPLATES, RemoteExecutor
-        from ms_flow.site_script import RESOURCES, directives
+        from ms_flow.site_script import RESOURCES
 
         host, env = hosts[0], hosts[0].env
         if host.address and not env and host_env is not None:
             env = host_env(host.address, lambda: _jobs_in_queue(host.address, host.workdir, config.scheduler))
         return RemoteExecutor(host.address or None, workdir=host.workdir, scheduler=config.scheduler,
                               template=Path(config.template).read_text() if config.template else TEMPLATES[config.scheduler],
-                              setup=directives(config.scheduler, modules=config.modules, setup=config.setup,
-                                               **{field: getattr(config, field) for field in RESOURCES}),
+                              setup=config.setup, asks={"modules": config.modules,
+                                                        **{field: getattr(config, field) for field in RESOURCES}},
                               runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
                               poll_s=config.poll_seconds, shared=config.shared_disk, env=env,

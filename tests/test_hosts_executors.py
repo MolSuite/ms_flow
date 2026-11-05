@@ -207,7 +207,8 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     assert (built("slurm").host, built("slurm").said["workdir"], built("slurm").said["env"]) == ("login", "scratch/jobs", "/envs/login")
     assert built("slurm", None).said["env"] == ""  # no app behind: the `python` of that account
     assert built("slurm2").said["env"] == "/mine"
-    assert built("slurm2").said["setup"] == "#SBATCH --cpus-per-task=8\nmodule load gcc\nexport A=1"  # asked, then its own
+    said = built("slurm2").said
+    assert said["setup"] == "export A=1" and said["asks"]["cpus"] == 8 and said["asks"]["modules"] == ["load gcc"]
     assert built("alone") == (None, {"num_cpus": 6, "num_gpus": 1})  # a Ray of this machine alone
     assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"],
                             {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)], "names": ["pc2", "pc3"]})  # each host gives its share

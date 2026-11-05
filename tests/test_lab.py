@@ -24,7 +24,6 @@ pytestmark = [pytest.mark.lab, pytest.mark.skipif(not LAB, reason="no vHPC lab: 
 from ms_env import Host, HostError  # noqa: E402
 from ms_flow.engine import Engine, Flow, ThreadExecutor  # noqa: E402
 from ms_flow.remote import TEMPLATES, RemoteExecutor  # noqa: E402
-from ms_flow.site_script import directives  # noqa: E402
 
 import lab_tasks  # noqa: E402
 
@@ -94,9 +93,8 @@ def far(setup="", **resources):
     """The lab's queue, asking for `resources` (one node with two CPUs by default) as a queue executor's fields do."""
     ex = RemoteExecutor(ADDR, workdir=FAR, scheduler="slurm", template=TEMPLATES["slurm"], env="/opt/venv",
                         poll_s=2, part_seconds=1, keep_after=7,
-                        setup=directives("slurm", **(resources or {"nodes": 1, "cpus": 2}),
-                                         setup=f"#SBATCH --no-requeue\n{setup}\n"
-                                               f"export PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks"))
+                        asks=resources or {"nodes": 1, "cpus": 2},
+                        setup=f"#SBATCH --no-requeue\n{setup}\nexport PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks")
     ex.remote = Faulty(ADDR, ssh=SSH)
     return ex
 
@@ -109,9 +107,9 @@ def lab_engine(tmp, ex):
     return engine
 
 
-def run(params, tmp, ex=None, seconds=600, during=None):
+def run(params, tmp, ex=None, seconds=600, during=None, **options):
     with lab_engine(tmp, ex or far()) as engine:
-        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j")
+        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j", **options)
         if during:
             threading.Thread(target=during, args=(engine, job), daemon=True).start()
         return engine.wait(job, seconds)
@@ -136,6 +134,13 @@ def test_a_campaign_runs_there(request, said):
     assert run(params(request), said).status == "completed"
     assert got() == list(range(8))
     assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
+
+
+def test_a_campaign_asks_the_queue_for_itself(request, said):
+    ex = far()
+    assert run(params(request), said, ex, resources={"cpus": 1, "time": "0:17:00"}).status == "completed"
+    asked = ex.remote.run(f"grep -l -- --time=0:17:00 {FAR}/c*/job.sh | xargs grep -c -- --cpus-per-task=1").decode()
+    assert asked.split() == ["1"]
 
 
 @pytest.mark.parametrize("pattern, nth, action", [

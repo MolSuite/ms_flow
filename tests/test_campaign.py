@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from ms_flow.campaign import From, Stage, campaign
+from ms_flow.campaign import Campaign, From, Stage, campaign
 from ms_flow.engine import Dir, Engine, File, Flow, ThreadExecutor, task
 from ms_flow.remote import RemoteExecutor
 
@@ -175,6 +175,26 @@ def test_the_identity_is_the_same_in_every_process(tmp_path):
                            cwd=tmp_path, env={**env, "PYTHONHASHSEED": seed}).stdout
             for seed in ("1", "2", "3")}
     assert len(keys) == 1, keys
+
+
+def test_a_campaign_asks_the_queue_for_itself_and_stays_the_same_campaign(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    far = RemoteExecutor(workdir=str(tmp_path / "far"), scheduler="slurm", setup="#SBATCH --qos=low\nexport A=1",
+                         asks={"partition": "short", "cpus": 4, "modules": ["load gcc"]})
+    try:
+        plain = Campaign(far, screen, Params(n=2), None)
+        more = Campaign(far, screen, Params(n=2), None, {"cpus": 16, "time": "2:00:00"})
+        assert plain.key == more.key
+        script = (more._tmp / "job.sh").read_text()
+        assert "#SBATCH --partition=short\n#SBATCH --cpus-per-task=16\n#SBATCH --time=2:00:00\n#SBATCH --qos=low\n" \
+               "module load gcc\nexport A=1\n" in script
+        assert "--cpus-per-task=4" in (plain._tmp / "job.sh").read_text()
+        plain.close(), more.close()
+        with pytest.raises(ValueError, match="queue"):
+            far.script_for({"queue": "x"})
+    finally:
+        far.shutdown()
 
 
 def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeypatch):

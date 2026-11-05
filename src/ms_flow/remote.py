@@ -156,6 +156,10 @@ class RemoteExecutor:
     given, unless `shared` says that the other side sees the disk of this one (as it does without
     a `host`).
 
+    `asks` is what each job asks of the queue: the fields of `ms_flow.site_script.RESOURCES` and
+    `modules`, written as `#SBATCH` lines above `setup` (see `site_script.directives`); a campaign
+    may ask otherwise for itself (`script`).
+
     `keep_after` is how many days a campaign's directory stays there (see `ms_flow.campaign`)
     once all of it came back or it was canceled: 0 removes it then.
 
@@ -173,13 +177,15 @@ class RemoteExecutor:
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
-                 poll_timeout: float = 120):
+                 poll_timeout: float = 120, asks: dict | None = None):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
             # after the setup: a queue reads its directives (`#SBATCH ...`) only above the first command
             setup = f'{setup}\nexport PATH={shlex.quote(env + "/bin")}:"$PATH"'
-        self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
+        self._script = (scheduler, template.replace("@python@", python).replace("@runner@", runner), setup)
+        self.asks = dict(asks or {})
+        self.script = self.script_for()
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
         self.keep_after, self.poll_timeout = keep_after, poll_timeout
@@ -192,6 +198,16 @@ class RemoteExecutor:
         self._tasks, self._jobs, self._groups, self._orders = set(), [], {}, []
         self._thread = threading.Thread(target=self._watch, name="msflow-remote", daemon=True)
         self._thread.start()
+
+    def script_for(self, asks: dict | None = None) -> str:
+        """The script of a job that asks the queue for `asks` instead of what the executor asks."""
+        from ms_flow.site_script import RESOURCES, directives
+
+        wrong = set(asks or ()) - {*RESOURCES, "modules"}
+        if wrong:
+            raise ValueError(f"not something a job asks of the queue: {', '.join(sorted(wrong))}")
+        scheduler, template, setup = self._script
+        return template.replace("@setup@", directives(scheduler, setup=setup, **{**self.asks, **(asks or {})}))
 
     # --- What the engine calls: nothing here waits for the other machine ---------------
 

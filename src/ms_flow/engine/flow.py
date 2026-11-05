@@ -265,7 +265,8 @@ def _origin(job, params, options: dict):
         if named(where) is not job:
             return None
         params = params.model_dump(mode="json") if hasattr(params, "model_dump") else params
-        kept = {name: value for name, value in options.items() if isinstance(value, (bool, int, float, str))}
+        kept = {name: value for name, value in options.items()
+                if isinstance(value, (bool, int, float, str)) or (name == "resources" and value)}
         return json.loads(json.dumps({"job": where, "params": params, "options": kept}))
     except Exception:
         return None
@@ -280,9 +281,11 @@ class Flow:
         self._lock = threading.Lock()
 
     def submit(self, job, params=None, *, executor: str = "process", batch: int | None = None,
-               cpu: float | None = None, thread: bool | None = None, after=(), on_terminal=None, **engine) -> int:
+               cpu: float | None = None, thread: bool | None = None, after=(), on_terminal=None,
+               resources: dict | None = None, **engine) -> int:
         """Start `job` and return its id. `batch`, `cpu` and `thread` override the task's; `after`
-        adds jobs to wait for.
+        adds jobs to wait for. `resources` is what the jobs of a campaign ask of the queue, instead
+        of what its executor asks: `partition`, `cpus`, `time`... (see `ms_flow.site_script`).
 
         What else `Engine.submit` takes (`key`, `journal`, `priority`, `total`...) passes through.
         The sink is written on the engine's delivery thread, one transaction for each group of
@@ -301,10 +304,12 @@ class Flow:
         if "campaign" in spec:
             from ms_flow.campaign import prepare
 
-            far, running = prepare(self.engine, job, params, executor, self.project, engine.get("journal"))
+            far, running = prepare(self.engine, job, params, executor, self.project, engine.get("journal"), resources)
             if running is not None:
                 return running
             engine["key"], executor = far.key, "thread"
+        elif resources:
+            raise ValueError(f"`{spec['name']}` is not a campaign: only a campaign asks the queue for resources")
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)
@@ -312,7 +317,8 @@ class Flow:
                  "thread": fn.__task__.get("thread", False) if thread is None else thread}
         if engine.get("journal") is not None:
             engine["key"] = engine.get("key") or uuid.uuid4().hex
-            engine["origin"] = _origin(job, params, {"executor": asked, "batch": batch, "cpu": cpu, "thread": thread, **{
+            engine["origin"] = _origin(job, params, {"executor": asked, "batch": batch, "cpu": cpu, "thread": thread,
+                                                     "resources": resources, **{
                 name: value for name, value in engine.items() if name not in ("journal", "key")}})
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
