@@ -222,8 +222,9 @@ def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch)
     assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
 
 
-def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatch):
-    from ms_flow import locations
+@pytest.mark.parametrize("rsync", [True, False])
+def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatch, rsync):
+    from ms_flow import campaign as module, locations
     from ms_flow.campaign import Campaign
     from ms_flow.core.database.project import ProjectStore
 
@@ -232,8 +233,11 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatc
     (tmp_path / "p" / "in").mkdir()
     (tmp_path / "p" / "in" / "said.txt").write_text("from here")
     monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "p" / "in" / "said.txt"))
-    sent, send = [], Campaign._send
+    sent, send, sync = [], Campaign._send, Campaign._rsync
     monkeypatch.setattr(Campaign, "_send", lambda self, there, files, *a: (sent.extend(files), send(self, there, files, *a)))
+    monkeypatch.setattr(Campaign, "_rsync", lambda self, there, paths: sync(self, there, paths) and not sent.extend(paths))
+    if not rsync:  # this machine has none: tar
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
     GOT.clear()
     far = _far(tmp_path)
     engine = Engine(cpus=4)

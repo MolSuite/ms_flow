@@ -43,7 +43,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import threading
@@ -55,6 +57,7 @@ from typing import Any, Callable, Optional
 from ms_flow import locations
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
+from ms_env import HostError
 from ms_flow.remote import RemoteExecutor, _untar, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
@@ -346,12 +349,32 @@ class Campaign:
 
     def _upload(self, names: list, make: bool = False) -> None:
         stored = [name[len(self._store):] for name in names if self._stored(name)]
-        if stored:
+        if stored and not self._rsync(locations.root(self.remote, self.project), stored):
             self._send(locations.root(self.remote, self.project), {path: self._local[self._store + path] for path in stored})
         names = [name for name in names if not self._stored(name)]
         if names or make:
             here = f"{self.remote.workdir}/{self.dir}"
             self._send(here, {name: self._local[name] for name in names}, make)
+
+    def _rsync(self, there: str, paths: list) -> bool:
+        """`paths` of the project to its folder `there` with rsync, which goes on from what a cut
+        left half sent: False when this machine or the other has no rsync (tar sends them then)."""
+        if getattr(self.remote, "_no_rsync", False) or not shutil.which("rsync"):
+            return False
+        address = self.remote.remote.address
+        self._run(f"mkdir -p {shlex.quote(there)}")
+        said = subprocess.run(
+            ["rsync", "-rtL", "--partial", "--timeout=120", "--files-from=-",
+             *(["-e", shlex.join(self.remote.remote.ssh)] if address else []),
+             f"{Path(self.project.project_dir).resolve()}/", f"{address}:{there}/" if address else f"{there}/"],
+            input="".join(f"{path}\n" for path in paths).encode(), capture_output=True)
+        if said.returncode == 0:
+            return True
+        error = said.stderr.decode(errors="replace").strip()
+        if said.returncode in (12, 127) and "rsync" in error and "not found" in error:  # none over there
+            self.remote._no_rsync = True
+            return False
+        raise HostError(f"{error}: {said.returncode}")
 
     def _send(self, there: str, files: dict, make: bool = True) -> None:
         """`files`, `{path there: path here}`, to the directory `there`."""
