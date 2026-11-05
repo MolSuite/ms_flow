@@ -143,6 +143,17 @@ def test_a_campaign_asks_the_queue_for_itself(request, said):
     assert asked.split() == ["1"]
 
 
+@pytest.mark.parametrize("cpus", [1, 2])
+def test_any_job_with_a_key_asks_the_queue_for_itself(said, cpus):
+    ex, got = far(), []  # the executor asks for 2 CPUs
+    with lab_engine(said, ex) as engine:
+        key = f"granted-{cpus}-{time.time()}"
+        ex.ask(key, {"cpus": cpus})
+        job = engine.submit("far", lab_tasks.granted, range(2), key=key, journal="j", on_results=got.extend)
+        assert engine.wait(job, 600).status == "completed"
+    assert {result["cpus"] for _, result in got} == {str(cpus)}  # what Slurm gave, read on the node
+
+
 @pytest.mark.parametrize("pattern, nth, action", [
     ("tar xf -", 1, "fail"), ("sha256sum -c", 1, "fail"), ("sbatch", 1, "fail"), (".poll.", 2, "fail"),
     (".poll.", 6, "fail"), ("tar xf -", 1, "ack"), ("sbatch", 1, "ack")])

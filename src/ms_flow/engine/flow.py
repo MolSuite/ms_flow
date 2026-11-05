@@ -284,8 +284,9 @@ class Flow:
                cpu: float | None = None, thread: bool | None = None, after=(), on_terminal=None,
                resources: dict | None = None, **engine) -> int:
         """Start `job` and return its id. `batch`, `cpu` and `thread` override the task's; `after`
-        adds jobs to wait for. `resources` is what the jobs of a campaign ask of the queue, instead
-        of what its executor asks: `partition`, `cpus`, `time`... (see `ms_flow.site_script`).
+        adds jobs to wait for. `resources` is what its jobs ask of a cluster's queue, instead of
+        what the executor asks: `partition`, `cpus`, `time`... (see `ms_flow.site_script`); a job
+        that is not a campaign needs a journal for it.
 
         What else `Engine.submit` takes (`key`, `journal`, `priority`, `total`...) passes through.
         The sink is written on the engine's delivery thread, one transaction for each group of
@@ -308,8 +309,6 @@ class Flow:
             if running is not None:
                 return running
             engine["key"], executor = far.key, "thread"
-        elif resources:
-            raise ValueError(f"`{spec['name']}` is not a campaign: only a campaign asks the queue for resources")
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)
@@ -320,6 +319,13 @@ class Flow:
             engine["origin"] = _origin(job, params, {"executor": asked, "batch": batch, "cpu": cpu, "thread": thread,
                                                      "resources": resources, **{
                 name: value for name, value in engine.items() if name not in ("journal", "key")}})
+        if resources and far is None:
+            there = self.engine.executor(executor)
+            if not hasattr(there, "ask"):
+                raise ValueError(f"`{executor}` is not a cluster's queue: only its jobs ask for resources")
+            if engine.get("journal") is None:  # the engine keeps a key only for a job in a journal
+                raise ValueError("a job that asks the queue for resources goes to a journal")
+            there.ask(engine["key"], resources)
         if "params" in inspect.signature(fn).parameters:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
 

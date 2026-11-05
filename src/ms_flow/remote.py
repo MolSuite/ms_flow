@@ -158,7 +158,7 @@ class RemoteExecutor:
 
     `asks` is what each job asks of the queue: the fields of `ms_flow.site_script.RESOURCES` and
     `modules`, written as `#SBATCH` lines above `setup` (see `site_script.directives`); a campaign
-    may ask otherwise for itself (`script`).
+    and any job with a key may ask otherwise for itself (`ask`, `script_for`).
 
     `keep_after` is how many days a campaign's directory stays there (see `ms_flow.campaign`)
     once all of it came back or it was canceled: 0 removes it then.
@@ -184,7 +184,7 @@ class RemoteExecutor:
             # after the setup: a queue reads its directives (`#SBATCH ...`) only above the first command
             setup = f'{setup}\nexport PATH={shlex.quote(env + "/bin")}:"$PATH"'
         self._script = (scheduler, template.replace("@python@", python).replace("@runner@", runner), setup)
-        self.asks = dict(asks or {})
+        self.asks, self._asked = dict(asks or {}), {}
         self.script = self.script_for()
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
@@ -227,7 +227,14 @@ class RemoteExecutor:
         handle.canceled = True
         self._wake.set()
 
+    def ask(self, key: str, asks: dict) -> None:
+        """The jobs of the engine's job `key` (one in a journal: the engine keeps no other key) ask
+        the queue for `asks` instead (see `script_for`)."""
+        self.script_for(asks)  # what is not a resource is refused now, not when a job is sent
+        self._asked[key] = dict(asks)
+
     def ended(self, key: str, kept: bool) -> None:
+        self._asked.pop(key, None)
         self._tell((key, kept))
 
     def _tell(self, what):
@@ -416,7 +423,7 @@ class RemoteExecutor:
                 payloads = [swap(payload, carry) for payload in payloads]
             stage(tmp, task.fn, payloads, batched=task.whole, part_seconds=self.part_seconds,
                   cpu=cpu, gpu=gpu, mem_mb=mem_mb)
-            Path(tmp, "job.sh").write_text(self.script)
+            Path(tmp, "job.sh").write_text(self.script_for(self._asked.get(task.key)))
             # What another run needs to take this job up: whose it is, its elements in order, its dirs.
             Path(tmp, "record.json").write_text(json.dumps({"key": task.key, "keys": queued.keys, "dirs": queued.dirs,
                                                             "at": time.time()}))

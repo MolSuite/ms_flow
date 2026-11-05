@@ -185,8 +185,9 @@ They are written back as the first lines of the script the queue runs
 (`ms_flow.site_script.directives`): `#SBATCH` lines for Slurm. On Grid Engine
 the resources go as `#$` lines in `setup`.
 
-A campaign asks otherwise for itself with `resources`, the same fields, for that
-run only; it is still the same campaign (its identity does not change):
+A job asks otherwise for itself with `resources`, the same fields, for that run
+only; a campaign is still the same campaign (its identity does not change). A
+job that is not a campaign has to go to a journal (`ms.submit` always does):
 
 ```python
 ms.submit(screen, params, executor="hpc", resources={"cpus": 32, "time": "12:00:00"})

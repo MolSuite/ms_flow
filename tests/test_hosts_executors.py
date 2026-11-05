@@ -388,3 +388,18 @@ srun python dock.py
         "#SBATCH --job-name=dock", "module purge", "module load gcc/12 cuda/12.2", "module load python",
         "source ~/venv/bin/activate"]
     assert read(written)["setup"] == said["setup"]  # read back, the same
+
+
+def test_a_job_asks_a_queue_for_itself_until_it_ends(tmp_path):
+    from ms_flow.remote import RemoteExecutor
+
+    far = RemoteExecutor(workdir=str(tmp_path), scheduler="slurm", asks={"cpus": 2})
+    try:
+        far.ask("k", {"cpus": 8, "time": "1:00:00"})
+        assert "--cpus-per-task=8" in far.script_for(far._asked["k"]) and "--cpus-per-task=2" in far.script
+        with pytest.raises(ValueError, match="queue"):
+            far.ask("k", {"queue": "long"})
+        far.ended("k", False)
+        assert "k" not in far._asked
+    finally:
+        far.shutdown()
