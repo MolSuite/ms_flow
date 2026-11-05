@@ -24,6 +24,7 @@ pytestmark = [pytest.mark.lab, pytest.mark.skipif(not LAB, reason="no vHPC lab: 
 from ms_env import Host, HostError  # noqa: E402
 from ms_flow.engine import Engine, Flow, ThreadExecutor  # noqa: E402
 from ms_flow.remote import TEMPLATES, RemoteExecutor  # noqa: E402
+from ms_flow.site_script import directives  # noqa: E402
 
 import lab_tasks  # noqa: E402
 
@@ -89,11 +90,13 @@ class Faulty(Host):
         return out
 
 
-def far(setup="#SBATCH --nodes=1\n#SBATCH --cpus-per-task=2"):
+def far(setup="", **resources):
+    """The lab's queue, asking for `resources` (one node with two CPUs by default) as a queue executor's fields do."""
     ex = RemoteExecutor(ADDR, workdir=FAR, scheduler="slurm", template=TEMPLATES["slurm"], env="/opt/venv",
                         poll_s=2, part_seconds=1, keep_after=7,
-                        setup=f"#SBATCH --no-requeue\n{setup}\n"
-                              f"export PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks")
+                        setup=directives("slurm", **(resources or {"nodes": 1, "cpus": 2}),
+                                         setup=f"#SBATCH --no-requeue\n{setup}\n"
+                                               f"export PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks"))
     ex.remote = Faulty(ADDR, ssh=SSH)
     return ex
 
@@ -240,16 +243,16 @@ def test_two_clients_of_one_campaign_queue_one_job(request, said):
     assert int(lab(f"ls -d {FAR}/c*-* | wc -l")) == int(dirs or 0) + 1  # one campaign, whatever its hash seed
 
 
-@pytest.mark.parametrize("jobs, setup", [
-    (2, "#SBATCH --nodelist=slurm-worker1\n#SBATCH --cpus-per-task=1"),  # two allocations on one node
-    (1, "#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=1"),               # Ray over two nodes
-    (2, "#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=1")])              # two of those at once
-def test_jobs_that_share_nodes_do_not_meet(request, said, jobs, setup):
+@pytest.mark.parametrize("jobs, setup, nodes", [
+    (2, "#SBATCH --nodelist=slurm-worker1", 0),  # two allocations on one node
+    (1, "", 2),                                  # Ray over two nodes
+    (2, "", 2)])                                 # two of those at once
+def test_jobs_that_share_nodes_do_not_meet(request, said, jobs, setup, nodes):
     snaps = [None] * jobs
 
     def go(i):
         snaps[i] = run(params(request, tag=f"{request.node.name}-{time.time()}-{i}", nap=3), tempfile.mkdtemp(),
-                       far(setup), seconds=400)
+                       far(setup, nodes=nodes, cpus=1), seconds=400)
 
     threads = [threading.Thread(target=go, args=(i,)) for i in range(jobs)]
     [t.start() for t in threads]

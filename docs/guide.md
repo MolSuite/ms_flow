@@ -166,6 +166,25 @@ ms.move(key, "local")                      # a job that runs continues elsewhere
   (`Workspace.host_env`).
 - `ms.executors()` lists them with their state; `deactivate` stops one.
 
+### A cluster's queue
+
+What each job of a `queue` asks for is a field of the executor: `partition`,
+`account`, `nodes`, `cpus` and `gpus` and `memory_gb` (each node), `time`.
+`modules` are its `module` commands, in order; `setup` the site's other lines.
+A site's own script fills them:
+
+```python
+from ms_flow.site_script import read
+
+fields = read(open("site_job.sh").read())  # #SBATCH -> fields, module -> modules
+dropped = fields.pop("dropped")           # what runs the site's program, and what ms_flow sets
+ms.save_executor("hpc", kind="queue", hosts=["cluster"], **fields)
+```
+
+They are written back as the first lines of the script the queue runs
+(`ms_flow.site_script.directives`): `#SBATCH` lines for Slurm. On Grid Engine
+the resources go as `#$` lines in `setup`.
+
 ## The engine without a project
 
 `ms_flow.engine.Engine` runs a function on every element of an iterable, with
