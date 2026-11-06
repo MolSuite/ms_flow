@@ -392,6 +392,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Where jobs run">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#a-clusters-queue" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        A cluster's queue
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -568,6 +585,23 @@
       </span>
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Where jobs run">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#a-clusters-queue" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        A cluster's queue
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -827,6 +861,25 @@ by name, in the settings of <code>~/.molsuite</code> (<code>$MOLSUITE_HOME</code
   (<code>Workspace.host_env</code>).</li>
 <li><code>ms.executors()</code> lists them with their state; <code>deactivate</code> stops one.</li>
 </ul>
+<h3 id="a-clusters-queue">A cluster's queue<a class="headerlink" href="#a-clusters-queue" title="Permanent link">&para;</a></h3>
+<p>What each job of a <code>queue</code> asks for is a field of the executor: <code>partition</code>,
+<code>account</code>, <code>nodes</code>, <code>cpus</code> and <code>gpus</code> and <code>memory_gb</code> (each node), <code>time</code>.
+<code>modules</code> are its <code>module</code> commands, in order; <code>setup</code> the site's other lines.
+A site's own script fills them:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">ms_flow.site_script</span><span class="w"> </span><span class="kn">import</span> <span class="n">read</span>
+
+<span class="n">fields</span> <span class="o">=</span> <span class="n">read</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="s2">"site_job.sh"</span><span class="p">)</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>  <span class="c1"># #SBATCH -&gt; fields, module -&gt; modules</span>
+<span class="n">dropped</span> <span class="o">=</span> <span class="n">fields</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"dropped"</span><span class="p">)</span>           <span class="c1"># what runs the site's program, and what ms_flow sets</span>
+<span class="n">ms</span><span class="o">.</span><span class="n">save_executor</span><span class="p">(</span><span class="s2">"hpc"</span><span class="p">,</span> <span class="n">kind</span><span class="o">=</span><span class="s2">"queue"</span><span class="p">,</span> <span class="n">hosts</span><span class="o">=</span><span class="p">[</span><span class="s2">"cluster"</span><span class="p">],</span> <span class="o">**</span><span class="n">fields</span><span class="p">)</span>
+</code></pre></div>
+<p>They are written back as the first lines of the script the queue runs
+(<code>ms_flow.site_script.directives</code>): <code>#SBATCH</code> lines for Slurm. On Grid Engine
+the resources go as <code>#$</code> lines in <code>setup</code>.</p>
+<p>A job asks otherwise for itself with <code>resources</code>, the same fields, for that run
+only; a campaign is still the same campaign (its identity does not change). A
+job that is not a campaign has to go to a journal (<code>ms.submit</code> always does):</p>
+<div class="highlight"><pre><span></span><code><span class="n">ms</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">screen</span><span class="p">,</span> <span class="n">params</span><span class="p">,</span> <span class="n">executor</span><span class="o">=</span><span class="s2">"hpc"</span><span class="p">,</span> <span class="n">resources</span><span class="o">=</span><span class="p">{</span><span class="s2">"cpus"</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span> <span class="s2">"time"</span><span class="p">:</span> <span class="s2">"12:00:00"</span><span class="p">})</span>
+</code></pre></div>
 <h2 id="the-engine-without-a-project">The engine without a project<a class="headerlink" href="#the-engine-without-a-project" title="Permanent link">&para;</a></h2>
 <p><code>ms_flow.engine.Engine</code> runs a function on every element of an iterable, with
 no project and no journal.</p>
