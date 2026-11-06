@@ -260,6 +260,31 @@ def test_jobs_that_share_nodes_do_not_meet(request, said, jobs, setup):
                "'pgrep -fc /tmp/ray_' 2>/dev/null || echo 0; done").split() == ["0", "0"]
 
 
+def test_the_files_of_a_project_go_once_to_its_folder_there(request, said, monkeypatch):
+    """With rsync over there or, without it, tar; a second campaign sends nothing."""
+    from ms_flow import locations
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(said / "p")
+    (said / "p" / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(said / "p" / "said.txt"))
+    ex, there = far(), None
+    with lab_engine(said, ex) as engine:
+        flow = Flow(engine, project)
+        there = locations.root(ex, project)
+        ex.remote.fault(f"mkdir -p {there}", 10 ** 9)  # never fails: counts the sendings to the project's folder
+        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
+        assert getattr(ex, "_no_rsync", False) == (lab("command -v rsync || :") == "")
+        assert lab(f"cat {there}/said.txt") == "from here"
+        sendings = ex.remote.rules[0][3]  # 2 without rsync there: the try, and tar
+        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert ex.remote.rules[0][3] == sendings  # another campaign found it there
+        lab(f"rm {there}/said.txt")
+        assert locations.reconcile(project, ex) == ["said.txt"]
+
+
 if __name__ == "__main__":  # one client of test_two_clients_of_one_campaign_queue_one_job
     os.environ["CAMPAIGN_FILE"] = str(Path(sys.argv[2]) / "said.txt")
     snap = run({"n": 8, "nap": 2, "tag": sys.argv[1]}, tempfile.mkdtemp())

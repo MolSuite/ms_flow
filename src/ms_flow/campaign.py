@@ -43,7 +43,9 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import threading
@@ -52,8 +54,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from ms_flow import locations
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
+from ms_env import HostError
 from ms_flow.remote import RemoteExecutor, _untar, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
@@ -168,6 +172,9 @@ class Campaign:
         stages = list(job(params, project))
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
+        self.project, uid = project, locations.uid(project)
+        # The project's files go to its folder there, once for every campaign; any other, with it.
+        self._store = f"../projects/{uid}/" if uid else None
         self._stop = threading.Event()
         # What the tasks over there get: the params without the volatile ones.
         volatile = spec["campaign"]
@@ -182,13 +189,15 @@ class Campaign:
 
         self._tmp = Path(tempfile.mkdtemp(prefix="msflow-campaign-"))
         try:
-            carried, made, known = {}, {}, dict(stages[0].digests or {})
+            carried, made, known, self._shas = {}, {}, dict(stages[0].digests or {}), {}
 
             def carry(mark):
                 if isinstance(mark, Dir):  # made there, under the campaign's directory, and left there
                     return Dir(made.setdefault(mark, f"out/{len(made)}"))
                 if mark not in carried:
-                    carried[mark] = f"files/{known.get(mark) or _sha256(mark)}/{os.path.basename(mark)}"
+                    sha, path = known.get(mark) or _sha256(mark), self._store and locations.inside(project, mark)
+                    carried[mark] = self._store + path if path else f"files/{sha}/{os.path.basename(mark)}"
+                    self._shas[carried[mark]] = sha
                 return File(carried[mark])
 
             listed = [{"name": stage.name, "fn": bound(stage.task),
@@ -200,7 +209,7 @@ class Campaign:
             stage_campaign(self._tmp, listed, (swap(payload, carry) for payload in stages[0].source),
                            part_seconds=remote.part_seconds)
             manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "elements.jsonl")}
-            manifest.update({there: there.split("/")[1] for there in carried.values()})
+            manifest.update(self._shas)
             (self._tmp / "manifest.sha").write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(manifest.items())))
             (self._tmp / "job.sh").write_text(remote.script)
             self._local = {name: self._tmp / name for name in (*manifest, "manifest.sha", "job.sh")}
@@ -331,26 +340,75 @@ class Campaign:
 
     def _attempt(self) -> None:
         self.dir = f"{self.stem}-{self.n}"
-        self._upload(list(self._local), make=True)
-        self._fill()
+        self._upload([name for name in self._local if not self._stored(name)], make=True)
+        self._fill()  # and what of the project's folder is not there yet
         self._submit()
 
+    def _stored(self, name: str) -> bool:
+        return bool(self._store) and name.startswith(self._store)
+
     def _upload(self, names: list, make: bool = False) -> None:
+        stored = [name[len(self._store):] for name in names if self._stored(name)]
+        if stored and not self._rsync(locations.root(self.remote, self.project), stored):
+            self._send(locations.root(self.remote, self.project), {path: self._local[self._store + path] for path in stored})
+        names = [name for name in names if not self._stored(name)]
+        if names or make:
+            here = f"{self.remote.workdir}/{self.dir}"
+            self._send(here, {name: self._local[name] for name in names}, make)
+
+    def _rsync(self, there: str, paths: list) -> bool:
+        """`paths` of the project to its folder `there` with rsync, which goes on from what a cut
+        left half sent: False when this machine or the other has no rsync (tar sends them then)."""
+        if getattr(self.remote, "_no_rsync", False) or not shutil.which("rsync"):
+            return False
+        address = self.remote.remote.address
+        self._run(f"mkdir -p {shlex.quote(there)}")
+        said = subprocess.run(
+            ["rsync", "-rtL", "--partial", "--timeout=120", "--files-from=-",
+             *(["-e", shlex.join(self.remote.remote.ssh)] if address else []),
+             f"{Path(self.project.project_dir).resolve()}/", f"{address}:{there}/" if address else f"{there}/"],
+            input="".join(f"{path}\n" for path in paths).encode(), capture_output=True)
+        if said.returncode == 0:
+            return True
+        error = said.stderr.decode(errors="replace").strip()
+        if said.returncode in (12, 127) and "rsync" in error and "not found" in error:  # none over there
+            self.remote._no_rsync = True
+            return False
+        raise HostError(f"{error}: {said.returncode}")
+
+    def _send(self, there: str, files: dict, make: bool = True) -> None:
+        """`files`, `{path there: path here}`, to the directory `there`."""
         with tempfile.TemporaryFile() as packed:  # on disk: the files of the elements, of any size
             with tarfile.open(fileobj=packed, mode="w", dereference=True) as tar:
-                for name in names:
-                    tar.add(self._local[name], arcname=name)
+                for name, here in files.items():
+                    tar.add(here, arcname=name)
             packed.seek(0)
-            here = f"{self.remote.workdir}/{self.dir}"
-            self._run(f"{'mkdir -p ' + here + ' && ' if make else ''}cd {here} && tar xf -", packed)
+            self._run(f"{'mkdir -p ' + there + ' && ' if make else ''}cd {there} && tar xf -", packed)
 
     def _fill(self) -> None:
-        """What was sent is all there, as it was here: what is missing or not the same goes again."""
+        """What was sent is all there, as it was here: what is missing or not the same goes again.
+        What of the project's folder was verified there before is checked by its size, the rest by
+        its sha256 (`ms_flow.locations`)."""
+        host = locations.host_of(self.remote)
+        known = locations.known(self.project, host) if self._store else {}
+        lines = []
+        for line in (self._tmp / "manifest.sha").read_text().splitlines():
+            sha, _, name = line.partition("  ")
+            size = os.path.getsize(self._local[name])
+            seen = self._stored(name) and known.get(name[len(self._store):]) == (size, sha)
+            lines.append(f"S {size} {name}" if seen else f"H {sha} {name}")
+        listing = "".join(line + "\n" for line in lines).encode()
         for _ in range(2):
-            said = self._run(f"cd {self.remote.workdir}/{self.dir} && "
-                             "{ sha256sum -c manifest.sha 2>/dev/null || :; } | sed -n 's/: FAILED.*$//p'").decode()
+            said = self._run(
+                f"cd {self.remote.workdir}/{self.dir} && while read -r k a p; do case $k in "
+                "S) [ \"$(stat -c %s -- \"$p\" 2>/dev/null)\" = \"$a\" ] || echo \"$p\";; "
+                "*) printf '%s  %s\\n' \"$a\" \"$p\" | sha256sum -c --status 2>/dev/null || echo \"$p\";; esac; done",
+                listing).decode()
             wrong = [name for name in said.splitlines() if name]
             if not wrong:
+                locations.record(self.project, host, {
+                    name[len(self._store):]: (os.path.getsize(self._local[name]), self._shas[name])
+                    for name in self._shas if self._stored(name)})
                 return self._upload(["job.sh"])  # the script of this side, a template that changed too
             log.info("campaign %s: %d files sent again", self.dir, len(wrong))
             self._upload([name for name in wrong if name in self._local] + ["manifest.sha"])
