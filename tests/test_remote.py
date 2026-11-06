@@ -1,6 +1,7 @@
 """`RemoteExecutor` against this machine: the same commands, run by `sh` here instead of over ssh."""
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -249,3 +250,20 @@ def test_a_job_waits_for_a_host_that_does_not_answer_and_goes_on_once_it_does(tm
         engine.reconnect(job)  # not the five minutes a fifth miss would wait
         ended = engine.wait(job, 60)
     assert (ended.status, ended.chunks_done, ended.unreachable, left) == ("completed", 3, None, [0])
+
+
+def test_grid_engine_says_canceled_only_when_qacct_says_who_deleted():
+    """What Son of Grid Engine 8.1.9's qacct printed in the vHPC lab, and a `deleted_by` line of the
+    Grid Engines that have it, read by the `state` command."""
+    from ms_flow.remote import SCHEDULERS
+
+    def state(qacct: str) -> str:
+        command = SCHEDULERS["sge"]["state"].format(id=1).rpartition("done; ")[2].replace("qacct -j 1 2>/dev/null", "cat")
+        return subprocess.run(["sh", "-c", command], input=qacct, capture_output=True, text=True).stdout.strip()
+
+    assert state("failed       100 : assumedly after job\ndeleted_by   user@sge\nexit_status  137\n") == "CANCELLED"
+    # qdel and a runner the system killed: SoGE says both alike, so neither is taken for a cancel
+    assert state("failed       100 : assumedly after job\nexit_status  137                  (Killed)\n") == ""
+    assert state("failed       0    \nexit_status  0                   \n") == ""
+    assert state("failed       0    \nexit_status  1                   \n") == ""
+    assert state("") == ""  # deleted while it waited: no record

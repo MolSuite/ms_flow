@@ -58,9 +58,19 @@ SCHEDULERS = {
              "state": ":"},
     "slurm": {"submit": "sbatch --parsable job.sh", "alive": "squeue -h -o %i -t PD,CF,R,CG,S,RQ,RS -j {ids}",
               "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1"},
-    # ponytail: written from the manual of Grid Engine and never run against one.
+    # Run against Son of Grid Engine 8.1.9 (the vHPC lab's lab/sge). A Grid Engine whose qacct has
+    # `deleted_by` says who canceled; SoGE's has not, and its record of a running job that qdel stopped
+    # (`failed 100`, exit 137) is that of a runner the system killed (out of memory, h_rt): one taken
+    # for the other would end a run that resumes, so on SoGE a qdel there is a job that left early,
+    # queued again. Cancel from the app (its `cancelled` mark) is exact everywhere. qacct has the
+    # record some seconds after the job left the listing (`flush_time` in `qconf -sconf`, 15 s by
+    # default): `state` waits for it while the job is not listed.
+    # ponytail: 30 s at most; `#$ -notify` + a SIGUSR2 trap in job.sh would tell a qdel on SoGE too.
     "sge": {"submit": "qsub -terse -cwd -S /bin/bash job.sh", "alive": "qstat | awk 'NR > 2 {{print $1}}'",
-            "cancel": "qdel {id}", "state": "qacct -j {id} | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"}}'"},
+            "cancel": "qdel {id}",
+            "state": "for i in $(seq 30); do qacct -j {id} > /dev/null 2>&1 || "
+                     "qstat | awk 'NR > 2 {{print $1}}' | grep -qx {id} && break; sleep 1; done; "
+                     "qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"; exit}}'"},
 }
 
 # What the queue runs, in the directory of the job: the runner with a pool of processes.
