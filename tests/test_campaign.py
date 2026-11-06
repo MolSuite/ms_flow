@@ -219,6 +219,11 @@ def test_a_campaign_of_one_stage_has_its_total_its_queue_and_says_where_it_is(tm
         _until(lambda: "running in the queue (job " in (engine.status(job).note or ""))
         ended = engine.wait(job, 120)
     assert ended.chunks_total == 12 and ended.chunks_done == 11 and ended.note is None, ended.error
+    lines = [line.split(":")[0].split(" (")[0] for _at, line in ended.steps]  # each step once, in order
+    assert lines[:3] == ["staging its elements and their files here", "checksumming the 12 elements staged and their files",
+                         "looking for it on this machine"], lines
+    assert "running in the queue" in lines and lines[-1] == "it ended there", lines
+    assert [at for at, _line in ended.steps] == sorted(at for at, _line in ended.steps)
     assert [json.loads(row["spec"])["executor"] for row in engine.recorded("j")] == ["far"]
 
 

@@ -141,6 +141,8 @@ class JobSnapshot:
     note: str | None = None
     # Canceled, and waiting for its other machine to stop it there before it counts as canceled.
     canceling: bool = False
+    # Every step its source went through, `(time, line)`, quick ones too, kept once it ends.
+    steps: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +187,7 @@ class _Job:
                            self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
                            None if self.finished_at else getattr(self.far, "unreachable", None),
                            None if self.finished_at else getattr(self.far, "note", None),
-                           bool(self.canceling) and not self.finished_at)
+                           bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())))
 
 
 def _busy_seconds() -> float | None:

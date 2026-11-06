@@ -171,14 +171,16 @@ class Campaign:
     comes back as it comes, `{"_key", "result"}` or `{"_key", "error"}`. Read on the engine's
     feeding thread; `ended` stops it. `executor` is the queue it goes to, which is where the job
     that follows it is shown; `total` is how many results come back, when that is known before
-    (one stage, each result as it comes), else None; `note` is what it is at, in a line."""
+    (one stage, each result as it comes), else None; `note` is what it is at, in a line, and
+    `steps` every step it went through, `(time, line)`, the quick ones too."""
 
     def __init__(self, remote: RemoteExecutor, job, params, project, asks: dict | None = None, executor: str = ""):
         spec = job.__job__
         stages = list(job(params, project))
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
-        self.executor, self.total, self.note = executor or None, None, None
+        self.executor, self.total, self.steps = executor or None, None, []
+        self.note = "staging its elements and their files here"
         # Canceling: nothing goes to the queue from then on, and what is there is stopped (`stop_there`).
         self._submitting, self._canceling, self._stopped = threading.Lock(), False, False
         self.project, uid = project, locations.uid(project)
@@ -219,6 +221,7 @@ class Campaign:
                            part_seconds=remote.part_seconds)
             if len(stages) == 1 and stages[0].deliver == "stream":
                 self.total = elements
+            self.note = f"checksumming the {elements:,} elements staged and their files"
             manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "elements.jsonl")}
             manifest.update(self._shas)
             (self._tmp / "manifest.sha").write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(manifest.items())))
@@ -234,6 +237,20 @@ class Campaign:
             self.close()
             raise
         self.stem = f"c{self.key[:24]}"
+
+    @property
+    def note(self) -> str | None:
+        return self._note
+
+    @note.setter
+    def note(self, line: str | None) -> None:
+        # The same step with new figures ("running in the queue (job 7): 3 of 9 done") is the
+        # line of the step it is in, not one more step.
+        self._note = line
+        if line is not None and self.steps and self.steps[-1][1].split(":")[0] == line.split(":")[0]:
+            self.steps[-1] = (self.steps[-1][0], line)
+        elif line is not None:
+            self.steps.append((time.time(), line))
 
     # --- What the engine reads ---------------------------------------------------------------
 
