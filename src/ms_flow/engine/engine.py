@@ -131,7 +131,8 @@ class JobSnapshot:
     # What it used, kept in the journal once it ends: `cpu_s` and `gpu_s` (CPUs and GPUs held times
     # the seconds held), `peak_cpu`, `peak_gpu`, `peak_mem_mb`. Run on this machine, also what the
     # machine did meanwhile, shared out among the jobs by what each held: `busy_s` (seconds of
-    # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None.
+    # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None. A campaign's
+    # job in a queue also has `queue`, what the queue's accounting says it used there (`read_usage`).
     usage: dict | None = None
     # While it runs and the other machine it waits for does not answer: since when, and what was
     # said. It goes on by itself once that machine answers (or sooner, with its executor's `reconnect`).
@@ -173,6 +174,9 @@ class _Job:
         usage = dict(self.usage, peak_mem_mb=self.peak_mem_mb)
         usage["cpu_s"] += cpu * span
         usage["gpu_s"] += gpu * span
+        queue = getattr(self.far, "queue_usage", None)  # a campaign's job in a queue: what its accounting says
+        if queue:
+            usage["queue"] = dict(queue)
         return usage
 
     def snapshot(self) -> JobSnapshot:

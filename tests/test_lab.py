@@ -137,9 +137,13 @@ def params(request, **more):
 
 
 def test_a_campaign_runs_there(request, said):
-    assert run(params(request), said).status == "completed"
+    ended = run(params(request), said)
+    assert ended.status == "completed"
     assert got() == list(range(8))
     assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
+    used = ended.usage["queue"]  # what the queue's accounting says its job used, its last word
+    assert used["final"] and used["job"] and used["cpus"] == 2 and used["wall_s"] > 0
+    assert used["cpu_s"] > 0 and used["peak_mem_mb"] > 0
 
 
 @slurm_only

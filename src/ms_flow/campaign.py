@@ -58,7 +58,7 @@ from ms_flow import locations
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
 from ms_env import HostError
-from ms_flow.remote import RemoteExecutor, _untar, unreachable
+from ms_flow.remote import RemoteExecutor, _untar, read_usage, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
 log = logging.getLogger(__name__)
@@ -166,13 +166,19 @@ def prepare(engine, job, params, executor: str, project, journal: str | None, as
     return far, None
 
 
+# How often, at most, a running campaign asks the queue's accounting what its job used (it
+# asks once more at the end): sacct goes to the cluster's database, which sites ask to spare.
+_ACCOUNT_EVERY = 300.0
+
+
 class Campaign:
     """The source of the job that follows a campaign: it sends it, or finds it, and gives what
     comes back as it comes, `{"_key", "result"}` or `{"_key", "error"}`. Read on the engine's
     feeding thread; `ended` stops it. `executor` is the queue it goes to, which is where the job
     that follows it is shown; `total` is how many results come back, when that is known before
     (one stage, each result as it comes), else None; `note` is what it is at, in a line, and
-    `steps` every step it went through, `(time, line)`, the quick ones too."""
+    `steps` every step it went through, `(time, line)`, the quick ones too; `queue_usage` what the
+    queue's accounting says its job there used (`read_usage`, and `job`), None until it says."""
 
     def __init__(self, remote: RemoteExecutor, job, params, project, asks: dict | None = None, executor: str = ""):
         spec = job.__job__
@@ -180,6 +186,7 @@ class Campaign:
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self.executor, self.total, self.steps = executor or None, None, []
+        self.queue_usage, self._accounted = None, 0.0
         self.note = "staging its elements and their files here"
         # Canceling: nothing goes to the queue from then on, and what is there is stopped (`stop_there`).
         self._submitting, self._canceling, self._stopped = threading.Lock(), False, False
@@ -496,6 +503,8 @@ class Campaign:
             alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
             if not self._canceling:
                 self._tell(told, alive)
+                if alive and time.monotonic() > self._accounted + _ACCOUNT_EVERY:
+                    self._account()
             for name in streamed:
                 new = sorted(file for file in files if file.startswith(f"stages/{name}/results/part-"))
                 for file in new:
@@ -527,6 +536,7 @@ class Campaign:
                 lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
                 lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
                 if not lost and not reduced:
+                    self._account(final=True)
                     return
                 gone = "it ended there, but what it made is not all there any longer"
             if gone:
@@ -542,6 +552,7 @@ class Campaign:
                 again, ending, was = True, False, None
                 continue
             if told.get("status") == "failed":
+                self._account()
                 raise RuntimeError(f"campaign {self.dir} failed there: {told.get('error')}{self._kept()}")
             if alive:
                 ending = False
@@ -563,6 +574,28 @@ class Campaign:
                 log.info("campaign %s left the queue at %s: queued again", self.dir, now)
                 self._submit()
             self._stop.wait(self.remote.poll_s)
+
+    def _account(self, final: bool = False) -> None:
+        """`queue_usage`, from the accounting of the queue over there (its `usage` command); with
+        `final`, its last word, waited for a while (the job leaves the queue a moment after its
+        runner ended; qacct writes it some seconds later). No accounting there: nothing."""
+        command = self.remote.queue.get("usage")
+        if not command or not self.job:
+            return
+        if final:
+            self.note = "reading what it used from the queue's accounting"
+        self._accounted = time.monotonic()
+        for _ in range(10 if final else 1):  # ponytail: 30 s at most, then what it said last
+            try:
+                used = read_usage(self._run(f"{{ {command.format(id=self.job)}; }} 2>/dev/null; :", timeout=60).decode())
+            except Exception:  # what it used is told, never what stops the campaign
+                log.debug("campaign %s: no accounting of job %s", self.dir, self.job, exc_info=True)
+                return
+            if used["cpus"] or used["cpu_s"] is not None:
+                self.queue_usage = {**used, "job": self.job}
+            if used["final"] or not final:
+                return
+            time.sleep(3)
 
     def _where(self) -> str:
         return self.remote.remote.address or "this machine"

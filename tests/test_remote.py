@@ -267,3 +267,23 @@ def test_grid_engine_says_canceled_only_when_qacct_says_who_deleted():
     assert state("failed       0    \nexit_status  0                   \n") == ""
     assert state("failed       0    \nexit_status  1                   \n") == ""
     assert state("") == ""  # deleted while it waited: no record
+
+
+def test_what_the_queue_says_a_job_used():
+    """What sacct/sstat (Slurm 23 of the vHPC lab) and qacct/qstat (SoGE 8.1.9) printed, read by
+    `read_usage`: a 2-CPU job that kept one CPU busy for 20 s with 200 MB."""
+    from ms_flow.remote import read_usage
+
+    running = read_usage("A|300|00:00:10|00:00:00|2||800M|RUNNING\nA|300.batch|00:00:10|00:00:00|2|||RUNNING\n"
+                         "S|300.extern|00:00:00|2688K|1\nS|300.batch|00:00:09|214784K|1\n")
+    assert (running["final"], running["wall_s"], running["cpu_s"], running["cpus"], running["mem_mb"]) == (False, 10, 9, 2, 800)
+    assert round(running["peak_mem_mb"]) == 210
+    ended = read_usage("A|300|00:00:21|00:20.131|2||800M|COMPLETED\nA|300.batch|00:00:21|00:20.129|2|214784K||COMPLETED\n"
+                       "A|300.extern|00:00:21|00:00.001|2|2688K||COMPLETED\n")
+    assert (ended["final"], ended["wall_s"], ended["cpu_s"], ended["cpus"]) == (True, 21, 20.131, 2)
+    assert read_usage("A|7|1-02:00:00|2-00:00:00|4||2Gc|TIMEOUT\n")["mem_mb"] == 8192  # per CPU, before 21.08
+    sge = read_usage("U|cpu=00:00:00, mem=0.00000 GB s, io=0.00000 GB, vmem=N/A, maxvmem=N/A\n"
+                     "Q|slots        2                   \nQ|failed       0    \nQ|ru_wallclock 20s\n"
+                     "Q|cpu          20.363s\nQ|maxvmem      211.738MB\n")
+    assert (sge["final"], sge["wall_s"], sge["cpu_s"], sge["cpus"], round(sge["peak_mem_mb"])) == (True, 20, 20.363, 2, 212)
+    assert read_usage("sacct: error: Problem talking to the database\n") == read_usage("")  # no accounting there
