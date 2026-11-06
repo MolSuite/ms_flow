@@ -136,6 +136,9 @@ class JobSnapshot:
     # While it runs and the other machine it waits for does not answer: since when, and what was
     # said. It goes on by itself once that machine answers (or sooner, with its executor's `reconnect`).
     unreachable: str | None = None
+    # While it runs, what its source says it is at, in a line (a campaign: sending its files,
+    # waiting in the queue, how far it is over there); else None.
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +181,8 @@ class _Job:
         return JobSnapshot(self.id, self.name, self.status, total, self.done, self.failed, self.open,
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
                            self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
-                           None if self.finished_at else getattr(self.far, "unreachable", None))
+                           None if self.finished_at else getattr(self.far, "unreachable", None),
+                           None if self.finished_at else getattr(self.far, "note", None))
 
 
 def _busy_seconds() -> float | None:
@@ -406,8 +410,9 @@ class Engine:
         if timeout is not None and not slot.kills:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
-        job.executor = executor
         job.far = chunks if hasattr(type(chunks), "unreachable") else slot.impl  # what tells of another machine
+        # A source that follows another machine's work runs on a thread here, and is shown by where that is.
+        job.executor = getattr(chunks, "executor", None) or executor if job.far is chunks else executor
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
@@ -417,7 +422,7 @@ class Engine:
                 raise ValueError(f"no usable journal {journal!r}; attached: {sorted(self._journals)}")
             job.uid, job.key = key or uuid.uuid4().hex, key  # `key`: what another run can ask for it by
             job.spec = json.dumps({
-                "executor": executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
+                "executor": job.executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
                 "cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "window": window, "max_cpu": max_cpu, "priority": priority,
                 "retries": retries, "retry_wait": retry_wait, "timeout": timeout, "batch": batch, "origin": origin})
         job.cost = (cpu, gpu, mem_mb) if slot.impl.uses_tokens else None

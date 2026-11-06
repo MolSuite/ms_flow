@@ -1,4 +1,5 @@
 """Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
+import json
 import os
 import shutil
 import subprocess
@@ -195,6 +196,26 @@ def test_a_campaign_asks_the_queue_for_itself_and_stays_the_same_campaign(tmp_pa
             far.script_for({"queue": "x"})
     finally:
         far.shutdown()
+
+
+@campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
+def one_stage(params, project):
+    said = Path(os.environ["CAMPAIGN_FILE"])
+    return [Stage("vs", square, [{"n": n, "f": File(said), "out": Dir(said.parent / "work")} for n in range(params.n)])]
+
+
+def test_a_campaign_of_one_stage_has_its_total_its_queue_and_says_where_it_is(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        job = flow.submit(one_stage, {"n": 12, "nap": 1}, executor="far", journal="j")
+        now = engine.status(job)
+        assert now.chunks_total == 12 and now.executor == "far"  # from the start, not "thread" and "?"
+        _until(lambda: "running in the queue (job " in (engine.status(job).note or ""))
+        ended = engine.wait(job, 120)
+    assert ended.chunks_total == 12 and ended.chunks_done == 11 and ended.note is None, ended.error
+    assert [json.loads(row["spec"])["executor"] for row in engine.recorded("j")] == ["far"]
 
 
 def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeypatch):
