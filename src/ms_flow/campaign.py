@@ -90,6 +90,9 @@ class Stage:
     digests: Optional[dict] = None
 
 
+_LET_GO = 120.0  # seconds a queue has to let a canceled job go before that is an error
+
+
 @task(cpu=0, thread=True)
 def _take(element):
     """What came back of an element there, as its result here."""
@@ -176,6 +179,8 @@ class Campaign:
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self.executor, self.total, self.note = executor or None, None, None
+        # Canceling: nothing goes to the queue from then on, and what is there is stopped (`stop_there`).
+        self._submitting, self._canceling, self._stopped = threading.Lock(), False, False
         self.project, uid = project, locations.uid(project)
         # The project's files go to its folder there, once for every campaign; any other, with it.
         self._store = f"../projects/{uid}/" if uid else None
@@ -251,6 +256,26 @@ class Campaign:
     def reconnect(self) -> None:
         self.remote.reconnect()
 
+    def stop_there(self) -> None:
+        """Cancel its job in the queue and wait for the queue to let it go, asking again while
+        the other machine does not answer: what `Engine.cancel` waits for before the job that
+        follows it counts as canceled. Its directory is marked `cancelled` there."""
+        with self._submitting:
+            self._canceling, job = True, self.job
+        if self.dir is None:
+            return
+        here, queue = f"{self.remote.workdir}/{self.dir}", self.remote.queue
+        self.note = f"canceling {f'job {job}' if job else 'it'} in the queue of {self._where()}"
+        self._patiently(lambda: self._run(f"cd {here} || exit 0; touch cancelled; "
+                                          f"{'' if not job else queue['cancel'].format(id=job) + ' 2>/dev/null'}; :"))
+        limit = time.monotonic() + _LET_GO
+        while job and not self._stop.is_set() and self._patiently(lambda: self._look(self.dir))["alive"]:
+            if time.monotonic() > limit:
+                raise RuntimeError(f"job {job} is still in the queue of {self._where()} {_LET_GO:.0f} s after "
+                                   f"it was canceled{self._kept()}")
+            self._stop.wait(2)
+        self._stopped = True
+
     def ended(self, snapshot) -> None:
         """The job that follows it ended: a campaign canceled here is canceled there, and one
         that is all here is kept for `keep_after` days. Interrupted or failed, it is left as it is."""
@@ -259,7 +284,7 @@ class Campaign:
             return
         here, queue = f"{self.remote.workdir}/{self.dir}", self.remote.queue
         try:
-            if snapshot.status == "canceled":
+            if snapshot.status == "canceled" and not self._stopped:
                 self._run(f"cd {here} || exit 0; id=$(cat queue.id 2>/dev/null); "
                           f"[ -z \"$id\" ] || {{ {queue['cancel'].format(id='$id')}; }} 2>/dev/null; touch cancelled")
             elif snapshot.status.startswith("completed"):
@@ -425,8 +450,11 @@ class Campaign:
         raise OSError(f"campaign {self.dir}: what was sent is not what arrived: {', '.join(wrong[:5])}")
 
     def _submit(self) -> None:
-        self.note = f"submitting it to the queue of {self._where()}"
-        self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
+        with self._submitting:  # never after `stop_there` read which job to cancel
+            if self._canceling:
+                return
+            self.note = f"submitting it to the queue of {self._where()}"
+            self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
 
     def _follow(self):
         """Every round, one command: the progress, whether the job is in the queue, and whatever
@@ -449,7 +477,8 @@ class Campaign:
             files = self._patiently(lambda: _untar(self._run(command, timeout=self.remote.poll_timeout)))
             told = json.loads(next((data for name, data in files.items() if name.endswith(".told")), b"") or b"{}")
             alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
-            self._tell(told, alive)
+            if not self._canceling:
+                self._tell(told, alive)
             for name in streamed:
                 new = sorted(file for file in files if file.startswith(f"stages/{name}/results/part-"))
                 for file in new:
@@ -468,6 +497,9 @@ class Campaign:
                     reduced.discard(name)
                     made = unplain(json.loads(files[f"stages/{name}/reduced.json"]))
                     yield {"_key": f"{self.n}:{name}:reduced", "result": made}
+            if self._canceling:  # its end there is `stop_there`'s to see, not a failure to go on from
+                self._stop.wait(self.remote.poll_s)
+                continue
             # The progress was read before the parts were listed: complete, nothing is left out,
             # unless something removed it there (a scratch purge). Nothing at all: no directory.
             gone = None

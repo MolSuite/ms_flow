@@ -127,9 +127,13 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         slow = flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j")
         _until(lambda: len(_dirs(tmp_path)) == 2 and GOT)
         engine.cancel(slow)
-        assert engine.wait(slow, 60).status == "canceled"
+        assert engine.status(slow).canceling and engine.status(slow).status == "running"  # until it is gone there
+        assert engine.wait(slow, 60).status == "canceled" and not engine.status(slow).canceling
         [canceled] = set(_dirs(tmp_path)) - {first}
-        _until(lambda: (tmp_path / "far" / canceled / "cancelled").exists())
+        # Only then: its queue job is gone, not left to run on its own.
+        assert (tmp_path / "far" / canceled / "cancelled").exists()
+        pid = (tmp_path / "far" / canceled / "queue.id").read_text().strip()
+        assert subprocess.run(["ps", "-p", pid], capture_output=True).returncode != 0
         GOT.clear()
         done = engine.wait(flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j"), 120)
         assert done.status == "completed_with_errors" and len([row for row in GOT if row["stage"] == "vs"]) == 39

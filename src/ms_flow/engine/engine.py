@@ -139,6 +139,8 @@ class JobSnapshot:
     # While it runs, what its source says it is at, in a line (a campaign: sending its files,
     # waiting in the queue, how far it is over there); else None.
     note: str | None = None
+    # Canceled, and waiting for its other machine to stop it there before it counts as canceled.
+    canceling: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +162,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
-                 "states", "executor", "usage", "held", "far")
+                 "states", "executor", "usage", "held", "far", "canceling")
 
     def used(self) -> dict:
         """`usage` up to now, with what it holds at this moment counted until now."""
@@ -182,7 +184,8 @@ class _Job:
                            self.error, self.peak_mem_mb, self.started_at, self.finished_at, self.uid,
                            self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
                            None if self.finished_at else getattr(self.far, "unreachable", None),
-                           None if self.finished_at else getattr(self.far, "note", None))
+                           None if self.finished_at else getattr(self.far, "note", None),
+                           bool(self.canceling) and not self.finished_at)
 
 
 def _busy_seconds() -> float | None:
@@ -411,6 +414,7 @@ class Engine:
             raise ValueError(f"executor {executor!r} cannot stop a running chunk, so its chunks cannot have a timeout")
         job = _Job()
         job.far = chunks if hasattr(type(chunks), "unreachable") else slot.impl  # what tells of another machine
+        job.canceling = False
         # A source that follows another machine's work runs on a thread here, and is shown by where that is.
         job.executor = getattr(chunks, "executor", None) or executor if job.far is chunks else executor
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
@@ -512,8 +516,23 @@ class Engine:
         return job.snapshot()
 
     def cancel(self, job_id: int) -> None:
+        """Cancel the job. One whose source follows work on another machine (`stop_there`, a
+        campaign) runs on, `canceling`, until that work is stopped there; canceled again
+        meanwhile, it is canceled at once and what is there is left as it is."""
         job = self._jobs.get(job_id)
-        if job is not None:
+        stop = getattr(job.far, "stop_there", None) if job is not None and job.far is not job.slot.impl else None
+        if stop is not None and not job.canceling and job.status in (RUNNING, WAITING):
+            job.canceling = True
+
+            def stopped():
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001 - said, and canceled here all the same
+                    log.warning("job %s: its work on the other machine may not be stopped", job.name, exc_info=True)
+                self._events.put((self._on_stop_job, job, CANCELED))
+
+            threading.Thread(target=stopped, name=f"ms_flow-cancel-{job_id}", daemon=True).start()
+        elif job is not None:
             self._events.put((self._on_stop_job, job, CANCELED))
         elif job_id not in self._ended:
             raise KeyError(job_id)
