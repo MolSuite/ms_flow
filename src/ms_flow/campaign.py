@@ -142,13 +142,14 @@ def _params(params) -> dict:
     return params.model_dump(mode="json") if hasattr(params, "model_dump") else dict(params)
 
 
-def prepare(engine, job, params, executor: str, project, journal: str | None):
+def prepare(engine, job, params, executor: str, project, journal: str | None, asks: dict | None = None):
     """The campaign `job` is with `params` on `executor`, staged here, and the id of the job of
-    `engine` that already follows it, or None. Called by `Flow.submit`."""
+    `engine` that already follows it, or None. `asks` is what its jobs ask of the queue, instead
+    of what the executor asks (see `RemoteExecutor.script_for`). Called by `Flow.submit`."""
     remote = engine.executor(executor)
     if not isinstance(remote, RemoteExecutor):
         raise ValueError(f"a campaign runs on an executor of kind `queue`, and `{executor}` is not one")
-    far = Campaign(remote, job, params, project)
+    far = Campaign(remote, job, params, project, asks)
     running = next((job_id for job_id, held in tuple(engine._jobs.items()) if held.key == far.key), None)
     if running is not None:
         far.close()
@@ -167,7 +168,7 @@ class Campaign:
     comes back as it comes, `{"_key", "result"}` or `{"_key", "error"}`. Read on the engine's
     feeding thread; `ended` stops it."""
 
-    def __init__(self, remote: RemoteExecutor, job, params, project):
+    def __init__(self, remote: RemoteExecutor, job, params, project, asks: dict | None = None):
         spec = job.__job__
         stages = list(job(params, project))
         _check(stages)
@@ -211,7 +212,8 @@ class Campaign:
             manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "elements.jsonl")}
             manifest.update(self._shas)
             (self._tmp / "manifest.sha").write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(manifest.items())))
-            (self._tmp / "job.sh").write_text(remote.script)
+            # not in its identity: the same campaign asking for more is the same campaign
+            (self._tmp / "job.sh").write_text(remote.script_for(asks))
             self._local = {name: self._tmp / name for name in (*manifest, "manifest.sha", "job.sh")}
             self._local.update({there: here for here, there in carried.items()})
             identity = {"job": spec["name"], "params": {name: value for name, value in _params(params).items()

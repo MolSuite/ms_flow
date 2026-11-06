@@ -58,9 +58,19 @@ SCHEDULERS = {
              "state": ":"},
     "slurm": {"submit": "sbatch --parsable job.sh", "alive": "squeue -h -o %i -t PD,CF,R,CG,S,RQ,RS -j {ids}",
               "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1"},
-    # ponytail: written from the manual of Grid Engine and never run against one.
+    # Run against Son of Grid Engine 8.1.9 (the vHPC lab's lab/sge). A Grid Engine whose qacct has
+    # `deleted_by` says who canceled; SoGE's has not, and its record of a running job that qdel stopped
+    # (`failed 100`, exit 137) is that of a runner the system killed (out of memory, h_rt): one taken
+    # for the other would end a run that resumes, so on SoGE a qdel there is a job that left early,
+    # queued again. Cancel from the app (its `cancelled` mark) is exact everywhere. qacct has the
+    # record some seconds after the job left the listing (`flush_time` in `qconf -sconf`, 15 s by
+    # default): `state` waits for it while the job is not listed.
+    # ponytail: 30 s at most; `#$ -notify` + a SIGUSR2 trap in job.sh would tell a qdel on SoGE too.
     "sge": {"submit": "qsub -terse -cwd -S /bin/bash job.sh", "alive": "qstat | awk 'NR > 2 {{print $1}}'",
-            "cancel": "qdel {id}", "state": "qacct -j {id} | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"}}'"},
+            "cancel": "qdel {id}",
+            "state": "for i in $(seq 30); do qacct -j {id} > /dev/null 2>&1 || "
+                     "qstat | awk 'NR > 2 {{print $1}}' | grep -qx {id} && break; sleep 1; done; "
+                     "qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"; exit}}'"},
 }
 
 # What the queue runs, in the directory of the job: the runner with a pool of processes.
@@ -156,6 +166,10 @@ class RemoteExecutor:
     given, unless `shared` says that the other side sees the disk of this one (as it does without
     a `host`).
 
+    `asks` is what each job asks of the queue: the fields of `ms_flow.site_script.RESOURCES` and
+    `modules`, written as `#SBATCH` lines above `setup` (see `site_script.directives`); a campaign
+    and any job with a key may ask otherwise for itself (`ask`, `script_for`).
+
     `keep_after` is how many days a campaign's directory stays there (see `ms_flow.campaign`)
     once all of it came back or it was canceled: 0 removes it then.
 
@@ -173,13 +187,15 @@ class RemoteExecutor:
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
-                 poll_timeout: float = 120):
+                 poll_timeout: float = 120, asks: dict | None = None):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
             # after the setup: a queue reads its directives (`#SBATCH ...`) only above the first command
             setup = f'{setup}\nexport PATH={shlex.quote(env + "/bin")}:"$PATH"'
-        self.script = template.replace("@python@", python).replace("@setup@", setup).replace("@runner@", runner)
+        self._script = (scheduler, template.replace("@python@", python).replace("@runner@", runner), setup)
+        self.asks, self._asked = dict(asks or {}), {}
+        self.script = self.script_for()
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
         self.keep_after, self.poll_timeout = keep_after, poll_timeout
@@ -192,6 +208,16 @@ class RemoteExecutor:
         self._tasks, self._jobs, self._groups, self._orders = set(), [], {}, []
         self._thread = threading.Thread(target=self._watch, name="msflow-remote", daemon=True)
         self._thread.start()
+
+    def script_for(self, asks: dict | None = None) -> str:
+        """The script of a job that asks the queue for `asks` instead of what the executor asks."""
+        from ms_flow.site_script import RESOURCES, directives
+
+        wrong = set(asks or ()) - {*RESOURCES, "modules"}
+        if wrong:
+            raise ValueError(f"not something a job asks of the queue: {', '.join(sorted(wrong))}")
+        scheduler, template, setup = self._script
+        return template.replace("@setup@", directives(scheduler, setup=setup, **{**self.asks, **(asks or {})}))
 
     # --- What the engine calls: nothing here waits for the other machine ---------------
 
@@ -211,7 +237,14 @@ class RemoteExecutor:
         handle.canceled = True
         self._wake.set()
 
+    def ask(self, key: str, asks: dict) -> None:
+        """The jobs of the engine's job `key` (one in a journal: the engine keeps no other key) ask
+        the queue for `asks` instead (see `script_for`)."""
+        self.script_for(asks)  # what is not a resource is refused now, not when a job is sent
+        self._asked[key] = dict(asks)
+
     def ended(self, key: str, kept: bool) -> None:
+        self._asked.pop(key, None)
         self._tell((key, kept))
 
     def _tell(self, what):
@@ -400,7 +433,7 @@ class RemoteExecutor:
                 payloads = [swap(payload, carry) for payload in payloads]
             stage(tmp, task.fn, payloads, batched=task.whole, part_seconds=self.part_seconds,
                   cpu=cpu, gpu=gpu, mem_mb=mem_mb)
-            Path(tmp, "job.sh").write_text(self.script)
+            Path(tmp, "job.sh").write_text(self.script_for(self._asked.get(task.key)))
             # What another run needs to take this job up: whose it is, its elements in order, its dirs.
             Path(tmp, "record.json").write_text(json.dumps({"key": task.key, "keys": queued.keys, "dirs": queued.dirs,
                                                             "at": time.time()}))

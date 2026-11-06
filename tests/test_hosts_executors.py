@@ -197,7 +197,7 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     settings = Settings(
         hosts={"local": {"cpus": 6}, "hpc": {"address": "login", "workdir": "scratch/jobs"},
                "mine": {"address": "login2", "env": "/mine"}, "pc2": {"address": "pc2", "cpus": -2, "memory_gb": 8}, "pc3": {"address": "pc3"}},
-        executors={"slurm": {"kind": "queue", "hosts": ["hpc"]}, "slurm2": {"kind": "queue", "hosts": ["mine"]},
+        executors={"slurm": {"kind": "queue", "hosts": ["hpc"]}, "slurm2": {"kind": "queue", "hosts": ["mine"], "cpus": 8, "modules": ["load gcc"], "setup": "export A=1"},
                    "alone": {"kind": "ray"}, "lab": {"kind": "ray", "hosts": ["local", "pc2", "pc3"]},
                    "others": {"kind": "ray", "hosts": ["pc2"]}})
 
@@ -207,6 +207,8 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     assert (built("slurm").host, built("slurm").said["workdir"], built("slurm").said["env"]) == ("login", "scratch/jobs", "/envs/login")
     assert built("slurm", None).said["env"] == ""  # no app behind: the `python` of that account
     assert built("slurm2").said["env"] == "/mine"
+    said = built("slurm2").said
+    assert said["setup"] == "export A=1" and said["asks"]["cpus"] == 8 and said["asks"]["modules"] == ["load gcc"]
     assert built("alone") == (None, {"num_cpus": 6, "num_gpus": 1})  # a Ray of this machine alone
     assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"],
                             {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)], "names": ["pc2", "pc3"]})  # each host gives its share
@@ -347,3 +349,57 @@ def test_a_login_node_is_told_apart(monkeypatch):
         assert job_api.warn_login_node()
     monkeypatch.setenv("JOB_ID", "3")
     assert job_api._login_node() == ""
+
+
+def test_a_site_script_is_read_into_the_fields_of_a_queue_and_written_back():
+    from ms_flow.site_script import RESOURCES, directives, read
+
+    said = read("""#!/bin/bash
+#SBATCH --job-name=dock
+#SBATCH -p gpu
+#SBATCH --account=chem123   # our group
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=4
+#SBATCH --cpus-per-task 16
+#SBATCH --gres=gpu:2
+#SBATCH --mem=64000
+#SBATCH -t 2-00:00:00
+#SBATCH --output=out_%j.log
+
+module purge
+module load gcc/12 cuda/12.2
+ml python
+source ~/venv/bin/activate
+cd $SLURM_SUBMIT_DIR
+srun python dock.py
+""")
+    assert {field: said[field] for field in RESOURCES} == {
+        "partition": "gpu", "account": "chem123", "nodes": 2, "cpus": 16, "gpus": 2, "memory_gb": 62, "time": "2-00:00:00"}
+    assert said["modules"] == ["purge", "load gcc/12 cuda/12.2", "load python"]
+    assert said["setup"] == "#SBATCH --job-name=dock\nsource ~/venv/bin/activate"
+    # what ms_flow sets itself, and what runs the site's program
+    assert said["dropped"] == ["#SBATCH --ntasks-per-node=4", "#SBATCH --output=out_%j.log", "cd $SLURM_SUBMIT_DIR",
+                               "srun python dock.py"]
+    assert read("#SBATCH --gres=gpu:a100:2")["setup"] == "#SBATCH --gres=gpu:a100:2"  # of a type: as the site wrote it
+    written = directives("slurm", **{field: said[field] for field in (*RESOURCES, "modules", "setup")})
+    assert written.splitlines() == [
+        "#SBATCH --partition=gpu", "#SBATCH --account=chem123", "#SBATCH --nodes=2", "#SBATCH --ntasks-per-node=1",
+        "#SBATCH --cpus-per-task=16", "#SBATCH --gres=gpu:2", "#SBATCH --mem=62G", "#SBATCH --time=2-00:00:00",
+        "#SBATCH --job-name=dock", "module purge", "module load gcc/12 cuda/12.2", "module load python",
+        "source ~/venv/bin/activate"]
+    assert read(written)["setup"] == said["setup"]  # read back, the same
+
+
+def test_a_job_asks_a_queue_for_itself_until_it_ends(tmp_path):
+    from ms_flow.remote import RemoteExecutor
+
+    far = RemoteExecutor(workdir=str(tmp_path), scheduler="slurm", asks={"cpus": 2})
+    try:
+        far.ask("k", {"cpus": 8, "time": "1:00:00"})
+        assert "--cpus-per-task=8" in far.script_for(far._asked["k"]) and "--cpus-per-task=2" in far.script
+        with pytest.raises(ValueError, match="queue"):
+            far.ask("k", {"queue": "long"})
+        far.ended("k", False)
+        assert "k" not in far._asked
+    finally:
+        far.shutdown()

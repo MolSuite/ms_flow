@@ -26,6 +26,12 @@ def square(element, params):
             "host": os.uname().nodename}
 
 
+@task()
+def granted(element):
+    """What the queue gave the job this element ran in."""
+    return {"n": element, "cpus": os.environ.get("SLURM_CPUS_ON_NODE", "")}
+
+
 class _Collect:
     def write(self, results):
         GOT.extend(results)

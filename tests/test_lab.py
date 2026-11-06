@@ -5,6 +5,8 @@ Runs only with `MS_FLOW_LAB=<the lab/ dir of the vHPC lab>` (a clone of github.c
 with a `lab/` of its own: `setup.sh`, `up.sh`, `install-env.sh`): its login answers on
 127.0.0.1:2222 with the key in `runtime/`, `workspace/` is its `/workspace` and `/opt/venv` has
 pydantic and Ray. This checkout's ms_flow and ms_env are copied there first. Some 9 minutes: `pytest -m lab`.
+With `MS_FLOW_LAB_SCHEDULER=sge` the same campaigns go to the lab's Grid Engine (`lab/sge`, one host
+on 127.0.0.1:2223); what only Slurm has (resources asked as fields, several nodes) is skipped there.
 """
 import json
 import os
@@ -20,6 +22,9 @@ import pytest
 
 LAB = os.environ.get("MS_FLOW_LAB")
 pytestmark = [pytest.mark.lab, pytest.mark.skipif(not LAB, reason="no vHPC lab: set MS_FLOW_LAB")]
+SGE = os.environ.get("MS_FLOW_LAB_SCHEDULER") == "sge"
+SUBMIT, CANCEL = ("qsub", "qdel") if SGE else ("sbatch", "scancel")
+slurm_only = pytest.mark.skipif(SGE, reason="Slurm only: a Grid Engine site writes its resources in setup")
 
 from ms_env import Host, HostError  # noqa: E402
 from ms_flow.engine import Engine, Flow, ThreadExecutor  # noqa: E402
@@ -29,7 +34,7 @@ import lab_tasks  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 ADDR, THERE = "user@127.0.0.1", "/workspace/ms_flow_lab"
-SSH = ("ssh", "-p", "2222", "-i", f"{LAB}/runtime/id_ed25519", "-o", "BatchMode=yes",
+SSH = ("ssh", "-p", "2223" if SGE else "2222", "-i", f"{LAB}/runtime/id_ed25519", "-o", "BatchMode=yes",
        "-o", f"UserKnownHostsFile={LAB}/runtime/known_hosts", "-o", "StrictHostKeyChecking=yes")
 FAR = f"{THERE}/far"
 
@@ -89,11 +94,13 @@ class Faulty(Host):
         return out
 
 
-def far(setup="#SBATCH --nodes=1\n#SBATCH --cpus-per-task=2"):
-    ex = RemoteExecutor(ADDR, workdir=FAR, scheduler="slurm", template=TEMPLATES["slurm"], env="/opt/venv",
+def far(setup="", **resources):
+    """The lab's queue, asking for `resources` (one node with two CPUs by default) as a queue executor's fields do."""
+    scheduler, head = ("sge", "#$ -pe smp 2") if SGE else ("slurm", "#SBATCH --no-requeue")
+    ex = RemoteExecutor(ADDR, workdir=FAR, scheduler=scheduler, template=TEMPLATES[scheduler], env="/opt/venv",
                         poll_s=2, part_seconds=1, keep_after=7,
-                        setup=f"#SBATCH --no-requeue\n{setup}\n"
-                              f"export PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks")
+                        asks={} if SGE else resources or {"nodes": 1, "cpus": 2},
+                        setup=f"{head}\n{setup}\nexport PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks")
     ex.remote = Faulty(ADDR, ssh=SSH)
     return ex
 
@@ -106,9 +113,9 @@ def lab_engine(tmp, ex):
     return engine
 
 
-def run(params, tmp, ex=None, seconds=600, during=None):
+def run(params, tmp, ex=None, seconds=600, during=None, **options):
     with lab_engine(tmp, ex or far()) as engine:
-        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j")
+        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j", **options)
         if during:
             threading.Thread(target=during, args=(engine, job), daemon=True).start()
         return engine.wait(job, seconds)
@@ -135,9 +142,29 @@ def test_a_campaign_runs_there(request, said):
     assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
 
 
+@slurm_only
+def test_a_campaign_asks_the_queue_for_itself(request, said):
+    ex = far()
+    assert run(params(request), said, ex, resources={"cpus": 1, "time": "0:17:00"}).status == "completed"
+    asked = ex.remote.run(f"grep -c -e --time=0:17:00 -e --cpus-per-task=1 $(ls -td {FAR}/c*-* | head -1)/job.sh").decode()
+    assert asked.split() == ["2"]
+
+
+@slurm_only
+@pytest.mark.parametrize("cpus", [1, 2])
+def test_any_job_with_a_key_asks_the_queue_for_itself(said, cpus):
+    ex, got = far(), []  # the executor asks for 2 CPUs
+    with lab_engine(said, ex) as engine:
+        key = f"granted-{cpus}-{time.time()}"
+        ex.ask(key, {"cpus": cpus})
+        job = engine.submit("far", lab_tasks.granted, range(2), key=key, journal="j", on_results=got.extend)
+        assert engine.wait(job, 600).status == "completed"
+    assert {result["cpus"] for _, result in got} == {str(cpus)}  # what Slurm gave, read on the node
+
+
 @pytest.mark.parametrize("pattern, nth, action", [
-    ("tar xf -", 1, "fail"), ("sha256sum -c", 1, "fail"), ("sbatch", 1, "fail"), (".poll.", 2, "fail"),
-    (".poll.", 6, "fail"), ("tar xf -", 1, "ack"), ("sbatch", 1, "ack")])
+    ("tar xf -", 1, "fail"), ("sha256sum -c", 1, "fail"), (SUBMIT, 1, "fail"), (".poll.", 2, "fail"),
+    (".poll.", 6, "fail"), ("tar xf -", 1, "ack"), (SUBMIT, 1, "ack")])
 def test_one_ssh_call_that_fails_does_not_fail_the_campaign(request, said, pattern, nth, action):
     ex = far()
     ex.remote.fault(pattern, nth, action)
@@ -160,10 +187,11 @@ def test_a_campaign_waits_out_a_network_that_goes_and_says_so(request, said):
     assert seen and "has not answered since" in seen[0]
 
 
+@pytest.mark.skipif(SGE, reason="SoGE's qacct tells a qdel from a killed runner by nothing: it goes again")
 def test_a_job_cancelled_there_fails_and_goes_again_when_sent_again(request, said):
     def cancel(engine, job):
         until(lambda: lab_tasks.GOT)
-        lab(f"scancel $(cat $(ls -td {FAR}/c*-* | head -1)/queue.id)")
+        lab(f"{CANCEL} $(cat $(ls -td {FAR}/c*-* | head -1)/queue.id)")
 
     p = params(request, n=20)
     assert run(p, said, during=cancel).status == "failed"
@@ -175,8 +203,8 @@ def test_a_job_cancelled_there_fails_and_goes_again_when_sent_again(request, sai
 def test_a_runner_killed_there_is_resumed_from_its_journal(request, said):
     def kill(engine, job):
         until(lambda: len(lab_tasks.GOT) >= 2)
-        lab("for h in slurm-worker1 slurm-worker2; do ssh -o StrictHostKeyChecking=no $h "
-            "pkill -9 -f ms_flow.runner; done")
+        lab("pkill -9 -f [m]s_flow.runner" if SGE else "for h in slurm-worker1 slurm-worker2; do "
+            "ssh -o StrictHostKeyChecking=no $h pkill -9 -f ms_flow.runner; done")
 
     assert run(params(request, n=20), said, during=kill).status == "completed"
     assert set(got()) == set(range(20))
@@ -185,7 +213,7 @@ def test_a_runner_killed_there_is_resumed_from_its_journal(request, said):
 def test_a_campaign_whose_directory_is_purged_mid_run_goes_again(request, said):
     def purge(engine, job):
         until(lambda: len(lab_tasks.GOT) >= 2)
-        lab(f"d=$(ls -td {FAR}/c*-* | head -1); scancel $(cat $d/queue.id); rm -rf $d")
+        lab(f"d=$(ls -td {FAR}/c*-* | head -1); {CANCEL} $(cat $d/queue.id); rm -rf $d")
 
     assert run(params(request, n=20), said, during=purge).status == "completed"
     assert set(got()) == set(range(20))
@@ -210,7 +238,7 @@ def test_a_file_spoiled_there_is_sent_again(request, said):
         ex.remote.down_until = float("inf")
         raise HostError("ssh: connect to host 127.0.0.1 port 2222: Connection refused")
 
-    ex.remote.fault("sbatch", 1, gone)
+    ex.remote.fault(SUBMIT, 1, gone)
     with lab_engine(said, ex) as engine:
         Flow(engine, None).submit(lab_tasks.screen, p, executor="far", journal="j")
         until(lambda: ex.remote.down_until, 120)
@@ -240,16 +268,17 @@ def test_two_clients_of_one_campaign_queue_one_job(request, said):
     assert int(lab(f"ls -d {FAR}/c*-* | wc -l")) == int(dirs or 0) + 1  # one campaign, whatever its hash seed
 
 
-@pytest.mark.parametrize("jobs, setup", [
-    (2, "#SBATCH --nodelist=slurm-worker1\n#SBATCH --cpus-per-task=1"),  # two allocations on one node
-    (1, "#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=1"),               # Ray over two nodes
-    (2, "#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=1")])              # two of those at once
-def test_jobs_that_share_nodes_do_not_meet(request, said, jobs, setup):
+@slurm_only
+@pytest.mark.parametrize("jobs, setup, nodes", [
+    (2, "#SBATCH --nodelist=slurm-worker1", 0),  # two allocations on one node
+    (1, "", 2),                                  # Ray over two nodes
+    (2, "", 2)])                                 # two of those at once
+def test_jobs_that_share_nodes_do_not_meet(request, said, jobs, setup, nodes):
     snaps = [None] * jobs
 
     def go(i):
         snaps[i] = run(params(request, tag=f"{request.node.name}-{time.time()}-{i}", nap=3), tempfile.mkdtemp(),
-                       far(setup), seconds=400)
+                       far(setup, nodes=nodes, cpus=1), seconds=400)
 
     threads = [threading.Thread(target=go, args=(i,)) for i in range(jobs)]
     [t.start() for t in threads]

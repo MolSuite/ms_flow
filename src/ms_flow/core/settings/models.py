@@ -71,7 +71,8 @@ class HostConfig(BaseModel):
 
 def _of(kind: str, default: Any, description: str, **limits) -> Any:
     """A field of `ExecutorConfig` that only one kind of executor reads: a form shows it for that one."""
-    return Field(default=default, description=f"`{kind}`: {description}", json_schema_extra={"kind": kind}, **limits)
+    held = {"default_factory": list} if default == [] else {"default": default}
+    return Field(**held, description=f"`{kind}`: {description}", json_schema_extra={"kind": kind}, **limits)
 
 
 class ExecutorConfig(BaseModel):
@@ -88,7 +89,18 @@ class ExecutorConfig(BaseModel):
         description="`ray`: the machines of its cluster, `local` being this one. `queue`: the login node alone, "
                     "which is `local` when this runs on it.")
     scheduler: Literal["slurm", "sge", "none"] = _of("queue", "slurm", "who keeps the queue.")
-    setup: str = _of("queue", "", "the shell lines that prepare the environment before the runner starts.")
+    partition: str = _of("queue", "", "the partition its jobs go to. Empty: the queue's default.")
+    account: str = _of("queue", "", "the account its jobs are charged to. Empty: the queue's default.")
+    nodes: int = _of("queue", 0, "how many nodes each job asks for. 0: the queue's default (one).", ge=0)
+    cpus: int = _of("queue", 0, "how many CPUs each job asks for on each node. 0: the queue's default.", ge=0, title="CPUs")
+    gpus: int = _of("queue", 0, "how many GPUs each job asks for on each node.", ge=0, title="GPUs")
+    memory_gb: int = _of("queue", 0, "how much memory each job asks for on each node. 0: the queue's default.",
+                         ge=0, title="Memory (GB)")
+    time: str = _of("queue", "", "how long a job may run, as the queue writes it (`2-00:00:00`). Empty: its default.")
+    modules: List[str] = _of("queue", [], "the `module` commands before the runner starts, in order, without the "
+                             "word `module`: `purge`, `load gcc/12`.")
+    setup: str = _of("queue", "", "the site's own lines: other `#SBATCH` (`#$`) lines, then the shell lines that "
+                     "prepare the environment before the runner starts.")
     runner: str = _of("queue", "", "arguments for the runner, like `--ray auto` or `--cpus 16`.")
     template: str = _of("queue", "", "a file with the script the queue runs. Empty is the one built in.")
     elements_per_job: int = _of("queue", 0, "how many elements go in each job of the queue. 0 is all of them.", ge=0)
