@@ -309,6 +309,8 @@ class Flow:
             if running is not None:
                 return running
             engine["key"], executor = far.key, "thread"
+            if engine.get("total") is None:
+                engine["total"] = far.total
         # How many elements to a task: whoever submits, then the executor (a job in a queue takes
         # what its settings say), then the author of the task.
         own = getattr(self.engine.executor(executor), "batch", None)

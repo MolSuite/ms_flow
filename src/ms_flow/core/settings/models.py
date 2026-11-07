@@ -61,18 +61,33 @@ class HostConfig(BaseModel):
     keep_after: float = Field(
         default=7, ge=0, title="Keep campaigns (days)",
         description="How long a campaign's directory stays in the work directory once all of it came back or "
-                    "it was canceled. 0: it goes then.")
+                    "it was canceled. 0: it goes then.", json_schema_extra={"guarded": False})
     tools: Dict[str, str] = Field(
         default_factory=dict, description="Where a program is there, by its name, when it is not the one the app installs.")
     install: Optional[List[str]] = Field(
         default=None, title="Programs",
-        description="The programs the app installs there, by name. None: each one it has here.")
+        description="The programs the app installs there, by name. None: each one it has here.",
+        json_schema_extra={"guarded": False})  # read by Sync, which is refused while the host is in use
 
 
-def _of(kind: str, default: Any, description: str, **limits) -> Any:
-    """A field of `ExecutorConfig` that only one kind of executor reads: a form shows it for that one."""
+def guarded(model, field: str) -> bool:
+    """Whether changing `field` of a kept `model` entry waits until no active executor uses it
+    (the default), or is taken while it runs: what each job asks the queue, not how it is reached."""
+    return (model.model_fields[field].json_schema_extra or {}).get("guarded", True)
+
+
+def _of(kind: str, default: Any, description: str, guarded: bool = True, **limits) -> Any:
+    """A field of `ExecutorConfig` that only one kind of executor reads: a form shows it for that one.
+    `guarded=False`: an active executor takes a change of it as it runs (see `guarded`)."""
     held = {"default_factory": list} if default == [] else {"default": default}
-    return Field(**held, description=f"`{kind}`: {description}", json_schema_extra={"kind": kind}, **limits)
+    extra = {"kind": kind} if guarded else {"kind": kind, "guarded": False}
+    return Field(**held, description=f"`{kind}`: {description}", json_schema_extra=extra, **limits)
+
+
+def _asked(default: Any, description: str, **limits) -> Any:
+    """A field of a `queue` that says what each of its jobs asks for, or how it is watched: one
+    that is active takes a change of it for the jobs it sends next."""
+    return _of("queue", default, description, guarded=False, **limits)
 
 
 class ExecutorConfig(BaseModel):
@@ -89,23 +104,23 @@ class ExecutorConfig(BaseModel):
         description="`ray`: the machines of its cluster, `local` being this one. `queue`: the login node alone, "
                     "which is `local` when this runs on it.")
     scheduler: Literal["slurm", "sge", "none"] = _of("queue", "slurm", "who keeps the queue.")
-    partition: str = _of("queue", "", "the partition its jobs go to. Empty: the queue's default.")
-    account: str = _of("queue", "", "the account its jobs are charged to. Empty: the queue's default.")
-    nodes: int = _of("queue", 0, "how many nodes each job asks for. 0: the queue's default (one).", ge=0)
-    cpus: int = _of("queue", 0, "how many CPUs each job asks for on each node. 0: the queue's default.", ge=0, title="CPUs")
-    gpus: int = _of("queue", 0, "how many GPUs each job asks for on each node.", ge=0, title="GPUs")
-    memory_gb: int = _of("queue", 0, "how much memory each job asks for on each node. 0: the queue's default.",
-                         ge=0, title="Memory (GB)")
-    time: str = _of("queue", "", "how long a job may run, as the queue writes it (`2-00:00:00`). Empty: its default.")
-    modules: List[str] = _of("queue", [], "the `module` commands before the runner starts, in order, without the "
-                             "word `module`: `purge`, `load gcc/12`.")
+    partition: str = _asked("", "the partition its jobs go to. Empty: the queue's default.")
+    account: str = _asked("", "the account its jobs are charged to. Empty: the queue's default.")
+    nodes: int = _asked(0, "how many nodes each job asks for. 0: the queue's default (one).", ge=0)
+    cpus: int = _asked(0, "how many CPUs each job asks for on each node. 0: the queue's default.", ge=0, title="CPUs")
+    gpus: int = _asked(0, "how many GPUs each job asks for on each node.", ge=0, title="GPUs")
+    memory_gb: int = _asked(0, "how much memory each job asks for on each node. 0: the queue's default.",
+                            ge=0, title="Memory (GB)")
+    time: str = _asked("", "how long a job may run, as the queue writes it (`2-00:00:00`). Empty: its default.")
+    modules: List[str] = _asked([], "the `module` commands before the runner starts, in order, without the "
+                            "word `module`: `purge`, `load gcc/12`.")
     setup: str = _of("queue", "", "the site's own lines: other `#SBATCH` (`#$`) lines, then the shell lines that "
                      "prepare the environment before the runner starts.")
     runner: str = _of("queue", "", "arguments for the runner, like `--ray auto` or `--cpus 16`.")
     template: str = _of("queue", "", "a file with the script the queue runs. Empty is the one built in.")
-    elements_per_job: int = _of("queue", 0, "how many elements go in each job of the queue. 0 is all of them.", ge=0)
-    max_jobs: int = _of("queue", 0, "how many jobs it has in the queue at once. 0 is any number.", ge=0)
-    poll_seconds: float = _of("queue", 30, "how often the queue is asked.", gt=0)
+    elements_per_job: int = _asked(0, "how many elements go in each job of the queue. 0 is all of them.", ge=0)
+    max_jobs: int = _asked(0, "how many jobs it has in the queue at once. 0 is any number.", ge=0)
+    poll_seconds: float = _asked(30, "how often the queue is asked.", gt=0)
     shared_disk: Optional[bool] = _of(
         "queue", None, "whether the other side sees the disk of this machine. Unset: only on `local`.")
 

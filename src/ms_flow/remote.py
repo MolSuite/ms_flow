@@ -49,7 +49,10 @@ def unreachable(error: BaseException) -> bool:
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
 # `cancel` stops the job `{id}`; `state` prints `CANCELLED` for the job `{id}` once it left the
-# queue because somebody canceled it (and maybe something else), nothing when that is not known.
+# queue because somebody canceled it (and maybe something else), nothing when that is not known;
+# `usage`, where the queue keeps accounts, what its accounting says the job `{id}` used, read by
+# `read_usage` (standard Slurm and Grid Engine commands, not a site's own `seff`/`arc.job-info`);
+# `nodes`, the nodes of the queue and what is taken of each, read by `read_nodes`.
 SCHEDULERS = {
     # Its ids are process ids, which the system gives out again: one counts only while it is this.
     "none": {"submit": "setsid nohup sh job.sh > runner.log 2>&1 < /dev/null & echo $!",
@@ -57,7 +60,11 @@ SCHEDULERS = {
              "cancel": "ps -ww -o args= -p {id} | grep -q -e job.sh -e ms_flow.runner && kill -- -{id}",
              "state": ":"},
     "slurm": {"submit": "sbatch --parsable job.sh", "alive": "squeue -h -o %i -t PD,CF,R,CG,S,RQ,RS -j {ids}",
-              "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1"},
+              "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1",
+              "usage": "sacct -n -P -o JobID,Elapsed,TotalCPU,AllocCPUS,MaxRSS,ReqMem,State -j {id} | sed 's/^/A|/'; "
+                       "sstat -n -P -a -o JobID,AveCPU,MaxRSS,NTasks -j {id} 2>/dev/null | sed 's/^/S|/'",
+              "nodes": "sinfo -N -h -O 'NodeList:0|,StateLong:0|,CPUsState:0|,Memory:0|,AllocMem:0|,Gres:0|,"
+                       "GresUsed:0|,CPUsLoad:0|,Partition:0|'"},
     # Run against Son of Grid Engine 8.1.9 (the vHPC lab's lab/sge). A Grid Engine whose qacct has
     # `deleted_by` says who canceled; SoGE's has not, and its record of a running job that qdel stopped
     # (`failed 100`, exit 137) is that of a runner the system killed (out of memory, h_rt): one taken
@@ -70,8 +77,120 @@ SCHEDULERS = {
             "cancel": "qdel {id}",
             "state": "for i in $(seq 30); do qacct -j {id} > /dev/null 2>&1 || "
                      "qstat | awk 'NR > 2 {{print $1}}' | grep -qx {id} && break; sleep 1; done; "
-                     "qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"; exit}}'"},
+                     "qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"; exit}}'",
+            "usage": "qstat -j {id} 2>/dev/null | sed -n 's/^usage *[0-9]*: */U|/p'; qacct -j {id} 2>/dev/null | sed 's/^/Q|/'",
+            "nodes": "qhost -q"},
 }
+
+# Slurm's states of a job that has not ended yet.
+_GOING = {"PENDING", "RUNNING", "SUSPENDED", "REQUEUED", "RESIZING", "COMPLETING", "CONFIGURING", "REQUEUE_HOLD"}
+
+
+def _seconds(text: str) -> float:
+    """`1-02:03:04`, `02:03:04`, `03:04.5` (Slurm), `20.3s` or `20` (qacct), `0:01:02:03` (qstat)."""
+    days, _, text = text.strip().removesuffix("s").rpartition("-")
+    parts = [float(part) for part in text.split(":")]
+    return sum(part * weight for part, weight in zip(reversed(parts), (1, 60, 3600, 86400))) + float(days or 0) * 86400
+
+
+def _mb(text: str) -> float:
+    """`214784K`, `800M`, `4Gc` (Slurm, binary units), `211.738MB` (Grid Engine), in MB."""
+    number = re.match(r"([\d.]+)\s*([KMGTP]?)", text.strip())
+    return float(number[1]) * 1024 ** ("KMGTP".index(number[2]) - 1 if number[2] else -2)
+
+
+def read_usage(said: str) -> dict:
+    """What the queue's `usage` command said a job used: `wall_s`, `cpu_s` (CPU time, all of its
+    CPUs added), `cpus` (allocated), `peak_mem_mb` (of its processes, at most), `mem_mb` (asked for,
+    where the queue tells) and `final` (the accounting of a job that ended, else what it is at).
+    What the queue did not say is None; a line it says otherwise is left out."""
+    used = {"wall_s": None, "cpu_s": None, "cpus": None, "peak_mem_mb": None, "mem_mb": None, "final": False}
+    live = 0.0
+
+    def peak(text):
+        if text.strip() and text.strip() != "N/A":
+            used["peak_mem_mb"] = max(used["peak_mem_mb"] or 0.0, _mb(text))
+
+    for line in said.splitlines():
+        kind, _, rest = line.partition("|")
+        try:
+            if kind == "A":  # sacct: the job, then each of its steps (what they used is on them)
+                name, elapsed, cpu, cpus, rss, asked, state = rest.split("|")[:7]
+                if "." not in name:
+                    used.update(wall_s=_seconds(elapsed), cpu_s=_seconds(cpu), cpus=int(cpus),
+                                final=(state.split() or [""])[0] not in _GOING)
+                    if asked:  # `c`: per CPU (Slurm before 21.08)
+                        used["mem_mb"] = _mb(asked) * (int(cpus) if asked.endswith("c") else 1)
+                peak(rss)
+            elif kind == "S":  # sstat, while it runs: the steps' CPU time so far
+                _, cpu, rss, tasks = rest.split("|")[:4]
+                live += _seconds(cpu) * int(tasks or 1)
+                peak(rss)
+            elif kind == "Q":  # qacct, once it ended: one record each (a parallel job's tasks too)
+                key, _, value = rest.partition(" ")
+                value, used["final"] = value.strip(), True
+                if key == "ru_wallclock":
+                    used["wall_s"] = max(used["wall_s"] or 0.0, _seconds(value))
+                elif key == "cpu":
+                    used["cpu_s"] = (used["cpu_s"] or 0.0) + _seconds(value)
+                elif key == "slots":
+                    used["cpus"] = max(used["cpus"] or 0, int(value))
+                elif key == "maxvmem":
+                    peak(value)
+            elif kind == "U" and not used["final"]:  # qstat, while it runs: `cpu=00:00:05, mem=..., maxvmem=1.2G`
+                fields = dict(field.strip().partition("=")[::2] for field in rest.split(","))
+                live = max(live, _seconds(fields.get("cpu") or "0"))
+                peak(fields.get("maxvmem", ""))
+        except (ValueError, TypeError, IndexError):
+            continue
+    if not used["final"] and live:
+        used["cpu_s"] = max(used["cpu_s"] or 0.0, live)
+    return used
+
+def _gres(text: str) -> int:
+    """The GPUs in Slurm's `gpu:a100:4(S:0-1),shard:8` (or `gpu:2(IDX:0-1)` used): 4, 2."""
+    return sum(int(match[1]) for match in re.finditer(r"(?:^|,)gpu(?::[^:,(]+)*?:(\d+)", text))
+
+
+def _gb(text: str) -> float:
+    return 0.0 if text == "-" else _mb(text) / 1024  # `-`: a Grid Engine host that is down
+
+
+def read_nodes(said: str) -> list[dict]:
+    """What the queue's `nodes` command said: one dict for each node, with `name`, `state`,
+    `cpus`, `cpus_used` (allocated), `mem_gb`, `mem_used_gb` (allocated on Slurm, in use on Grid
+    Engine), `gpus`, `gpus_used`, `load` and `partitions` (Slurm's; the queues on Grid Engine)."""
+    nodes: dict[str, dict] = {}
+    host = None
+    for line in said.splitlines():
+        fields = line.split("|")
+        try:
+            if len(fields) >= 9:  # sinfo: a node once for each partition it is in
+                name, state, cpus, mem, alloc, gres, used, load, partition = (f.strip() for f in fields[:9])
+                node = nodes.setdefault(name, {
+                    "name": name, "state": state, "cpus": int(cpus.split("/")[3]), "cpus_used": int(cpus.split("/")[0]),
+                    "mem_gb": float(mem) / 1024, "mem_used_gb": float(alloc) / 1024, "gpus": _gres(gres),
+                    "gpus_used": _gres(used), "load": float(load) if load.replace(".", "", 1).isdigit() else None,
+                    "partitions": []})
+                node["partitions"].append(partition.rstrip("*"))
+                continue
+            words = line.split()
+            if len(words) == 11 and words[0] not in ("HOSTNAME", "global"):  # qhost
+                load = words[6]
+                host = nodes[words[0]] = {
+                    "name": words[0], "state": "down" if load == "-" else "up", "cpus": int(words[2]), "cpus_used": 0,
+                    "mem_gb": _gb(words[7]), "mem_used_gb": _gb(words[8]),
+                    "gpus": 0, "gpus_used": 0, "load": None if load == "-" else float(load), "partitions": []}
+            elif host is not None and len(words) >= 3 and words[2].count("/") == 2:  # its queues: resv/used/total slots
+                if not host["partitions"]:
+                    host["cpus"] = 0  # what its queues give, not what it has
+                host["partitions"].append(words[0])
+                host["cpus_used"] += int(words[2].split("/")[1])
+                host["cpus"] += int(words[2].split("/")[2])
+        except (ValueError, IndexError):
+            continue
+    return list(nodes.values())
+
 
 # What the queue runs, in the directory of the job: the runner with a pool of processes.
 JOB_SH = "#!/bin/sh\n@setup@\nexec @python@ -m ms_flow.runner . @runner@\n"
@@ -277,6 +396,16 @@ class RemoteExecutor:
         self._thread.join(5)  # ponytail: a command that is taking longer is left to end by itself
 
     # --- For whoever looks after the other machine: these wait for it, so not for the engine ---
+
+    def queue_nodes(self) -> list[dict]:
+        """The nodes of its queue now (`read_nodes`), those of the partition it asks for if it
+        asks for one. A queue that has no `nodes` command: none. Waits for the other machine."""
+        command = self.queue.get("nodes")
+        if not command:
+            return []
+        nodes = read_nodes(self.remote.run(f"{{ {command}; }} 2>/dev/null; :", timeout=self.poll_timeout).decode(errors="replace"))
+        partition = self.asks.get("partition")
+        return [node for node in nodes if not partition or partition in node["partitions"]]
 
     def jobs_there(self) -> list[dict]:
         """What the account has in `workdir` over there, whichever process sent it: for each job

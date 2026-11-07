@@ -1,4 +1,5 @@
 """Campaigns against this machine's `none` queue: the same commands a cluster gets, run by `sh` here."""
+import json
 import os
 import shutil
 import subprocess
@@ -73,9 +74,9 @@ def screen(params, project):
 
 
 def _far(tmp_path, **options):
-    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, poll_s=0.2, part_seconds=0.1, runner="--cpus 2",
+    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, part_seconds=0.1, runner="--cpus 2",
                           setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}:{_ROOT / 'tests'}:{os.environ.get('PYTHONPATH', '')}",
-                          **options)
+                          **{"poll_s": 0.2, **options})
 
 
 def _engine(tmp_path, far):
@@ -126,9 +127,13 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         slow = flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j")
         _until(lambda: len(_dirs(tmp_path)) == 2 and GOT)
         engine.cancel(slow)
-        assert engine.wait(slow, 60).status == "canceled"
+        assert engine.status(slow).canceling and engine.status(slow).status == "running"  # until it is gone there
+        assert engine.wait(slow, 60).status == "canceled" and not engine.status(slow).canceling
         [canceled] = set(_dirs(tmp_path)) - {first}
-        _until(lambda: (tmp_path / "far" / canceled / "cancelled").exists())
+        # Only then: its queue job is gone, not left to run on its own.
+        assert (tmp_path / "far" / canceled / "cancelled").exists()
+        pid = (tmp_path / "far" / canceled / "queue.id").read_text().strip()
+        assert subprocess.run(["ps", "-p", pid], capture_output=True).returncode != 0
         GOT.clear()
         done = engine.wait(flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j"), 120)
         assert done.status == "completed_with_errors" and len([row for row in GOT if row["stage"] == "vs"]) == 39
@@ -195,6 +200,31 @@ def test_a_campaign_asks_the_queue_for_itself_and_stays_the_same_campaign(tmp_pa
             far.script_for({"queue": "x"})
     finally:
         far.shutdown()
+
+
+@campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
+def one_stage(params, project):
+    said = Path(os.environ["CAMPAIGN_FILE"])
+    return [Stage("vs", square, [{"n": n, "f": File(said), "out": Dir(said.parent / "work")} for n in range(params.n)])]
+
+
+def test_a_campaign_of_one_stage_has_its_total_its_queue_and_says_where_it_is(tmp_path, monkeypatch):
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    engine, flow = _engine(tmp_path, _far(tmp_path))
+    with engine:
+        job = flow.submit(one_stage, {"n": 12, "nap": 1}, executor="far", journal="j")
+        now = engine.status(job)
+        assert now.chunks_total == 12 and now.executor == "far"  # from the start, not "thread" and "?"
+        _until(lambda: "running in the queue (job " in (engine.status(job).note or ""))
+        ended = engine.wait(job, 120)
+    assert ended.chunks_total == 12 and ended.chunks_done == 11 and ended.note is None, ended.error
+    lines = [line.split(":")[0].split(" (")[0] for _at, line in ended.steps]  # each step once, in order
+    assert lines[:3] == ["staging its elements and their files here", "checksumming the 12 elements staged and their files",
+                         "looking for it on this machine"], lines
+    assert "running in the queue" in lines and lines[-1] == "it ended there", lines
+    assert [at for at, _line in ended.steps] == sorted(at for at, _line in ended.steps)
+    assert [json.loads(row["spec"])["executor"] for row in engine.recorded("j")] == ["far"]
 
 
 def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeypatch):
@@ -281,3 +311,19 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatc
         assert locations.known(project, locations.host_of(far)) == {}
         assert engine.wait(flow.submit(screen, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
         assert sent.count("in/said.txt") == 2 and (there / "in" / "said.txt").exists()
+
+
+def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(tmp_path, monkeypatch):
+    import ms_flow.campaign as module
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    monkeypatch.setattr(module, "_GLANCE_EVERY", 0.1)
+    glances, glance = [], Campaign._glance
+    monkeypatch.setattr(Campaign, "_glance", lambda self: glances.append(1) or glance(self))
+    GOT.clear()
+    engine, flow = _engine(tmp_path, _far(tmp_path, poll_s=2))
+    with engine:
+        ended = engine.wait(flow.submit(screen, {"n": 12, "nap": 0.3}, executor="far", journal="j"), 120)
+    assert ended.status == "completed_with_errors", ended.error
+    assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(12) if n != 3}  # parts on the rounds
+    assert len(glances) > 5

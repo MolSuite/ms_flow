@@ -144,6 +144,12 @@ def test_the_workspace_runs_on_the_executors_the_settings_describe(tmp_path, mon
         assert _until(lambda: ms.remote_jobs("far") == [])  # asked of that machine: what ended well leaves nothing
         assert ms.remote_jobs("local") == []  # nothing is anywhere else
 
+        # What its jobs ask the queue for is taken while it is active; how it runs them is not.
+        far = dict(kind="queue", scheduler="none", setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}")
+        ms.save_executor("far", **far, poll_seconds=0.3, cpus=4)
+        assert (ms.engine.executor("far").poll_s, ms.engine.executor("far").asks["cpus"]) == (0.3, 4)
+        with pytest.raises(ValueError, match="in use by `far`"):
+            ms.save_executor("far", **far, poll_seconds=0.3, cpus=4, runner="--cpus 2")
         with pytest.raises(ValueError, match="in use by `far`"):  # the queue is made of this machine as it is kept
             ms.save_host("local", cpus=2)
         ms.deactivate("far")

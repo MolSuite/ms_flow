@@ -58,7 +58,7 @@ from ms_flow import locations
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.flow import job, task
 from ms_env import HostError
-from ms_flow.remote import RemoteExecutor, _untar, unreachable
+from ms_flow.remote import RemoteExecutor, _untar, read_usage, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
 
 log = logging.getLogger(__name__)
@@ -88,6 +88,9 @@ class Stage:
     reduce: Optional[Callable] = None
     deliver: str = "stream"
     digests: Optional[dict] = None
+
+
+_LET_GO = 120.0  # seconds a queue has to let a canceled job go before that is an error
 
 
 @task(cpu=0, thread=True)
@@ -149,7 +152,7 @@ def prepare(engine, job, params, executor: str, project, journal: str | None, as
     remote = engine.executor(executor)
     if not isinstance(remote, RemoteExecutor):
         raise ValueError(f"a campaign runs on an executor of kind `queue`, and `{executor}` is not one")
-    far = Campaign(remote, job, params, project, asks)
+    far = Campaign(remote, job, params, project, asks, executor=executor)
     running = next((job_id for job_id, held in tuple(engine._jobs.items()) if held.key == far.key), None)
     if running is not None:
         far.close()
@@ -163,16 +166,34 @@ def prepare(engine, job, params, executor: str, project, journal: str | None, as
     return far, None
 
 
+# How often, at most, a running campaign asks the queue's accounting what its job used (it
+# asks once more at the end): sacct goes to the cluster's database, which sites ask to spare.
+_ACCOUNT_EVERY = 300.0
+# Its first minutes are when someone watches it start: a glance at its progress every second
+# then (a few hundred bytes over the connection ssh keeps open), the parts made only every
+# `poll_s`, so a stage that ends fast does not send a part a second.
+_GLANCE_FOR, _GLANCE_EVERY = 300.0, 1.0
+
+
 class Campaign:
     """The source of the job that follows a campaign: it sends it, or finds it, and gives what
     comes back as it comes, `{"_key", "result"}` or `{"_key", "error"}`. Read on the engine's
-    feeding thread; `ended` stops it."""
+    feeding thread; `ended` stops it. `executor` is the queue it goes to, which is where the job
+    that follows it is shown; `total` is how many results come back, when that is known before
+    (one stage, each result as it comes), else None; `note` is what it is at, in a line, and
+    `steps` every step it went through, `(time, line)`, the quick ones too; `queue_usage` what the
+    queue's accounting says its job there used (`read_usage`, and `job`), None until it says."""
 
-    def __init__(self, remote: RemoteExecutor, job, params, project, asks: dict | None = None):
+    def __init__(self, remote: RemoteExecutor, job, params, project, asks: dict | None = None, executor: str = ""):
         spec = job.__job__
         stages = list(job(params, project))
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
+        self.executor, self.total, self.steps = executor or None, None, []
+        self.queue_usage, self._accounted = None, 0.0
+        self.note = "staging its elements and their files here"
+        # Canceling: nothing goes to the queue from then on, and what is there is stopped (`stop_there`).
+        self._submitting, self._canceling, self._stopped = threading.Lock(), False, False
         self.project, uid = project, locations.uid(project)
         # The project's files go to its folder there, once for every campaign; any other, with it.
         self._store = f"../projects/{uid}/" if uid else None
@@ -207,8 +228,11 @@ class Campaign:
                        "from": None if place == 0 else (stage.source.stage, stage.source.fn,
                                                         swap(tuple(stage.source.args), carry))}
                       for place, stage in enumerate(stages)]
-            stage_campaign(self._tmp, listed, (swap(payload, carry) for payload in stages[0].source),
+            elements = stage_campaign(self._tmp, listed, (swap(payload, carry) for payload in stages[0].source),
                            part_seconds=remote.part_seconds)
+            if len(stages) == 1 and stages[0].deliver == "stream":
+                self.total = elements
+            self.note = f"checksumming the {elements:,} elements staged and their files"
             manifest = {name: _sha256(self._tmp / name) for name in ("spec.json", "elements.jsonl")}
             manifest.update(self._shas)
             (self._tmp / "manifest.sha").write_text("".join(f"{sha}  {name}\n" for name, sha in sorted(manifest.items())))
@@ -225,10 +249,25 @@ class Campaign:
             raise
         self.stem = f"c{self.key[:24]}"
 
+    @property
+    def note(self) -> str | None:
+        return self._note
+
+    @note.setter
+    def note(self, line: str | None) -> None:
+        # The same step with new figures ("running in the queue (job 7): 3 of 9 done") is the
+        # line of the step it is in, not one more step.
+        self._note = line
+        if line is not None and self.steps and self.steps[-1][1].split(":")[0] == line.split(":")[0]:
+            self.steps[-1] = (self.steps[-1][0], line)
+        elif line is not None:
+            self.steps.append((time.time(), line))
+
     # --- What the engine reads ---------------------------------------------------------------
 
     def __iter__(self):
         try:
+            self.note = f"looking for it on {self._where()}"
             self._patiently(lambda: (self._sweep(), self._place()))  # finding it there again does not repeat it
             # What was sent stays here until the end: an attempt that lost what it made goes again.
             yield from self._follow()
@@ -245,6 +284,26 @@ class Campaign:
     def reconnect(self) -> None:
         self.remote.reconnect()
 
+    def stop_there(self) -> None:
+        """Cancel its job in the queue and wait for the queue to let it go, asking again while
+        the other machine does not answer: what `Engine.cancel` waits for before the job that
+        follows it counts as canceled. Its directory is marked `cancelled` there."""
+        with self._submitting:
+            self._canceling, job = True, self.job
+        if self.dir is None:
+            return
+        here, queue = f"{self.remote.workdir}/{self.dir}", self.remote.queue
+        self.note = f"canceling {f'job {job}' if job else 'it'} in the queue of {self._where()}"
+        self._patiently(lambda: self._run(f"cd {here} || exit 0; touch cancelled; "
+                                          f"{'' if not job else queue['cancel'].format(id=job) + ' 2>/dev/null'}; :"))
+        limit = time.monotonic() + _LET_GO
+        while job and not self._stop.is_set() and self._patiently(lambda: self._look(self.dir))["alive"]:
+            if time.monotonic() > limit:
+                raise RuntimeError(f"job {job} is still in the queue of {self._where()} {_LET_GO:.0f} s after "
+                                   f"it was canceled{self._kept()}")
+            self._stop.wait(2)
+        self._stopped = True
+
     def ended(self, snapshot) -> None:
         """The job that follows it ended: a campaign canceled here is canceled there, and one
         that is all here is kept for `keep_after` days. Interrupted or failed, it is left as it is."""
@@ -253,7 +312,7 @@ class Campaign:
             return
         here, queue = f"{self.remote.workdir}/{self.dir}", self.remote.queue
         try:
-            if snapshot.status == "canceled":
+            if snapshot.status == "canceled" and not self._stopped:
                 self._run(f"cd {here} || exit 0; id=$(cat queue.id 2>/dev/null); "
                           f"[ -z \"$id\" ] || {{ {queue['cancel'].format(id='$id')}; }} 2>/dev/null; touch cancelled")
             elif snapshot.status.startswith("completed"):
@@ -342,6 +401,7 @@ class Campaign:
 
     def _attempt(self) -> None:
         self.dir = f"{self.stem}-{self.n}"
+        self.note = f"sending its files to {self._where()}"
         self._upload([name for name in self._local if not self._stored(name)], make=True)
         self._fill()  # and what of the project's folder is not there yet
         self._submit()
@@ -391,6 +451,7 @@ class Campaign:
         """What was sent is all there, as it was here: what is missing or not the same goes again.
         What of the project's folder was verified there before is checked by its size, the rest by
         its sha256 (`ms_flow.locations`)."""
+        self.note = f"checking the files on {self._where()}"
         host = locations.host_of(self.remote)
         known = locations.known(self.project, host) if self._store else {}
         lines = []
@@ -417,16 +478,30 @@ class Campaign:
         raise OSError(f"campaign {self.dir}: what was sent is not what arrived: {', '.join(wrong[:5])}")
 
     def _submit(self) -> None:
-        self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
+        with self._submitting:  # never after `stop_there` read which job to cancel
+            if self._canceling:
+                return
+            self.note = f"submitting it to the queue of {self._where()}"
+            self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
 
     def _follow(self):
         """Every round, one command: the progress, whether the job is in the queue, and whatever
-        is new of each stage. What comes is given, under a key of its attempt."""
+        is new of each stage. What comes is given, under a key of its attempt. In between, for
+        its first `_GLANCE_FOR` seconds, only its progress (`_glance`)."""
         streamed = [stage.name for stage in self.stages if stage.deliver == "stream"]
         reduced = {stage.name for stage in self.stages if stage.deliver == "reduced"}
         parts, errors = dict.fromkeys(streamed, 0), {stage.name: 0 for stage in self.stages}
         queue, ending, was, again = self.remote.queue, False, None, False
+        glancing, round_at = time.monotonic() + _GLANCE_FOR, 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            if now < glancing and now < round_at + self.remote.poll_s and not self._canceling:
+                told, alive = self._patiently(self._glance)
+                self._tell(told, alive)
+                if alive and not self._complete(told) and told.get("status") != "failed":
+                    self._stop.wait(_GLANCE_EVERY)
+                    continue  # anything else is for a whole round to see, now
+            round_at = time.monotonic()
             asked = " ".join(f"{name}:{parts[name]}" for name in streamed)
             command = (
                 f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; t=.poll.$$; "
@@ -440,6 +515,10 @@ class Campaign:
             files = self._patiently(lambda: _untar(self._run(command, timeout=self.remote.poll_timeout)))
             told = json.loads(next((data for name, data in files.items() if name.endswith(".told")), b"") or b"{}")
             alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
+            if not self._canceling:
+                self._tell(told, alive)
+                if alive and time.monotonic() > self._accounted + _ACCOUNT_EVERY:
+                    self._account()
             for name in streamed:
                 new = sorted(file for file in files if file.startswith(f"stages/{name}/results/part-"))
                 for file in new:
@@ -458,6 +537,9 @@ class Campaign:
                     reduced.discard(name)
                     made = unplain(json.loads(files[f"stages/{name}/reduced.json"]))
                     yield {"_key": f"{self.n}:{name}:reduced", "result": made}
+            if self._canceling:  # its end there is `stop_there`'s to see, not a failure to go on from
+                self._stop.wait(self.remote.poll_s)
+                continue
             # The progress was read before the parts were listed: complete, nothing is left out,
             # unless something removed it there (a scratch purge). Nothing at all: no directory.
             gone = None
@@ -468,6 +550,7 @@ class Campaign:
                 lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
                 lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
                 if not lost and not reduced:
+                    self._account(final=True)
                     return
                 gone = "it ended there, but what it made is not all there any longer"
             if gone:
@@ -483,6 +566,7 @@ class Campaign:
                 again, ending, was = True, False, None
                 continue
             if told.get("status") == "failed":
+                self._account()
                 raise RuntimeError(f"campaign {self.dir} failed there: {told.get('error')}{self._kept()}")
             if alive:
                 ending = False
@@ -503,7 +587,58 @@ class Campaign:
                 was, ending = now, False
                 log.info("campaign %s left the queue at %s: queued again", self.dir, now)
                 self._submit()
-            self._stop.wait(self.remote.poll_s)
+            self._stop.wait(min(_GLANCE_EVERY, self.remote.poll_s) if time.monotonic() < glancing else self.remote.poll_s)
+
+    def _glance(self) -> tuple[dict, bool]:
+        """Its progress there, and whether its job is in the queue: nothing it made."""
+        queue = self.remote.queue
+        out = self._run(f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; id=$(cat queue.id 2>/dev/null); "
+                        f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -qx \"$id\"; }} 2>/dev/null "
+                        "&& echo alive; cat progress.json 2>/dev/null; :", timeout=self.remote.poll_timeout)
+        alive = out.startswith(b"alive\n")
+        return json.loads((out[6:] if alive else out) or b"{}"), alive
+
+    def _account(self, final: bool = False) -> None:
+        """`queue_usage`, from the accounting of the queue over there (its `usage` command); with
+        `final`, its last word, waited for a while (the job leaves the queue a moment after its
+        runner ended; qacct writes it some seconds later). No accounting there: nothing."""
+        command = self.remote.queue.get("usage")
+        if not command or not self.job:
+            return
+        if final:
+            self.note = "reading what it used from the queue's accounting"
+        self._accounted = time.monotonic()
+        for _ in range(10 if final else 1):  # ponytail: 30 s at most, then what it said last
+            try:
+                used = read_usage(self._run(f"{{ {command.format(id=self.job)}; }} 2>/dev/null; :", timeout=60).decode())
+            except Exception:  # what it used is told, never what stops the campaign
+                log.debug("campaign %s: no accounting of job %s", self.dir, self.job, exc_info=True)
+                return
+            if used["cpus"] or used["cpu_s"] is not None:
+                self.queue_usage = {**used, "job": self.job}
+            if used["final"] or not final:
+                return
+            time.sleep(3)
+
+    def _where(self) -> str:
+        return self.remote.remote.address or "this machine"
+
+    def _tell(self, told: dict, alive: bool) -> None:
+        """`note` from what the runner over there last said (`progress.json`)."""
+        job = f"job {self.job}" if self.job else "its job"
+        if str(told.get("status", "")).startswith("completed"):
+            self.note = "it ended there: bringing back what it made"
+        elif alive and told.get("status") in ("waiting", "running"):
+            stage = f"stage {told.get('stage')} ({told.get('stages_done', 0) + 1} of {len(self.stages)}): " \
+                if len(self.stages) > 1 else ""
+            failed = f", {told['failed']} failed" if told.get("failed") else ""
+            self.note = f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} done{failed}"
+        elif alive and not told:
+            self.note = f"waiting in the queue ({job})"
+        elif alive:
+            self.note = f"in the queue again ({job}): {told.get('done', 0):,} of {told.get('total', 0):,} done before"
+        else:
+            self.note = f"{job} is not in the queue: looking at why"
 
     def _kept(self) -> str:
         return self.remote._said(self.dir)
