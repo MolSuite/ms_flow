@@ -169,6 +169,10 @@ def prepare(engine, job, params, executor: str, project, journal: str | None, as
 # How often, at most, a running campaign asks the queue's accounting what its job used (it
 # asks once more at the end): sacct goes to the cluster's database, which sites ask to spare.
 _ACCOUNT_EVERY = 300.0
+# Its first minutes are when someone watches it start: a glance at its progress every second
+# then (a few hundred bytes over the connection ssh keeps open), the parts made only every
+# `poll_s`, so a stage that ends fast does not send a part a second.
+_GLANCE_FOR, _GLANCE_EVERY = 300.0, 1.0
 
 
 class Campaign:
@@ -482,12 +486,22 @@ class Campaign:
 
     def _follow(self):
         """Every round, one command: the progress, whether the job is in the queue, and whatever
-        is new of each stage. What comes is given, under a key of its attempt."""
+        is new of each stage. What comes is given, under a key of its attempt. In between, for
+        its first `_GLANCE_FOR` seconds, only its progress (`_glance`)."""
         streamed = [stage.name for stage in self.stages if stage.deliver == "stream"]
         reduced = {stage.name for stage in self.stages if stage.deliver == "reduced"}
         parts, errors = dict.fromkeys(streamed, 0), {stage.name: 0 for stage in self.stages}
         queue, ending, was, again = self.remote.queue, False, None, False
+        glancing, round_at = time.monotonic() + _GLANCE_FOR, 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            if now < glancing and now < round_at + self.remote.poll_s and not self._canceling:
+                told, alive = self._patiently(self._glance)
+                self._tell(told, alive)
+                if alive and not self._complete(told) and told.get("status") != "failed":
+                    self._stop.wait(_GLANCE_EVERY)
+                    continue  # anything else is for a whole round to see, now
+            round_at = time.monotonic()
             asked = " ".join(f"{name}:{parts[name]}" for name in streamed)
             command = (
                 f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; t=.poll.$$; "
@@ -573,7 +587,16 @@ class Campaign:
                 was, ending = now, False
                 log.info("campaign %s left the queue at %s: queued again", self.dir, now)
                 self._submit()
-            self._stop.wait(self.remote.poll_s)
+            self._stop.wait(min(_GLANCE_EVERY, self.remote.poll_s) if time.monotonic() < glancing else self.remote.poll_s)
+
+    def _glance(self) -> tuple[dict, bool]:
+        """Its progress there, and whether its job is in the queue: nothing it made."""
+        queue = self.remote.queue
+        out = self._run(f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; id=$(cat queue.id 2>/dev/null); "
+                        f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -qx \"$id\"; }} 2>/dev/null "
+                        "&& echo alive; cat progress.json 2>/dev/null; :", timeout=self.remote.poll_timeout)
+        alive = out.startswith(b"alive\n")
+        return json.loads((out[6:] if alive else out) or b"{}"), alive
 
     def _account(self, final: bool = False) -> None:
         """`queue_usage`, from the accounting of the queue over there (its `usage` command); with

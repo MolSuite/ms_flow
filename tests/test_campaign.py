@@ -74,9 +74,9 @@ def screen(params, project):
 
 
 def _far(tmp_path, **options):
-    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, poll_s=0.2, part_seconds=0.1, runner="--cpus 2",
+    return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, part_seconds=0.1, runner="--cpus 2",
                           setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}:{_ROOT / 'tests'}:{os.environ.get('PYTHONPATH', '')}",
-                          **options)
+                          **{"poll_s": 0.2, **options})
 
 
 def _engine(tmp_path, far):
@@ -311,3 +311,19 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatc
         assert locations.known(project, locations.host_of(far)) == {}
         assert engine.wait(flow.submit(screen, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
         assert sent.count("in/said.txt") == 2 and (there / "in" / "said.txt").exists()
+
+
+def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(tmp_path, monkeypatch):
+    import ms_flow.campaign as module
+    (tmp_path / "said.txt").write_text("from here")
+    monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
+    monkeypatch.setattr(module, "_GLANCE_EVERY", 0.1)
+    glances, glance = [], Campaign._glance
+    monkeypatch.setattr(Campaign, "_glance", lambda self: glances.append(1) or glance(self))
+    GOT.clear()
+    engine, flow = _engine(tmp_path, _far(tmp_path, poll_s=2))
+    with engine:
+        ended = engine.wait(flow.submit(screen, {"n": 12, "nap": 0.3}, executor="far", journal="j"), 120)
+    assert ended.status == "completed_with_errors", ended.error
+    assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(12) if n != 3}  # parts on the rounds
+    assert len(glances) > 5
