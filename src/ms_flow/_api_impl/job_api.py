@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 LOGIN_NODE = ("this looks like the login node of a %s cluster: what runs here on this machine shares it with "
@@ -141,6 +142,21 @@ def build_executor(name: str, settings, host_env=None):
     return ProcessExecutor(_here(hosts[0])[0])
 
 
+def _retake(executor, settings, name: str) -> None:
+    """Give the active `executor` kept as `name` what is kept of it now that is not `guarded`: a
+    queue sends its next jobs asking for it. The others hold nothing of that kind."""
+    from ms_flow.remote import RemoteExecutor
+    from ms_flow.site_script import RESOURCES
+
+    if not isinstance(executor, RemoteExecutor):
+        return
+    config = settings.executors[name]
+    executor.asks = {"modules": config.modules, **{field: getattr(config, field) for field in RESOURCES}}
+    executor.script = executor.script_for()
+    executor.capacity, executor.batch = config.max_jobs or sys.maxsize, config.elements_per_job or sys.maxsize
+    executor.poll_s, executor.keep_after = config.poll_seconds, settings.hosts[config.hosts[0]].keep_after
+
+
 class WorkspaceJobApiMixin:
     #: Set by the app: `host_env(address, busy, on_line) -> path` makes sure the host has the
     #: environment that runs its jobs and says where. It is for a host with no `env` named,
@@ -240,12 +256,33 @@ class WorkspaceJobApiMixin:
                 self._aside = None
                 self._local_back()
 
-    def _change(self, table: str, name: str, change) -> None:
+    def _change(self, table: str, name: str, change, fields: dict | None = None) -> None:
         """Run `change` on the entry `name` of `hosts` or `executors`, unless an active executor
-        is made of it. The pool of this machine is the one made again with what is kept."""
-        executors = self.settings_manager.settings.executors
+        is made of it. The pool of this machine is the one made again with what is kept.
+
+        Saving `fields` that differ from what is kept only where a field is not `guarded` goes
+        through while it is active: the active ones made of it take them as they run."""
+        settings = self.settings_manager.settings
+        executors = settings.executors
         users = [key for key in self._active() & set(executors) if self._engine is not None and
                  (key == name if table == "executors" else name in executors[key].hosts)]
+        if users and users != ["local"] and fields is not None and name in getattr(settings, table):
+            from pydantic import ValidationError
+
+            from ms_flow.core.settings.models import ExecutorConfig, HostConfig, guarded
+
+            model = HostConfig if table == "hosts" else ExecutorConfig
+            kept = getattr(settings, table)[name]
+            try:
+                new = model.model_validate(fields)  # as `save_host` keeps it: what is not given, its default
+            except ValidationError:
+                change()  # which says what is wrong with it, as a person reads it
+                raise
+            if not any(guarded(model, key) for key in model.model_fields if getattr(new, key) != getattr(kept, key)):
+                change()
+                for user in users:
+                    _retake(self._engine.executor(user), self.settings_manager.settings, user)
+                return
         if users and users != ["local"]:
             raise ValueError(f"`{table}.{name}` is in use by `{users[0]}`, which is active: deactivate it first")
         with self._activation:
@@ -259,14 +296,14 @@ class WorkspaceJobApiMixin:
 
     def save_host(self, name: str, **fields) -> None:
         """`SettingsManager.save_host`, refused while an active executor works on that machine."""
-        self._change("hosts", name, lambda: self.settings_manager.save_host(name, **fields))
+        self._change("hosts", name, lambda: self.settings_manager.save_host(name, **fields), fields)
 
     def remove_host(self, name: str) -> None:
         self._change("hosts", name, lambda: self.settings_manager.remove_host(name))
 
     def save_executor(self, name: str, **fields) -> None:
         """`SettingsManager.save_executor`, refused while that executor is active."""
-        self._change("executors", name, lambda: self.settings_manager.save_executor(name, **fields))
+        self._change("executors", name, lambda: self.settings_manager.save_executor(name, **fields), fields)
 
     def remove_executor(self, name: str) -> None:
         self._change("executors", name, lambda: self.settings_manager.remove_executor(name))
@@ -342,6 +379,14 @@ class WorkspaceJobApiMixin:
         slot = None if self._engine is None else self._engine._executors.get(executor)
         nodes = getattr(getattr(slot, "impl", None), "nodes", None)
         return nodes() if nodes is not None else {}
+
+    def queue_nodes(self, executor: str) -> list[dict]:
+        """For a queue that is active, its nodes and what is taken of each: see
+        `RemoteExecutor.queue_nodes`. Nothing for any other, and never builds the engine. It
+        asks the login node, so not from a thread that cannot wait."""
+        slot = None if self._engine is None else self._engine._executors.get(executor)
+        nodes = getattr(getattr(slot, "impl", None), "queue_nodes", None)
+        return nodes() if nodes is not None else []
 
     def remove_remote_job(self, executor: str, dir: str) -> None:
         """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of

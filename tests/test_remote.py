@@ -287,3 +287,21 @@ def test_what_the_queue_says_a_job_used():
                      "Q|cpu          20.363s\nQ|maxvmem      211.738MB\n")
     assert (sge["final"], sge["wall_s"], sge["cpu_s"], sge["cpus"], round(sge["peak_mem_mb"])) == (True, 20, 20.363, 2, 212)
     assert read_usage("sacct: error: Problem talking to the database\n") == read_usage("")  # no accounting there
+
+
+def test_the_nodes_of_a_queue_are_read_from_sinfo_and_qhost():
+    from ms_flow.remote import read_nodes
+
+    slurm = read_nodes("w1|idle|0/4/0/4|2048|0|(null)|(null)|1.70|debug*|\n"
+                       "w1|idle|0/4/0/4|2048|0|(null)|(null)|1.70|long|\n"
+                       "g1|mixed|8/24/0/32|256000|64000|gpu:a100:4(S:0-1)|gpu:a100:2(IDX:0-1)|N/A|gpu|\n")
+    assert [(n["name"], n["cpus_used"], n["cpus"], n["gpus_used"], n["gpus"], n["partitions"]) for n in slurm] == [
+        ("w1", 0, 4, 0, 0, ["debug", "long"]), ("g1", 8, 32, 2, 4, ["gpu"])]
+    assert slurm[1]["mem_used_gb"] == 62.5 and slurm[1]["load"] is None
+    sge = read_nodes("HOSTNAME  ARCH  NCPU NSOC NCOR NTHR  LOAD  MEMTOT  MEMUSE  SWAPTO  SWAPUS\n"
+                     "global    -     -    -    -    -     -     -       -       -       -\n"
+                     "sge       lx-amd64  16  1  8  16  1.45  47.0G  19.0G  9.3G  1.7G\n"
+                     "   all.q  BIP   0/2/4\n"
+                     "n2        lx-amd64  16  1  8  16  -  -  -  -  -\n")
+    assert [(n["name"], n["state"], n["cpus_used"], n["cpus"], n["mem_used_gb"]) for n in sge] == [
+        ("sge", "up", 2, 4, 19.0), ("n2", "down", 0, 16, 0.0)]
