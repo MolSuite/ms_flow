@@ -191,6 +191,9 @@ class Campaign:
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self.executor, self.total, self.steps = executor or None, None, []
         self.queue_usage, self._accounted = None, 0.0
+        # What its job asks of the queue, for whoever shows it: the executor's asks, `asks` over them.
+        self.asked = {key: value for key, value in {**remote.asks, **(asks or {})}.items()
+                      if key in ("nodes", "cpus", "gpus", "memory_gb") and value not in (None, "", 0)}
         self.note = "staging its elements and their files here"
         # Canceling: nothing goes to the queue from then on, and what is there is stopped (`stop_there`).
         self._submitting, self._canceling, self._stopped = threading.Lock(), False, False
