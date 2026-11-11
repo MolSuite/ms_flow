@@ -224,6 +224,58 @@ def test_an_executor_that_does_its_own_accounting_is_told_what_each_chunk_needs(
         assert engine.wait(engine.submit("own", _echo, payloads, cpu=2), 30).status == "completed"
     assert sorted(costed.costs) == [(2, 0, 0), (2, 1, 0), (3, 0, 50)]
 
+
+def test_an_executor_with_a_total_gets_only_the_tasks_it_has_room_for():
+    """Ray with 4 CPUs and one GPU took 4 GPU tasks at once and ran one: the other three waited
+    in its queue, counted as running. With its total said, the engine hands it one at a time."""
+    costed, gauge = _Costed(), []
+    costed.total = (4, 1, 0)
+    lock, running = threading.Lock(), [0]
+
+    def held(payload):
+        with lock:
+            running[0] += 1
+            gauge.append(running[0])
+        time.sleep(0.05)
+        with lock:
+            running[0] -= 1
+        return payload
+
+    with Engine(cpus=8) as engine:
+        engine.register("own", costed)
+        assert engine.wait(engine.submit("own", held, range(4), gpu=1), 30).status == "completed"
+        assert max(gauge) == 1
+        gauge.clear()
+        assert engine.wait(engine.submit("own", held, range(8)), 30).status == "completed"
+        assert max(gauge) == 4  # CPU tasks still fill the CPUs
+
+
+def test_a_cpu_job_runs_beside_a_gpu_job_on_what_the_gpu_job_leaves():
+    """Two Ray nodes, one GPU each: a GPU docking held every CPU in waiting tasks, and a CPU
+    docking sent after it waited for all of them. It runs now on the CPUs the GPU job leaves."""
+    costed, lock = _Costed(), threading.Lock()
+    costed.total = (4, 1, 0)
+    running, both = {"gpu": 0, "cpu": 0}, []
+
+    def held(kind):
+        def run(payload):
+            with lock:
+                running[kind] += 1
+                both.append(dict(running))
+            time.sleep(0.05)
+            with lock:
+                running[kind] -= 1
+            return payload
+        return run
+
+    with Engine(cpus=8) as engine:
+        engine.register("own", costed)
+        gpu = engine.submit("own", held("gpu"), range(6), gpu=1)
+        cpu = engine.submit("own", held("cpu"), range(12))
+        assert {engine.wait(gpu, 30).status, engine.wait(cpu, 30).status} == {"completed"}
+    assert max(seen["gpu"] for seen in both) == 1
+    assert any(seen["gpu"] and seen["cpu"] == 3 for seen in both)  # side by side, on all that is left
+
 def test_content_key_is_the_same_in_another_process():
     payload = {"ligand": "CCO", "receptor": ["1abc", 7], "box": (1.5, 2.0)}
     code = f"from ms_flow.engine import content_key; print(content_key({payload!r}).hex())"

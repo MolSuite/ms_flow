@@ -13,7 +13,7 @@ import time
 
 from ms_env import Host, HostError
 
-from ms_flow.engine.executors import RayExecutor
+from ms_flow.engine.executors import RayExecutor, _cluster
 
 log = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ class RayOverHosts(RayExecutor):
         except BaseException:
             self.shutdown()
             raise
-        self.capacity = int(self._ray.cluster_resources().get("CPU", 1))
+        self.capacity, self.total = _cluster(self._ray)  # the joined machines count now
 
     def shutdown(self) -> None:
         for host, ray_there in self._hosts:

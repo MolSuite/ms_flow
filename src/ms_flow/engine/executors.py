@@ -235,6 +235,14 @@ class ProcessExecutor:
             pass
 
 
+def _cluster(ray, capacity: int | None = None) -> tuple[int, tuple]:
+    """How many tasks go to Ray at once, and the (cpu, gpu, mem_mb) the engine fills with them:
+    a task Ray has no room for waits in its queue, and would count as running all the while."""
+    have = ray.cluster_resources()
+    total = (have.get("CPU", 1), have.get("GPU", 0), int(have.get("memory", 0) / 2 ** 20))
+    return capacity or int(total[0]), total
+
+
 class RayExecutor:
     """Tasks on a Ray cluster, which shares out its own CPUs, GPUs and memory.
 
@@ -290,7 +298,7 @@ class RayExecutor:
         if failed:
             raise failed[0]
         # How many tasks are handed to Ray at once: it queues those it has no room for.
-        self.capacity = capacity or int(ray.cluster_resources().get("CPU", 1))
+        self.capacity, self.total = _cluster(ray, capacity)
         self._lost = (ray.exceptions.WorkerCrashedError, ray.exceptions.NodeDiedError,
                       ray.exceptions.ObjectLostError, ray.exceptions.OutOfMemoryError)
         # max_retries=0: the engine is the one that runs a chunk again

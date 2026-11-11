@@ -211,11 +211,12 @@ def one_stage(params, project):
 def test_a_campaign_of_one_stage_has_its_total_its_queue_and_says_where_it_is(tmp_path, monkeypatch):
     (tmp_path / "said.txt").write_text("from here")
     monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
-    engine, flow = _engine(tmp_path, _far(tmp_path))
+    engine, flow = _engine(tmp_path, _far(tmp_path, asks={"cpus": 2, "gpus": 0}))
     with engine:
         job = flow.submit(one_stage, {"n": 12, "nap": 1}, executor="far", journal="j")
         now = engine.status(job)
         assert now.chunks_total == 12 and now.executor == "far"  # from the start, not "thread" and "?"
+        assert now.asked == {"cpus": 2}  # what the monitor shows of the queue: what its job asked
         _until(lambda: "running in the queue (job " in (engine.status(job).note or ""))
         ended = engine.wait(job, 120)
     assert ended.chunks_total == 12 and ended.chunks_done == 11 and ended.note is None, ended.error

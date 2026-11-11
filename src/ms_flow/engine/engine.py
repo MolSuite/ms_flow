@@ -144,6 +144,9 @@ class JobSnapshot:
     canceling: bool = False
     # Every step its source went through, `(time, line)`, quick ones too, kept once it ends.
     steps: tuple = ()
+    # What its job asks of a queue (a campaign's): `nodes`, `cpus` (each node), `gpus`, `memory_gb`,
+    # those it sets; else None.
+    asked: dict | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +194,8 @@ class _Job:
                            self.retried, progress, len(self.flying), self.cpu_used, self.executor, self.used(),
                            None if self.finished_at else getattr(self.far, "unreachable", None),
                            None if self.finished_at else getattr(self.far, "note", None),
-                           bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())))
+                           bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())),
+                           getattr(self.far, "asked", None) or None)
 
 
 def _busy_seconds() -> float | None:
@@ -209,6 +213,22 @@ def _busy_seconds() -> float | None:
         return None
     times = psutil.cpu_times()
     return sum(times) - times.idle
+
+
+def _room(slot: _Slot, needs) -> bool:
+    """An executor that says its `total` (Ray: the cluster) has room for `needs` beside what its
+    tasks asked for: one it has no room for waits in its queue, counted as running all the while.
+    The caller lets a task through when the executor runs nothing, a need larger than the whole
+    included, for the executor to judge."""
+    # ponytail: summed over the cluster, so a task that fits no single node (64 CPUs on two of
+    # 32) still waits in Ray; per-node room if that shows up.
+    total = getattr(slot.impl, "total", None)
+    return total is None or all(h + n <= t for h, n, t in zip(slot.held, needs, total) if n)
+
+
+def _take(slot: _Slot, needs, sign: int) -> None:
+    if getattr(slot.impl, "total", None) is not None:
+        slot.held = [h + sign * n for h, n in zip(slot.held, needs)]
 
 
 def _hold(job: _Job, needs, sign: int) -> None:
@@ -245,7 +265,7 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives", "threads", "watches_all", "places")
+                 "outlives", "threads", "watches_all", "places", "held")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
@@ -254,6 +274,7 @@ class _Slot:
         self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
         self.watches_all = getattr(impl, "watches_all", False)
         self.places = hasattr(impl, "hosts")
+        self.held = [0, 0, 0]  # (cpu, gpu, mem_mb) its tasks asked for, where it says its `total`
 
 
 class Engine:
@@ -712,6 +733,7 @@ class Engine:
         job = chunk.job
         slot = job.slot
         slot.inflight -= 1
+        _take(slot, chunk.needs, -1)
         if not slot.inflight:
             slot.killing = False
         if chunk.alone:
@@ -927,6 +949,8 @@ class Engine:
                 return False
         chunk = ready[0]
         cost = chunk.cost
+        if slot.inflight and not _room(slot, chunk.needs):
+            return False
         if cost is not None and self.tokens.ever_fits(cost) and (
                 not self.tokens.fits(cost)
                 or (job.max_cpu is not None and job.cpu_used and job.cpu_used + cost[0] > job.max_cpu)):
@@ -992,6 +1016,7 @@ class Engine:
                 self._reader = threading.Thread(target=self._read_machine, name="msflow-machine", daemon=True)
                 self._reader.start()
         _hold(job, chunk.needs, 1)
+        _take(slot, chunk.needs, 1)
         slot.inflight += 1
         slot.isolating = chunk.alone = alone
         chunk.doomed, chunk.spared = None, False
