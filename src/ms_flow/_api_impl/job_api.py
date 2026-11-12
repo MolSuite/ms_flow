@@ -196,7 +196,8 @@ class WorkspaceJobApiMixin:
 
         Raises `ms_flow.engine.Busy` when another process of this user already runs one.
         With an engine in a process of its own, this is its `EngineProxy`: the process starts
-        here, and a use of it after that process died starts another.
+        aside when a project opens (or here, if that has not happened yet), and a use of it
+        after that process died starts another.
         """
         if self._engine is None and self._host == "process":
             with self._hosting:

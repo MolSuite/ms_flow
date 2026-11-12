@@ -76,6 +76,27 @@ def test_a_child_that_dies_leaves_the_app_standing(tmp_path, monkeypatch):
         ms.shutdown()
 
 
+def test_the_engines_process_starts_when_a_project_opens(tmp_path, monkeypatch):
+    ms = _workspace(tmp_path, monkeypatch)  # no job submitted
+    try:
+        assert _until(lambda: ms._engine is not None and ms._flow)  # the project is open there
+        child = ms._engine.process.pid
+        assert ms.engine.process.pid == child  # the first use takes it, it does not start another
+        ms.create_or_open_project(name="two", folder=tmp_path / "two", description="", activate=True)
+        assert ms.engine.wait(ms.submit(numbers, {}, executor="thread"), 60).status == "completed"
+        assert ms.engine.process.pid == child
+        assert (tmp_path / "two" / "out" / "where.txt").exists()
+    finally:
+        ms.shutdown()
+    assert not _alive(child)
+
+
+def test_a_shutdown_while_the_engines_process_starts_leaves_none_behind(tmp_path, monkeypatch):
+    ms = _workspace(tmp_path, monkeypatch)
+    ms.shutdown()  # right after the project opened: its process may still be starting
+    assert ms._engine is None
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

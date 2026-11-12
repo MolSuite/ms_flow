@@ -192,7 +192,7 @@ Techos conocidos (`ponytail`), por si hacen falta:
 - Los dos procesos escriben en los mismos archivos de log.
 - El registro de callbacks no se libera: una entrada pequeña por callback enviado.
 - Un job que murió con el hijo no recibe `on_terminal`: queda `running` hasta el `resume`.
-- Una llamada al proxy desde la GUI espera al GIL del hijo: 0,11 ms en reposo. Las lecturas de la vista no pasan por ahí (van a SQLite). El primer uso arranca el hijo: 0,42 s, una vez por sesión, en quien haga el primer submit.
+- Una llamada al proxy desde la GUI espera al GIL del hijo: 0,11 ms en reposo. Las lecturas de la vista no pasan por ahí (van a SQLite). El hijo tarda 0,42 s en arrancar; arranca en un hilo aparte al abrir el proyecto, así que el primer submit no lo espera. Se arranca siempre desde un mismo hilo que dura lo que la aplicación: `PR_SET_PDEATHSIG` mata al hijo cuando termina el *hilo* que lo creó, no solo el proceso.
 - Una copia `with_options` que cambia lo que corre el motor responde al nombre de la original: solo corre `inline`. Si solo cambia `executor`, `supported_executors` u `on_thread`, es el mismo job.
 - `extra_dirs` de `open_project` no llega al hijo.
 

@@ -26,6 +26,7 @@ import socket
 import sys
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 #: Arguments of a call to the engine that stay in the application: the engine calls them back.
 CALLBACKS = frozenset({"on_terminal", "on_line"})
@@ -184,13 +185,19 @@ class EngineProxy:
             self.process.join()
 
 
+_STARTER = ThreadPoolExecutor(1, thread_name_prefix="msflow-engine-start")
+
+
 def start(init: dict, on_gone) -> EngineProxy:
     """Start the child process with the `Workspace` that `init` describes."""
     global _peer
     context = multiprocessing.get_context("spawn")
     mine, theirs = context.Pipe()
     process = context.Process(target=_child, args=(theirs, pickle.dumps(init)), name="msflow-engine-host")
-    process.start()  # not a daemon: its executors start processes of their own
+    # not a daemon: its executors start processes of their own. Started from a thread that lasts
+    # as long as the application: `PR_SET_PDEATHSIG` kills the child when the thread that started
+    # it ends, not only its process.
+    _STARTER.submit(process.start).result()
     theirs.close()
     _peer = _Peer(mine, None, on_gone)
     return EngineProxy(process, _peer)

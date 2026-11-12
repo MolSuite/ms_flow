@@ -91,7 +91,7 @@ class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
         # what the engine's process builds its Workspace with
         self._init = {"app_id": self.app_id, "host_namespace": self.host_namespace,
                       "project_resources": project_resources, "app_settings": app_settings}
-        self._hosting = threading.Lock()
+        self._hosting, self._warming = threading.Lock(), None  # see `_activate_context`
         # see `Workspace.activate`: who put the pool of this machine aside, who is starting, one at a time
         self._aside, self._starting, self._activation = None, set(), threading.Lock()
         self.project_logger = None
