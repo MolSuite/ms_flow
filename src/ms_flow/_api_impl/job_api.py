@@ -389,6 +389,9 @@ class WorkspaceJobApiMixin:
         `key=` continues it. `executor` is `thread` or the name of an active one (see
         `activate`), by default the one the settings give (`general.default_executor`);
         `options` are those of `ms_flow.engine.Flow.submit`.
+        With the engine in a process of its own, `job` goes there by its name, so it is a
+        module-level function, and `params` are values: what the job reads of the project, its
+        source and its writer read there.
         """
         flow = self._project_flow()
         name = executor or self.settings_manager.settings.general.default_executor

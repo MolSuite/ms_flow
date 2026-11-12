@@ -10,9 +10,11 @@ dies (on Linux the kernel also kills it then: `PR_SET_PDEATHSIG`).
 A child that dies leaves the application standing: what waits for it raises `EngineGone`, and
 the next use of the engine starts another one, whose journal continues the jobs (`resume`).
 
-What travels: arguments with cloudpickle, so a job goes by value, its closures too. A callable
-the other side calls back goes as a reference to it instead: `CALLBACKS` names those of the
-calls to the engine, and the arguments of a call back are all of that kind.
+What travels is references and values, with pickle: a job goes by its name (its function has
+to be importable, as `resume` needs it anyway) and its params as they are; what it reads of the
+project, the engine's process reads there. A callable the other side calls back goes as a
+reference to it: `CALLBACKS` names those of the calls to the engine, and the arguments of a call
+back are all of that kind.
 """
 from __future__ import annotations
 
@@ -24,8 +26,6 @@ import socket
 import sys
 import threading
 import traceback
-
-import cloudpickle
 
 #: Arguments of a call to the engine that stay in the application: the engine calls them back.
 CALLBACKS = frozenset({"on_terminal", "on_line"})
@@ -83,7 +83,7 @@ class _Peer:
         threading.Thread(target=self._read, name=f"msflow-host-{_side}", daemon=True).start()
 
     def _send(self, message) -> None:
-        payload = cloudpickle.dumps(message)
+        payload = pickle.dumps(message)
         with self._lock:
             self.conn.send_bytes(payload)
 
@@ -189,7 +189,7 @@ def start(init: dict, on_gone) -> EngineProxy:
     global _peer
     context = multiprocessing.get_context("spawn")
     mine, theirs = context.Pipe()
-    process = context.Process(target=_child, args=(theirs, cloudpickle.dumps(init)), name="msflow-engine-host")
+    process = context.Process(target=_child, args=(theirs, pickle.dumps(init)), name="msflow-engine-host")
     process.start()  # not a daemon: its executors start processes of their own
     theirs.close()
     _peer = _Peer(mine, None, on_gone)

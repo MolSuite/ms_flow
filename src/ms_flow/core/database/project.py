@@ -74,13 +74,6 @@ class ProjectStore:
             if auto_setup:
                 self.setup()
 
-    def __reduce__(self):
-        """A store travels as its database: the other process opens its own on the same file
-        (the engine's process, when a job's handler takes the project's store)."""
-        if self.db_path is None:
-            raise TypeError("a ProjectStore without a database does not travel")
-        return _open_cached, (str(self.db_path),)
-
     @classmethod
     def open_at(cls, db_path: Path | str) -> "ProjectStore":
         store = cls(db_path)
@@ -740,7 +733,3 @@ def resolve_project_store(source: Any) -> ProjectStore:
     if store is None:
         raise ValueError("Could not resolve project store from source.")
     return store
-
-
-def _open_cached(db_path: str) -> ProjectStore:
-    return ProjectStore.open_cached(db_path)  # cloudpickle fails on the bound classmethod

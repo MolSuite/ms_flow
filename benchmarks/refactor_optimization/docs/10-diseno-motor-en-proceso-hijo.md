@@ -174,9 +174,12 @@ Lo que cambió respecto a la forma de arriba:
   - Los métodos del `Workspace` que tocan el motor llevan `@hosted`: `submit`, `origin`, `resume`, `move`, `activate`/`deactivate`, `save_*`/`remove_*` de hosts y executors, `node_metrics`, `queue_nodes` y `remote_jobs`, y se ejecutan en el hijo.
   - Los `lazy` corren en la app mientras no haya motor.
   - Tras `save_*`/`remove_*`, la app recarga sus settings; el hijo los recarga antes de cada uno (`SettingsManager.reload()`).
-- **Los jobs viajan por valor con cloudpickle** (closures incluidas), no como `origin`. Los callables que el otro lado llama (`on_terminal`, `on_line`, `host_env` y los argumentos de un callback) viajan como referencia (`callback()`), así que la llamada vuelve por el pipe.
-  - Un `ProjectStore` viaja como la ruta de su base: el otro proceso abre el suyo (`open_cached`). Los handlers de AMDockVS se construyen en el hijo, al abrirse la salida del job, porque llevan locks y conexiones.
-  - Un global de datos de un módulo que una closure usa se copiaría. Por eso `amdockvs.core.jobs.configs` se resuelve por nombre (`__reduce__`) y se llena en el hijo con el hook `Workspace.jobs_setup`.
+- **Todo cruza como referencia o valor, con `pickle`; ningún objeto vivo.**
+  - Un job viaja por su nombre (función importable, lo mismo que pide `resume`) y sus params como valores. Lo que lee del proyecto (`project_db`, recursos, contexto) lo resuelve el lado que lo ejecuta: el writer y la fuente se construyen en el hijo, a partir de `(params, project)`. Así el payload se arma donde vive el job y un job con handler también se reanuda.
+  - El writer propio de un job puede tener `on_error(key, error)` y `ended(snapshot)`: `Flow.submit` los conecta, así no viajan callbacks por submit.
+  - En AMDockVS, `result_handler_factory(params, config)` reemplaza a `result_handler_kwargs`: lo que el handler necesitaba (`generation_id`, `payload`…) pasó a los params, y `project_db`/`shard_dir` vienen de `config`, que el hook `Workspace.jobs_setup` llena en el hijo.
+  - Lo que no es importable (una closure, un `ProjectStore`) falla al enviarlo, en vez de copiarse en silencio. Sin cloudpickle.
+  - Los callables que el otro lado llama (`on_terminal`, `on_line`, `host_env` y los argumentos de un callback) viajan como referencia (`callback()`), así que la llamada vuelve por el pipe.
 - **IPC:** un `Pipe` spawn (socketpair). Cada mensaje es una petición con id; cada petición entrante se atiende en su propio hilo, en los dos sentidos. Las excepciones vuelven con el traceback remoto como nota.
 - **Vida:**
   - El hijo arranca en el primer uso de `engine` y abre el proyecto activo.
@@ -189,7 +192,8 @@ Techos conocidos (`ponytail`), por si hacen falta:
 - Los dos procesos escriben en los mismos archivos de log.
 - El registro de callbacks no se libera: una entrada pequeña por callback enviado.
 - Un job que murió con el hijo no recibe `on_terminal`: queda `running` hasta el `resume`.
-- Una llamada al proxy desde la GUI espera al GIL del hijo. Las lecturas de la vista no pasan por ahí (van a SQLite).
+- Una llamada al proxy desde la GUI espera al GIL del hijo: 0,11 ms en reposo. Las lecturas de la vista no pasan por ahí (van a SQLite). El primer uso arranca el hijo: 0,42 s, una vez por sesión, en quien haga el primer submit.
+- Una copia `with_options` que cambia lo que corre el motor responde al nombre de la original: solo corre `inline`. Si solo cambia `executor`, `supported_executors` u `on_thread`, es el mismo job.
 - `extra_dirs` de `open_project` no llega al hijo.
 
 ### Medición fase B (PC de desarrollo, 16 CPU)
