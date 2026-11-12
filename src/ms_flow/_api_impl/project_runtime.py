@@ -386,7 +386,7 @@ class WorkspaceProjectRuntimeMixin:
             return
         with self._hosting:  # one at a time with a start of the engine's process
             if self._engine is not None:  # the engine's process opens it too
-                self._engine.call("open_project", (str(context.id),), {"touch_master": False})
+                self._engine.call("_hosted_open", (str(context.id),))
                 self._flow = True
                 return
         # ponytail: the process starts now, aside, so the first job does not wait for it

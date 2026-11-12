@@ -67,10 +67,32 @@ def test_a_child_that_dies_leaves_the_app_standing(tmp_path, monkeypatch):
         with pytest.raises(EngineGone):
             ms.engine.wait(job_id, 60)
         assert _until(lambda: ms._engine is None)
-        assert ms.jobs()[0].status == "running"  # what the journal said last: a new engine marks it
+        assert ms.jobs()[0].status == "running"  # it died young: none starts until the next use
         # the next use starts another engine, and the job continues where it was
         assert ms.engine.wait(ms.resume(key), 60).status == "completed"
         assert ms.engine.process.pid != first
+        assert sorted({int(n) for n, _ in _rows(tmp_path)}) == list(range(400))
+    finally:
+        ms.shutdown()
+
+
+def test_a_child_that_dies_is_replaced_and_its_jobs_read_interrupted(tmp_path, monkeypatch):
+    from ms_flow.main import Workspace
+
+    monkeypatch.setattr(Workspace, "_restart_after", 0)
+    ms = _workspace(tmp_path, monkeypatch)
+    try:
+        job_id = ms.submit(numbers, {"n": 400, "nap": 0.2}, executor="thread")
+        key = ms.engine.status(job_id).key
+        first = ms.engine.process.pid
+        from ms_flow.engine.journal import recorded
+
+        assert _until(lambda: list(recorded(tmp_path / "one" / "executor.db", None)))  # on record
+        os.kill(first, signal.SIGKILL)
+        # with no use of the engine, another starts and the app reads the job as interrupted
+        assert _until(lambda: [job.status for job in ms.jobs()] == ["interrupted"], 30)
+        assert ms._engine is not None and ms._engine.process.pid != first
+        assert ms.engine.wait(ms.resume(key), 60).status == "completed"
         assert sorted({int(n) for n, _ in _rows(tmp_path)}) == list(range(400))
     finally:
         ms.shutdown()

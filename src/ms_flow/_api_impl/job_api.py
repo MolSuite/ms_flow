@@ -5,6 +5,8 @@ import json
 import os
 import shutil
 import sys
+import threading
+import time
 from pathlib import Path
 
 LOGIN_NODE = ("this looks like the login node of a %s cluster: what runs here on this machine shares it with "
@@ -213,6 +215,8 @@ class WorkspaceJobApiMixin:
             self._local_back()
         return self._engine
 
+    _restart_after = 5.0  # s an engine's process lived for another to start when it dies
+
     def _start_host(self):
         from ms_flow._api_impl.engine_host import callback, start
 
@@ -220,18 +224,30 @@ class WorkspaceJobApiMixin:
         proxy = start({"workspace": self._init, "host_env": self.host_env and callback(self.host_env),
                        "jobs_setup": self.jobs_setup},
                       lambda: self._engine_gone(proxy))
+        proxy.started = time.monotonic()
         project = self._runtime_state.active_project
         if project is not None and project.context is not None:
-            proxy.call("open_project", (str(project.context.id),), {"touch_master": False})
+            proxy.call("_hosted_open", (str(project.context.id),))
             self._flow = True  # the engine's process has the project: see `_close_project_runtime`
         return proxy
+
+    def _hosted_open(self, project_id: str) -> None:
+        """In the engine's process: the project, and its journal, whose opening marks what a
+        process before this one left unfinished as interrupted, so the app sees it at once."""
+        self.open_project(project_id, touch_master=False)
+        self._project_flow()
 
     def _engine_gone(self, proxy) -> None:
         if self._engine is proxy:
             self._engine = self._flow = None  # the next use starts another
-        if not proxy.closed:
-            self.app_logger.error("The engine's process ended: its jobs are interrupted (see `resume`), "
-                                  "and the next use of the engine starts another.")
+        if proxy.closed:
+            return
+        self.app_logger.error("The engine's process ended: its jobs are interrupted (see `resume`).")
+        # Another starts now, aside: it marks those jobs interrupted. Not for one that died
+        # young, which would only die again.
+        if self._runtime_state.active_project is not None and time.monotonic() - proxy.started > self._restart_after:
+            self._warming = threading.Thread(target=self._warm, name="ms_flow-engine-start", daemon=True)
+            self._warming.start()
 
     def _local_back(self) -> None:
         self._engine.register("local", build_executor("local", self.settings_manager.settings))
@@ -480,9 +496,9 @@ class WorkspaceJobApiMixin:
         from ms_flow.engine import JobSnapshot
         from ms_flow.engine.journal import recorded
 
-        live = {(job.key, job.started_at): job for job in (self._engine.jobs() if self._flow is not None else ())}
-        # ponytail: a job of a process that died reads as running until this session's first
-        # submit opens the journal, which is what marks it interrupted.
+        live = {(job.key, job.started_at): job for job in self._live_jobs()}
+        # A job of an engine's process that died reads as running until the one that replaces it
+        # opens the journal, which marks it interrupted (see `_engine_gone`).
         listed = [live.pop((row["job_id"], row["started_at"]), None)
                   or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
                                  row["error"], (usage := _usage(row)).get("peak_mem_mb", 0), row["started_at"],
@@ -493,6 +509,17 @@ class WorkspaceJobApiMixin:
         # One just submitted is not in the file until the journal's next write. Only the active
         # project has jobs that have not ended: closing a project interrupts its own.
         return listed + [job for job in live.values() if job.finished_at is None]
+
+    def _live_jobs(self) -> list:
+        engine = self._engine
+        if engine is None or self._flow is None:
+            return []
+        from ms_flow._api_impl.engine_host import EngineGone
+
+        try:
+            return engine.jobs()
+        except EngineGone:  # its process has just died: its jobs are on record
+            return []
 
     def job_tasks(self, job_id: int | None) -> list:
         """The tasks in flight of a job this session runs, by its `JobSnapshot.id`: see

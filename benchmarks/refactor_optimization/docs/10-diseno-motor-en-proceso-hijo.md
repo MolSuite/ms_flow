@@ -185,6 +185,7 @@ Lo que cambió respecto a la forma de arriba:
   - El hijo arranca en el primer uso de `engine` y abre el proyecto activo.
   - Termina al ver EOF: cierra el proyecto y el motor, y luego `os._exit`. En Linux, además, `PR_SET_PDEATHSIG`.
   - Si muere, lo que espera recibe `EngineGone`, la app sigue en pie y el siguiente uso arranca otro hijo. `resume(key)` continúa el job desde su journal (test: SIGKILL a mitad, 400/400 filas tras el resume).
+  - Con un proyecto abierto, si el hijo vivió más de 5 s, ms_flow arranca otro aparte en ese momento; este abre el journal, que marca como `interrupted` los jobs del muerto, y la app los ve así enseguida (el monitor emite `job_finished`). Si muere más joven, no se rearranca (guardia anti-bucle): el siguiente uso lo hace.
 - **ms_components: nada.** Los tests de ms_flow corren en `inline` (conftest) más `tests/test_engine_host.py` en `process`.
 
 Techos conocidos (`ponytail`), por si hacen falta:
