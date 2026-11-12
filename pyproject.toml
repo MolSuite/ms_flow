@@ -26,10 +26,12 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
-# Core runtime: engine + SQLite-backed projects. loky is the local process pool; ms_env is the
+# Core runtime: engine + SQLite-backed projects. loky is the local process pool; cloudpickle
+# takes jobs to the engine's process; ms_env is the
 # ssh of the remote executor and the environments on the other side.
 dependencies = [
     "blinker>=1.6",
+    "cloudpickle>=2.0",
     "loky>=3.0",
     "ms_env>=0.2.0",
     "pydantic>=2.0",

@@ -26,3 +26,6 @@ def isolated_workspace(tmp_path_factory, monkeypatch):
     """
     empty = tmp_path_factory.mktemp("empty_workspace")
     monkeypatch.setenv("MS_FLOW_WORKSPACE_ROOT", str(empty))
+    # The suite looks inside the engine: a Workspace keeps it in this process unless a test says
+    # otherwise (`test_engine_host.py`).
+    monkeypatch.setenv("MSFLOW_ENGINE_HOST", "inline")

@@ -79,7 +79,15 @@ class WorkspaceProjectRuntimeMixin:
         active_project = self._runtime_state.active_project
         if self._flow is not None:  # before the project goes: what its jobs delivered is written first
             self._flow = None
-            self._engine.detach("project")
+            if self._host == "process":  # its process closes it, with the jobs it runs
+                from ms_flow._api_impl.engine_host import EngineGone
+
+                try:
+                    self._engine.call("close_project")
+                except EngineGone:
+                    pass
+            else:
+                self._engine.detach("project")
         try:
             if active_project is not None and active_project.project_db is not None:
                 active_project.project_db.disconnect()
@@ -370,6 +378,9 @@ class WorkspaceProjectRuntimeMixin:
         )
         if touch_master:
             self.project_manager.touch_project(context.id)
+        if self._host == "process" and self._engine is not None:  # the engine's process opens it too
+            self._engine.call("open_project", (str(context.id),), {"touch_master": False})
+            self._flow = True
 
     def shutdown(self):
         try:

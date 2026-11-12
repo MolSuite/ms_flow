@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 from typing import Optional
 from uuid import UUID
@@ -37,7 +38,11 @@ class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
         host_namespace: str | None = None,
         project_resources=None,
         app_settings=None,
+        engine_host: str | None = None,
     ):
+        """`engine_host` is where the engine runs: `process` (a child process of this one, see
+        `ms_flow._api_impl.engine_host`) or `inline` (threads of this process). By default
+        `MSFLOW_ENGINE_HOST` says, and without it, `process`."""
         self.app_id = str(app_id).strip()
         if not self.app_id:
             raise ValueError("Workspace requires a non-empty app_id.")
@@ -80,6 +85,13 @@ class Workspace(WorkspaceJobApiMixin, WorkspaceProjectRuntimeMixin):
         warn_login_node(self.app_logger)
         self._runtime_state = ProjectRuntimeState()
         self._engine = self._flow = None  # see `Workspace.engine` and `Workspace.submit`
+        self._host = engine_host or os.environ.get("MSFLOW_ENGINE_HOST") or "process"
+        if self._host not in ("process", "inline"):
+            raise ValueError(f"engine_host is `process` or `inline`, not `{self._host}`")
+        # what the engine's process builds its Workspace with
+        self._init = {"app_id": self.app_id, "host_namespace": self.host_namespace,
+                      "project_resources": project_resources, "app_settings": app_settings}
+        self._hosting = threading.Lock()
         # see `Workspace.activate`: who put the pool of this machine aside, who is starting, one at a time
         self._aside, self._starting, self._activation = None, set(), threading.Lock()
         self.project_logger = None
