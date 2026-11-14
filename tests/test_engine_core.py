@@ -27,6 +27,10 @@ def _echo(payload):
     return payload
 
 
+def _nice(payload):
+    return os.nice(0)
+
+
 def _card(payload):
     time.sleep(0.3)  # long enough for the two cards to be held at once
     return os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -489,6 +493,19 @@ def test_a_task_that_needs_a_card_sees_the_one_it_holds(monkeypatch):
         got.clear()
         engine.wait(engine.submit("process", _card, list(range(4)), gpu=0.5, on_result=got.__setitem__), 60)
         assert sorted(got.values()) == ["5", "5", "7", "7"]
+
+
+@pytest.mark.skipif(not hasattr(os, "nice"), reason="POSIX only")
+def test_workers_give_the_cpu_way_to_the_app():
+    from ms_flow.engine.executors import WORKER_NICE
+
+    got = {}
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(2))
+        for thread in (False, True):  # a worker, and the process the tasks on a thread wait in
+            got.clear()
+            engine.wait(engine.submit("process", _nice, [0], thread=thread, on_result=got.__setitem__), 60)
+            assert list(got.values()) == [min(19, os.nice(0) + WORKER_NICE)]
 
 
 @pytest.mark.slow
