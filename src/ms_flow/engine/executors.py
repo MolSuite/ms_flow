@@ -540,6 +540,7 @@ class _Host:
 
 def _serve(conn, workers: int) -> None:
     """The main thread of a `_Host`: the tasks go to its threads, and how each ended goes back."""
+    _yield_cpu()
     from loky.backend.reduction import dumps
     from loky.backend.utils import kill_process_tree
 
@@ -772,8 +773,21 @@ def _peak_mb() -> int:
     return peak >> (20 if sys.platform == "darwin" else 10)  # bytes on macOS, KB elsewhere
 
 
+WORKER_NICE = 10
+
+
+def _yield_cpu() -> None:
+    """A worker, and the programs it starts, give way to the app's interface for the CPU: with
+    every core busy, opening a big view took twice as long (380 -> 770 ms; 470 at nice 10). Nothing
+    is lost on a machine with nothing else to run."""
+    if hasattr(os, "nice"):  # ponytail: POSIX only; Windows would need SetPriorityClass
+        os.nice(WORKER_NICE)
+
+
 def _die_with_parent(parent: int) -> None:
-    """Worker initializer: exit when the process that owns the engine is gone."""
+    """Worker initializer: exit when the process that owns the engine is gone, and yield the CPU
+    (`_yield_cpu`)."""
+    _yield_cpu()
 
     def watch():
         # ponytail: POSIX only, getppid never changes on Windows. There it needs a
