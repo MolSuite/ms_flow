@@ -18,6 +18,11 @@ returns its writer.
 
         def write(self, results): ...       # what a group of elements returned; nothing left behind if it raises
         def finish(self): ...               # optional: once every element has ended; if it raises, the job fails
+        def on_error(self, key, error): ... # optional: an element that failed for good
+        def ended(self, snapshot): ...      # optional: the job ended, however; before `finalize`
+
+The writer is made where the engine runs, from the params and the project: nothing of it
+travels with the job, which is its name and its params.
 """
 import functools
 import importlib
@@ -332,6 +337,8 @@ class Flow:
             fn = functools.partial(fn, params=params)  # pickled with the function: once for each batch
 
         writer = None if output is None else _writer(output, params, self.project)
+        if engine.get("on_error") is None:  # a writer with `on_error` hears of what failed for good
+            engine["on_error"] = getattr(writer, "on_error", None)
 
         def write(pairs):
             results = [result for _, result in pairs if result]
@@ -344,6 +351,8 @@ class Flow:
             try:
                 if far is not None:
                     far.ended(snapshot)
+                if hasattr(writer, "ended"):  # after `finish`, or instead of it for a job stopped halfway
+                    writer.ended(snapshot)
                 if spec["finalize"] is not None:
                     spec["finalize"](params, self.project, snapshot)
             finally:

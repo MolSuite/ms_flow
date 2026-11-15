@@ -116,16 +116,28 @@ class Lines:
     def finish(self):
         if self.params.get("refuse"):
             raise RuntimeError("nothing worth keeping")
-        SEEN["lines"] = sorted(self.kept)
+        SEEN["lines"] = sorted(self.kept, key=str)
+
+    def on_error(self, key, error):
+        SEEN.setdefault("failed", []).append(str(error))
+
+    def ended(self, snapshot):
+        SEEN["writer_ended"] = snapshot.status
 
 
 def tidy_up(params, project, snapshot):
     SEEN["ended"] = snapshot.status
+    SEEN["writer_ended_first"] = "writer_ended" in SEEN
 
 
 @job(task=line, output=Lines, finalize=tidy_up)
 def kept_by_its_writer(params, project):
     return range(params["n"])
+
+
+@job(task=halve, output=Lines)
+def odd_ones_told_to_the_writer(params, project):
+    return range(4)
 
 
 class Shouted:
@@ -234,6 +246,11 @@ def test_a_job_writes_files_or_through_its_own_writer_which_has_the_last_word(pr
         refused = submit(kept_by_its_writer, {"n": 5, "refuse": True})  # every element ran; the writer said no
         assert refused.status == "failed" and refused.chunks_done == 5 and "nothing worth keeping" in refused.error
         assert SEEN["ended"] == "failed"
+        assert SEEN["writer_ended"] == "failed" and SEEN["writer_ended_first"]  # told how it ended, before `finalize`
+
+        told = submit(odd_ones_told_to_the_writer, {})  # a writer with `on_error` hears of the elements that failed
+        assert told.status == "completed_with_errors", told.error
+        assert [error.splitlines()[-1] for error in SEEN["failed"]] == ["ValueError: odd"] * 2
 
     with pytest.raises(TypeError, match="file_sink"):
         job(task=line, output="lines.txt")
