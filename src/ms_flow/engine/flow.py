@@ -30,9 +30,12 @@ import inspect
 import json
 import logging
 import threading
+import time
 import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+
+from ms_flow.engine.slow import slow
 
 log = logging.getLogger(__name__)
 
@@ -343,7 +346,9 @@ class Flow:
         def write(pairs):
             results = [result for _, result in pairs if result]
             if results:
+                started = time.perf_counter()
                 writer.write(results)
+                slow(f"writer {type(writer).__name__} of {spec['name']}: {len(results)} results", started)
 
         def ended(snapshot):
             with self._lock:

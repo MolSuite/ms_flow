@@ -151,3 +151,58 @@ print(ms.engine.process.pid, flush=True)
     assert done.returncode == 0, done.stderr
     assert "process ended" not in done.stdout + done.stderr  # closed, not taken for dead
     assert _until(lambda: not _alive(int(done.stdout.split()[-1])))
+
+
+def test_a_child_that_stops_answering_is_killed_and_the_call_raises(tmp_path, monkeypatch):
+    from ms_flow._api_impl import engine_host
+    from ms_flow._api_impl.engine_host import EngineGone
+
+    monkeypatch.setattr(engine_host, "PING_EVERY", 0.2)
+    monkeypatch.setattr(engine_host, "HANG_AFTER", 1.0)
+    monkeypatch.setenv("MSFLOW_SLOW_MS", "100000")  # only the kill is that slow: it logs anyway
+    ms = _workspace(tmp_path, monkeypatch)
+    try:
+        child = ms.engine.process
+        os.kill(child.pid, signal.SIGSTOP)  # alive, and silent
+        started = time.monotonic()
+        with pytest.raises(EngineGone):
+            ms.engine.wait(-1, 30)
+        assert time.monotonic() - started < 10
+        assert _until(lambda: not child.is_alive())  # killed (a zombie of ours until joined)
+        assert "engine process silent, killed, during wait" in (tmp_path / "home" / "logs" / "slow.log").read_text()
+    finally:
+        ms.shutdown()
+
+
+def test_a_long_call_to_a_busy_child_that_answers_is_not_killed(tmp_path, monkeypatch):
+    from ms_flow._api_impl import engine_host
+
+    monkeypatch.setattr(engine_host, "PING_EVERY", 0.2)
+    monkeypatch.setattr(engine_host, "HANG_AFTER", 1.0)
+    ms = _workspace(tmp_path, monkeypatch)
+    try:
+        job_id = ms.submit(numbers, {"n": 2, "nap": 2.5}, executor="thread")  # longer than HANG_AFTER
+        assert ms.engine.wait(job_id, 60).status == "completed"
+    finally:
+        ms.shutdown()
+
+
+def test_slow_steps_are_logged_when_asked(tmp_path, monkeypatch):
+    monkeypatch.setenv("MSFLOW_SLOW_MS", "0")  # everything is that slow
+    ms = _workspace(tmp_path, monkeypatch)
+    try:
+        assert ms.engine.wait(ms.submit(numbers, {"n": 2}, executor="thread"), 60).status == "completed"
+    finally:
+        ms.shutdown()
+    log = (tmp_path / "home" / "logs" / "slow.log").read_text()
+    assert "engine process start" in log and "engine call submit" in log
+    assert "writer" in log and "of numbers" in log  # written by the engine's process
+    assert "engine call wait" not in log
+
+
+def test_the_engine_package_stays_light_for_workers():
+    import subprocess
+    import sys
+
+    code = "import sys, ms_flow.engine.flow; assert 'sqlalchemy' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)

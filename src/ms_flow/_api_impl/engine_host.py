@@ -27,6 +27,7 @@ import pickle
 import socket
 import sys
 import threading
+import time
 import traceback
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,13 @@ CALLBACKS = frozenset({"on_terminal", "on_line"})
 
 class EngineGone(RuntimeError):
     """The engine's process ended while something waited for it."""
+
+
+#: While a call of the app waits, the engine's process is asked every `PING_EVERY` s whether it
+#: still answers (its reading thread does, however busy the engine); one that has said nothing
+#: for `HANG_AFTER` s is taken as hung and killed, and the call raises `EngineGone`. A call may
+#: take as long as it needs (`wait`, the start of a remote host) while the process answers.
+PING_EVERY, HANG_AFTER = 5.0, 60.0
 
 
 _side = "app"  # "engine" in the child
@@ -84,6 +92,8 @@ class _Peer:
         self._waiting: dict[int, list] = {}
         self._ids = itertools.count()
         self.gone = self.closed = False
+        self.on_hang = None  # the app's end: what kills the other process when it stops answering
+        self._asked = None  # when the oldest ping still unanswered went
         threading.Thread(target=self._read, name=f"msflow-host-{_side}", daemon=True).start()
 
     def _send(self, message) -> None:
@@ -101,7 +111,23 @@ class _Peer:
         except (OSError, EOFError, ValueError):
             self._waiting.pop(rid, None)
             raise EngineGone("the engine's process has ended") from None
-        slot[0].wait()
+        while not slot[0].wait(PING_EVERY):
+            if self.on_hang is None:
+                continue
+            if self._asked is None:
+                self._asked = time.monotonic()
+                try:
+                    self._send(("ping",))
+                except (OSError, EOFError, ValueError):
+                    pass  # `_read` sees the end
+            elif time.monotonic() - self._asked > HANG_AFTER:
+                from ms_flow.engine.slow import slow
+
+                slow(f"engine process silent, killed, during {target[1]}",
+                     time.perf_counter() - (time.monotonic() - self._asked), always=True)
+                self.on_hang()  # its end of the pipe closes: `_read` ends every wait with `EngineGone`
+                if not slot[0].wait(HANG_AFTER):
+                    raise EngineGone("the engine's process stopped answering")
         if slot[1]:
             return slot[2]
         raise slot[2]
@@ -110,9 +136,12 @@ class _Peer:
         try:
             while True:
                 message = pickle.loads(self.conn.recv_bytes())
+                self._asked = None  # it answers
                 if message[0] == "ask":
                     threading.Thread(target=self._answer, args=message[1:], daemon=True).start()
-                else:
+                elif message[0] == "ping":
+                    self._send(("pong",))
+                elif message[0] == "got":
                     _, rid, ok, value = message
                     slot = self._waiting.pop(rid)
                     slot[1], slot[2] = ok, value
@@ -171,14 +200,24 @@ class EngineProxy:
         def run(*args, **kwargs):
             kwargs = {key: callback(value) if key in CALLBACKS and callable(value) else value
                       for key, value in kwargs.items()}
-            return self.peer.call(("engine", name), args, kwargs)
+            return self._timed(("engine", name), args, kwargs)
         return run
 
     def call(self, name: str, args=(), kwargs=None):
         """The child's `Workspace.<name>`."""
         kwargs = {key: callback(value) if key in CALLBACKS and callable(value) else value
                   for key, value in (kwargs or {}).items()}
-        return self.peer.call(("workspace", name), args, kwargs)
+        return self._timed(("workspace", name), args, kwargs)
+
+    def _timed(self, target, args, kwargs):
+        from ms_flow.engine.slow import slow
+
+        started = time.perf_counter()
+        try:
+            return self.peer.call(target, args, kwargs)
+        finally:
+            if target[1] != "wait":  # it waits by design
+                slow(f"engine call {target[1]}", started)
 
     def close(self, timeout: float = 60) -> None:
         self.peer.close()  # the child sees the pipe close, closes its project and engine, and exits
@@ -214,9 +253,14 @@ def start(init: dict, on_gone) -> EngineProxy:
     # not a daemon: its executors start processes of their own. Started from a thread that lasts
     # as long as the application: `PR_SET_PDEATHSIG` kills the child when the thread that started
     # it ends, not only its process.
+    from ms_flow.engine.slow import slow
+
+    started = time.perf_counter()
     _STARTER.submit(process.start).result()
+    slow("engine process start", started)
     theirs.close()
     _peer = _Peer(mine, None, on_gone)
+    _peer.on_hang = process.kill
     proxy = EngineProxy(process, _peer)
     _live.add(proxy)
     return proxy
