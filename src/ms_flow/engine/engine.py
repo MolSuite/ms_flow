@@ -151,6 +151,8 @@ class JobSnapshot:
     # What its job asks of a queue (a campaign's): `nodes`, `cpus` (each node), `gpus`, `memory_gb`,
     # those it sets; else None.
     asked: dict | None = None
+    # The keys of the jobs it was submitted after (`after`), for a monitor to draw it under them.
+    after: tuple = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,7 +172,7 @@ class _Job:
                  "on_result", "on_results", "on_error", "on_terminal", "status", "total", "done", "failed", "open",
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
-                 "skip", "after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
+                 "skip", "after", "came_after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
                  "states", "executor", "usage", "held", "far", "canceling")
 
@@ -201,7 +203,7 @@ class _Job:
                            None if self.finished_at else getattr(self.far, "unreachable", None),
                            None if self.finished_at else getattr(self.far, "note", None),
                            bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())),
-                           getattr(self.far, "asked", None) or None)
+                           getattr(self.far, "asked", None) or None, self.came_after)
 
 
 @functools.cache
@@ -472,6 +474,7 @@ class Engine:
         job.journal = job.n = job.uid = job.spec = job.skip = job.source = job.key = None
         job.retries, job.retry_wait, job.timeout, job.retried = retries, retry_wait, timeout, 0
         job.after = [self._jobs.get(job_id) or self._ended[job_id] for job_id in after]
+        job.came_after = tuple(dict.fromkeys(k for dep in job.after if (k := getattr(dep, "uid", dep.key))))  # kept once they ended
         if journal is not None:
             job.journal = self._journals.get(journal)
             if job.journal is None or job.journal.failed:
