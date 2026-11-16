@@ -837,3 +837,12 @@ def test_a_ray_says_where_each_machine_tells_what_it_uses():
         assert "ray_node_mem_total" in text
     finally:
         ray.shutdown()
+
+
+def test_a_job_says_which_jobs_it_comes_after_once_they_ended(tmp_path):
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(2))
+        engine.attach("j", tmp_path / "j.db")
+        a = engine.submit("thread", _boom_on_3, [1], journal="j", key="a")
+        b = engine.submit("thread", _boom_on_3, [1], journal="j", key="b", after=[a, a])
+        assert engine.wait(b, 30).after == ("a",) and engine.status(a).after == ()
