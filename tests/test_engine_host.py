@@ -206,3 +206,18 @@ def test_the_engine_package_stays_light_for_workers():
 
     code = "import sys, ms_flow.engine.flow; assert 'sqlalchemy' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_provenance_and_after_cross_to_the_app(tmp_path, monkeypatch):
+    ms = _workspace(tmp_path, monkeypatch)
+    try:
+        first = ms.submit(numbers, {"n": 2}, executor="thread")
+        second = ms.submit(numbers, {"n": 2}, executor="thread", after=[first])
+        assert ms.engine.wait(second, 60).status == "completed"
+        snaps = {snap.key: snap for snap in ms.jobs()}
+        key = ms.engine.status(second).key
+        assert ms.provenance(key)["usage"]["ran_on"]["host"]
+        live = ms.engine.status(second)
+        assert getattr(live, "after", None) == (ms.engine.status(first).key,), (live, snaps)
+    finally:
+        ms.shutdown()
