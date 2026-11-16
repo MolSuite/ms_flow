@@ -143,16 +143,19 @@ def test_get_and_get_many_round_trip_in_location_order(project, monkeypatch):
     store.close()
 
 
+_FDS = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"  # macOS: no /proc
+
+
 def test_reader_keeps_at_most_max_open_fds(project, monkeypatch):
     monkeypatch.setattr(P, "VOLUME_SIZE", P.HEADER + 16 + 1)  # one payload per volume
     monkeypatch.setattr(P, "MAX_OPEN_FDS", 2)
     store = PayloadStore(project)
     ids = _put(store, project, [Payload(bytes([i])) for i in range(6)])
     store.close()
-    before = len(os.listdir("/proc/self/fd"))
+    before = len(os.listdir(_FDS))
     for _ in range(2):
         assert store.get_many(ids) == {pid: bytes([i]) for i, pid in enumerate(ids)}
-        assert len(store._fds) == 2 and len(os.listdir("/proc/self/fd")) == before + 2
+        assert len(store._fds) == 2 and len(os.listdir(_FDS)) == before + 2
     store.close()
 
 
