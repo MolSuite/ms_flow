@@ -258,3 +258,19 @@ def test_a_job_on_this_machine_keeps_what_its_cpus_and_cards_did(tmp_path, monke
     assert gpu["peak_gpu"] == 2 and gpu["gpu_s"] >= 0.5
     assert gpu["vram_mb"] == 1000 and gpu["gpu_util"] == 50.0  # it held both cards
     assert cpu["vram_mb"] is None and cpu["busy_s"] > 0.15  # a core spinning, shared with the other job while both ran
+
+
+def test_a_file_system_without_locks_is_said_so_and_is_not_another_owner(tmp_path, monkeypatch):
+    import errno
+    import fcntl
+
+    from ms_flow.engine import Busy
+    from ms_flow.engine.journal import own
+
+    def no_locks(*_):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    with pytest.raises(OSError, match="cannot be locked on this file system") as raised:
+        own(tmp_path / "j.db.lock")
+    assert not isinstance(raised.value, Busy)

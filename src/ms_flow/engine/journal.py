@@ -6,6 +6,7 @@ as not done and run again. A chunk is written once, when it ends, and never its 
 """
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -67,7 +68,11 @@ def own(path):
             import fcntl
 
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except OSError as error:
+        if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK):
+            handle.close()  # a file system without locks (Lustre without flock, some NFS): not another owner
+            raise OSError(error.errno, f"{path} cannot be locked on this file system ({error.strerror}): "
+                                       "a journal needs one with locks, like the home or a local disk") from error
         handle.seek(0)
         owner = handle.read().strip() or "another process"
         handle.close()

@@ -48,11 +48,14 @@ def unreachable(error: BaseException) -> bool:
 
 # One entry for each kind of queue. `submit` runs in the directory of the job and prints its id
 # last; `alive` prints the ids, of those in `{ids}` (with commas), that are queued or running;
-# `cancel` stops the job `{id}`; `state` prints `CANCELLED` for the job `{id}` once it left the
-# queue because somebody canceled it (and maybe something else), nothing when that is not known;
-# `usage`, where the queue keeps accounts, what its accounting says the job `{id}` used, read by
-# `read_usage` (standard Slurm and Grid Engine commands, not a site's own `seff`/`arc.job-info`);
-# `nodes`, the nodes of the queue and what is taken of each, read by `read_nodes`.
+# `cancel` stops the job `{id}`; `state`, run in the job's directory once it left the queue, prints
+# how it ended, `CANCELLED` first when somebody canceled it, nothing when that is not known (Slurm's
+# `NODE_FAIL`, `TIMEOUT`, `OUT_OF_MEMORY`... go in what is said of a job that left early); `why`,
+# for a job `{id}` in the queue, `<state>|<reason>`: the queue's word for it (`PENDING`, `qw`,
+# `Eqw`...) and why it waits, from the queue's own listing; `usage`, where the queue keeps accounts,
+# what its accounting says the job `{id}` used, read by `read_usage` (standard Slurm and Grid Engine
+# commands, not a site's own `seff`/`arc.job-info`); `nodes`, the nodes of the queue and what is
+# taken of each, read by `read_nodes`.
 SCHEDULERS = {
     # Its ids are process ids, which the system gives out again: one counts only while it is this.
     "none": {"submit": "setsid nohup sh job.sh > runner.log 2>&1 < /dev/null & echo $!",
@@ -61,23 +64,27 @@ SCHEDULERS = {
              "state": ":"},
     "slurm": {"submit": "sbatch --parsable job.sh", "alive": "squeue -h -o %i -t PD,CF,R,CG,S,RQ,RS -j {ids}",
               "cancel": "scancel {id}", "state": "sacct -n -X -P -o State -j {id} | head -n 1",
+              "why": "squeue -h -o '%T|%r' -j {id}",
               "usage": "sacct -n -P -o JobID,Elapsed,TotalCPU,AllocCPUS,MaxRSS,ReqMem,State -j {id} | sed 's/^/A|/'; "
                        "sstat -n -P -a -o JobID,AveCPU,MaxRSS,NTasks -j {id} 2>/dev/null | sed 's/^/S|/'",
               "nodes": "sinfo -N -h -O 'NodeList:0|,StateLong:0|,CPUsState:0|,Memory:0|,AllocMem:0|,Gres:0|,"
                        "GresUsed:0|,CPUsLoad:0|,Partition:0|'"},
     # Run against Son of Grid Engine 8.1.9 (the vHPC lab's lab/sge). A Grid Engine whose qacct has
     # `deleted_by` says who canceled; SoGE's has not, and its record of a running job that qdel stopped
-    # (`failed 100`, exit 137) is that of a runner the system killed (out of memory, h_rt): one taken
-    # for the other would end a run that resumes, so on SoGE a qdel there is a job that left early,
-    # queued again. Cancel from the app (its `cancelled` mark) is exact everywhere. qacct has the
-    # record some seconds after the job left the listing (`flush_time` in `qconf -sconf`, 15 s by
-    # default): `state` waits for it while the job is not listed.
-    # ponytail: 30 s at most; `#$ -notify` + a SIGUSR2 trap in job.sh would tell a qdel on SoGE too.
+    # (`failed 100`, exit 137) is that of a runner the system killed. So the template asks for
+    # `-notify`: a qdel sends SIGUSR2 to the job a while before SIGKILL, and job.sh leaves a `deleted`
+    # mark (its h_rt running out sends nothing: `failed 37`). Cancel from the app (its `cancelled`
+    # mark) is exact everywhere. qacct has the record some seconds after the job left the listing
+    # (`flush_time` in `qconf -sconf`, 15 s by default): `state` waits for it while the job is not listed.
+    # ponytail: 30 s at most.
     "sge": {"submit": "qsub -terse -cwd -S /bin/bash job.sh", "alive": "qstat | awk 'NR > 2 {{print $1}}'",
             "cancel": "qdel {id}",
-            "state": "for i in $(seq 30); do qacct -j {id} > /dev/null 2>&1 || "
-                     "qstat | awk 'NR > 2 {{print $1}}' | grep -qx {id} && break; sleep 1; done; "
-                     "qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{print \"CANCELLED\"; exit}}'",
+            "state": "if [ -f deleted ]; then echo CANCELLED; exit 0; fi; for i in $(seq 30); do "
+                     "qacct -j {id} > /dev/null 2>&1 || qstat | awk 'NR > 2 {{print $1}}' | grep -qx {id} && break; "
+                     "sleep 1; done; qacct -j {id} 2>/dev/null | awk '$1 == \"deleted_by\" {{d = 1}} "
+                     "$1 == \"failed\" && $2 != 0 {{$1 = \"\"; f = \"failed\" $0}} END {{print d ? \"CANCELLED\" : f}}'",
+            "why": "s=$(qstat | awk -v id={id} '$1 == id {{print $5}}'); "
+                   "r=$(qstat -j {id} 2>/dev/null | sed -n 's/^error reason *[0-9]*: *//p' | head -n 1); echo \"$s|$r\"",
             "usage": "qstat -j {id} 2>/dev/null | sed -n 's/^usage *[0-9]*: */U|/p'; qacct -j {id} 2>/dev/null | sed 's/^/Q|/'",
             "nodes": "qhost -q"},
 }
@@ -217,7 +224,10 @@ TEMPLATES = {
              '    "ray start --address=$ip:$port --num-cpus=\\${SLURM_CPUS_ON_NODE:-1} --block" >/dev/null 2>&1 &\n'
              '@python@ -m ms_flow.runner . --ray "$ip:$port" --nodes "$n" @runner@\n',
     # ponytail: one node; a parallel environment over several is the site's own template.
-    "sge": '#!/bin/bash\n@setup@\nexec @python@ -m ms_flow.runner . --cpus "${NSLOTS:-1}" @runner@\n',
+    # A qdel sends SIGUSR2 to the whole job first (`-notify`): the runner ends on it, then the mark.
+    # SIGUSR1 comes before a suspension: ignored, the runner too (an ignored signal stays so).
+    "sge": '#!/bin/bash\n#$ -notify\n@setup@\ntrap \'\' USR1\ntrap \'touch "${SGE_O_WORKDIR:-.}/deleted"\' USR2\n'
+           '@python@ -m ms_flow.runner . --cpus "${NSLOTS:-1}" @runner@\n',
 }
 
 

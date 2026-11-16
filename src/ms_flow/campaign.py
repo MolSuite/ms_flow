@@ -173,6 +173,7 @@ _ACCOUNT_EVERY = 300.0
 # then (a few hundred bytes over the connection ssh keeps open), the parts made only every
 # `poll_s`, so a stage that ends fast does not send a part a second.
 _GLANCE_FOR, _GLANCE_EVERY = 300.0, 1.0
+_TOLD = "--told--"  # between what the queue said and the progress, in a glance
 
 
 class Campaign:
@@ -191,6 +192,7 @@ class Campaign:
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self.executor, self.total, self.steps = executor or None, None, []
         self.queue_usage, self._accounted = None, 0.0
+        self._why = ("", "")  # the queue's word for its job and why it waits, while it is in the queue
         # What its job asks of the queue, for whoever shows it: the executor's asks, `asks` over them.
         self.asked = {key: value for key, value in {**remote.asks, **(asks or {})}.items()
                       if key in ("nodes", "cpus", "gpus", "memory_gb") and value not in (None, "", 0)}
@@ -485,7 +487,7 @@ class Campaign:
             if self._canceling:
                 return
             self.note = f"submitting it to the queue of {self._where()}"
-            self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled")
+            self.job = self.remote._queue(f"cd {self.remote.workdir}/{self.dir} && rm -f cancelled deleted")
 
     def _follow(self):
         """Every round, one command: the progress, whether the job is in the queue, and whatever
@@ -509,7 +511,7 @@ class Campaign:
             command = (
                 f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; t=.poll.$$; "
                 "cat progress.json > $t.told 2>/dev/null; id=$(cat queue.id 2>/dev/null); "
-                f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -x \"$id\"; }} > $t.alive 2>/dev/null; "
+                f"{self._alive_why()} > $t.alive; "
                 "echo $t.told > $t; echo $t.alive >> $t; "
                 f"for a in {asked}; do s=${{a%:*}}; n=${{a#*:}}; ls stages/$s/results 2>/dev/null | "
                 "awk -v d=stages/$s/results -v n=$n -F'[-.]' '/^part-/ && $2 + 0 > n {print d \"/\" $0}'; done >> $t; "
@@ -517,7 +519,9 @@ class Campaign:
                 "do [ -f \"$f\" ] && echo \"$f\"; done >> $t; tar cf - -T $t 2>/dev/null; rm -f $t $t.told $t.alive")
             files = self._patiently(lambda: _untar(self._run(command, timeout=self.remote.poll_timeout)))
             told = json.loads(next((data for name, data in files.items() if name.endswith(".told")), b"") or b"{}")
-            alive = any(data.strip() for name, data in files.items() if name.endswith(".alive"))
+            said = next((data for name, data in files.items() if name.endswith(".alive")), b"")
+            alive = bool(said.strip())
+            self._why_from(said)
             if not self._canceling:
                 self._tell(told, alive)
                 if alive and time.monotonic() > self._accounted + _ACCOUNT_EVERY:
@@ -583,12 +587,12 @@ class Campaign:
                     raise RuntimeError(f"campaign {self.dir} was canceled in the queue{self._kept()}")
                 now = (told.get("stages_done", 0), told.get("done", 0))
                 if was is not None and now <= was:
-                    raise RuntimeError(f"campaign {self.dir} left the queue before its end, no further than when it "
-                                       f"was queued again{self._kept()}")
+                    raise RuntimeError(f"campaign {self.dir} left the queue before its end{self._ended_as(state)}, "
+                                       f"no further than when it was queued again{self._kept()}")
                 # Out of the queue before its end (its time ran out, its node failed): once more,
                 # and the runner goes on from its journal.
                 was, ending = now, False
-                log.info("campaign %s left the queue at %s: queued again", self.dir, now)
+                log.warning("campaign %s left the queue at %s%s: queued again", self.dir, now, self._ended_as(state))
                 self._submit()
             self._stop.wait(min(_GLANCE_EVERY, self.remote.poll_s) if time.monotonic() < glancing else self.remote.poll_s)
 
@@ -596,10 +600,23 @@ class Campaign:
         """Its progress there, and whether its job is in the queue: nothing it made."""
         queue = self.remote.queue
         out = self._run(f"cd {self.remote.workdir}/{self.dir} 2>/dev/null || exit 0; id=$(cat queue.id 2>/dev/null); "
-                        f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -qx \"$id\"; }} 2>/dev/null "
-                        "&& echo alive; cat progress.json 2>/dev/null; :", timeout=self.remote.poll_timeout)
-        alive = out.startswith(b"alive\n")
-        return json.loads((out[6:] if alive else out) or b"{}"), alive
+                        f"{self._alive_why()}; echo {_TOLD}; cat progress.json 2>/dev/null; :", timeout=self.remote.poll_timeout)
+        head, _, told = out.partition(f"{_TOLD}\n".encode())
+        self._why_from(head)
+        return json.loads(told or b"{}"), bool(head.strip())
+
+    def _alive_why(self) -> str:
+        """Shell that prints, when the job `$id` is in the queue, its id and then, unless its runner
+        says it runs, `why=` (`why` of the queue, one call more to it): what `_why_from` reads."""
+        queue = self.remote.queue
+        why = (f" && {{ grep -qs '\"status\": \"running\"' progress.json || "
+               f"echo \"why=$({{ {queue['why'].format(id='$id')}; }} 2>/dev/null | head -n 1)\"; }}") if "why" in queue else ""
+        return f"{{ [ -n \"$id\" ] && {{ {queue['alive'].format(ids='$id')}; }} | grep -x \"$id\"{why}; }} 2>/dev/null"
+
+    def _why_from(self, said: bytes) -> None:
+        state, _, reason = next((line[4:] for line in said.decode(errors="replace").splitlines()
+                                 if line.startswith("why=")), "").partition("|")
+        self._why = (state.strip(), reason.strip())
 
     def _account(self, final: bool = False) -> None:
         """`queue_usage`, from the accounting of the queue over there (its `usage` command); with
@@ -637,11 +654,35 @@ class Campaign:
             failed = f", {told['failed']} failed" if told.get("failed") else ""
             self.note = f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} done{failed}"
         elif alive and not told:
-            self.note = f"waiting in the queue ({job})"
+            self.note = f"{self._waiting()} ({job}){self._because()}"
         elif alive:
-            self.note = f"in the queue again ({job}): {told.get('done', 0):,} of {told.get('total', 0):,} done before"
+            self.note = (f"{self._waiting()} again ({job}){self._because()}: "
+                         f"{told.get('done', 0):,} of {told.get('total', 0):,} done before")
         else:
             self.note = f"{job} is not in the queue: looking at why"
+
+    def _waiting(self) -> str:
+        """How it waits in the queue, from `_why`: held or in error, it waits for somebody."""
+        state, reason = self._why
+        grid = not state.isupper()  # Grid Engine's letters (qw, hqw, Eqw), not Slurm's words
+        if grid and "E" in state:
+            return "in error in the queue, waiting for its error to be cleared (qmod -cj) or for a cancel"
+        if grid and "h" in state or state == "REQUEUE_HOLD" or "held" in reason.lower():
+            return "held in the queue, waiting to be released or canceled"
+        return "waiting in the queue"
+
+    def _because(self) -> str:
+        reason = self._why[1]
+        return f": {reason}" if reason and reason != "None" else ""
+
+    def _ended_as(self, state: str) -> str:
+        """What the queue says of how its job ended, for what is said of a job that left early."""
+        hint = {"OUT_OF_MEMORY": ": it needs more memory than it asked the queue for",
+                "TIMEOUT": ": its time ran out, it may ask the queue for more",
+                "NODE_FAIL": ": its node failed"}.get(state.split()[0] if state else "", "")
+        if state.startswith("failed 37"):
+            hint = ": a limit of the queue (h_rt, h_cpu or h_vmem) ran out, it may ask for more"
+        return f" ({state}{hint})" if state else ""
 
     def _kept(self) -> str:
         return self.remote._said(self.dir)
