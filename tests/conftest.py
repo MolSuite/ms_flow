@@ -26,3 +26,4 @@ def isolated_workspace(tmp_path_factory, monkeypatch):
     """
     empty = tmp_path_factory.mktemp("empty_workspace")
     monkeypatch.setenv("MS_FLOW_WORKSPACE_ROOT", str(empty))
+    monkeypatch.delenv("MSFLOW_ENGINE_HOST", raising=False)  # inline unless a test says (`test_engine_host.py`)

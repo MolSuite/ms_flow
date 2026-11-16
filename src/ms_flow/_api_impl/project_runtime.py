@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID
@@ -70,6 +71,8 @@ class WorkspaceProjectRuntimeMixin:
         return Path(project_path).expanduser().resolve() / "project.db"
 
     def _shutdown_runtime_stack(self):
+        if self._warming is not None:  # a process started ahead is closed below, not left behind
+            self._warming.join()
         self._close_project_runtime()
         if self._engine is not None:
             self._engine.close()
@@ -77,9 +80,18 @@ class WorkspaceProjectRuntimeMixin:
 
     def _close_project_runtime(self):
         active_project = self._runtime_state.active_project
-        if self._flow is not None:  # before the project goes: what its jobs delivered is written first
-            self._flow = None
-            self._engine.detach("project")
+        with self._hosting:  # a start of the engine's process opens the project first: see `_warm`
+            flow, self._flow = self._flow, None
+        if flow is not None:  # before the project goes: what its jobs delivered is written first
+            if self._host == "process":  # its process closes it, with the jobs it runs
+                from ms_flow._api_impl.engine_host import EngineGone
+
+                try:
+                    self._engine.call("close_project")
+                except EngineGone:
+                    pass
+            else:
+                self._engine.detach("project")
         try:
             if active_project is not None and active_project.project_db is not None:
                 active_project.project_db.disconnect()
@@ -370,6 +382,22 @@ class WorkspaceProjectRuntimeMixin:
         )
         if touch_master:
             self.project_manager.touch_project(context.id)
+        if self._host != "process":
+            return
+        with self._hosting:  # one at a time with a start of the engine's process
+            if self._engine is not None:  # the engine's process opens it too
+                self._engine.call("_hosted_open", (str(context.id),))
+                self._flow = True
+                return
+        # ponytail: the process starts now, aside, so the first job does not wait for it
+        self._warming = threading.Thread(target=self._warm, name="ms_flow-engine-start", daemon=True)
+        self._warming.start()
+
+    def _warm(self):
+        try:
+            self.engine  # starts its process, which opens the active project
+        except Exception as error:  # the first use of the engine says it again, to whoever uses it
+            self.app_logger.info("The engine's process did not start ahead of its use: %s", error)
 
     def shutdown(self):
         try:

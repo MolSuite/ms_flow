@@ -22,13 +22,16 @@ class BaseRuntime:
         logger_name: str | None = None,
         project_resources: Iterable[ProjectResourceSpec | dict | object] | None = None,
         app_settings=None,
+        engine_host: str | None = None,
     ):
+        """`engine_host`: see `Workspace`."""
         self.app_id = app_id
         self.workspace = Workspace(
             app_id=app_id,
             host_namespace=app_id,
             project_resources=project_resources,
             app_settings=app_settings,
+            engine_host=engine_host,
         )
         self.logger = self.workspace.get_app_logger(logger_name or app_id)
 
@@ -180,12 +183,14 @@ class AppRuntime(BaseRuntime):
         logger_name: str | None = None,
         project_resources: Iterable[ProjectResourceSpec | dict | object] | None = None,
         app_settings=None,
+        engine_host: str | None = None,
     ):
         super().__init__(
             app_id=app_id,
             logger_name=logger_name,
             project_resources=project_resources,
             app_settings=app_settings,
+            engine_host=engine_host,
         )
         self._project_catalog: AppProjectCatalog | None = None
 
