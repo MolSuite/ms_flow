@@ -435,6 +435,28 @@ class WorkspaceJobApiMixin:
         return self._project_flow().origin(key, journal="project")
 
     @hosted()
+    def provenance(self, key: str) -> dict:
+        """What the job recorded under `key` in the active project ran with and made, to keep next
+        to what it made: `job`, `params` and `options` (its `origin`, when it has one), `executor`,
+        `status`, `error`, the times, its counts of elements, and `usage`, where `ran_on` says on
+        which machine, with which Python and with which version of ms_flow and of its task's
+        package it ran, and `queue` (a campaign's) what the queue's accounting says it used."""
+        project = self._runtime_state.active_project
+        if project is None:
+            raise RuntimeError("no project is open")
+        from ms_flow.engine.journal import recorded
+
+        row = next((row for row in recorded(project.context.path / "executor.db") if row["job_id"] == key), None)
+        if row is None:
+            raise KeyError(f"no job {key!r} on record in this project")
+        origin = json.loads(row["spec"] or "{}").get("origin") or {}
+        when = {name: time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(row[name])) if row[name] else None
+                for name in ("started_at", "finished_at")}
+        return {"key": key, "name": row["name"], **origin, "executor": _spec_executor(row["spec"]),
+                "status": row["status"], "error": row["error"], **when, "total": row["total"], "done": row["done"],
+                "failed": row["failed"], "usage": _usage(row)}
+
+    @hosted()
     def resume(self, key: str, **options) -> int:
         """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
         with the params and options it was submitted with: one that was interrupted (the project

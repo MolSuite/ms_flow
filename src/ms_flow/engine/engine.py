@@ -8,6 +8,7 @@ job, the callbacks on the delivery thread, the disk on the writer thread of each
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import heapq
 import itertools
@@ -15,8 +16,10 @@ import json
 import logging
 import os
 import pickle
+import platform
 import queue
 import reprlib
+import socket
 import subprocess
 import threading
 import time
@@ -133,6 +136,7 @@ class JobSnapshot:
     # machine did meanwhile, shared out among the jobs by what each held: `busy_s` (seconds of
     # busy cores), `vram_mb` (peak) and `gpu_util` (mean % of the cards); else None. A campaign's
     # job in a queue also has `queue`, what the queue's accounting says it used there (`read_usage`).
+    # `ran_on` says with what it ran: machine, Python, ms_flow and its task's package (`ran_on`).
     usage: dict | None = None
     # While it runs and the other machine it waits for does not answer: since when, and what was
     # said. It goes on by itself once that machine answers (or sooner, with its executor's `reconnect`).
@@ -180,6 +184,8 @@ class _Job:
         queue = getattr(self.far, "queue_usage", None)  # a campaign's job in a queue: what its accounting says
         if queue:
             usage["queue"] = dict(queue)
+        # ponytail: a job on Ray says what the machine that runs the engine has, not each node
+        usage["ran_on"] = getattr(self.far, "ran_on", None) or ran_on(getattr(self.fn, "__module__", "") or "")
         return usage
 
     def snapshot(self) -> JobSnapshot:
@@ -196,6 +202,25 @@ class _Job:
                            None if self.finished_at else getattr(self.far, "note", None),
                            bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())),
                            getattr(self.far, "asked", None) or None)
+
+
+@functools.cache
+def ran_on(*modules: str) -> dict:
+    """What a job ran with, for its provenance: this machine, its Python, ms_flow's version, and
+    the version of the distribution each of `modules` (its tasks' modules) comes from."""
+    from importlib.metadata import version
+
+    def of(name: str) -> str:
+        try:
+            return version(name)
+        except Exception:  # not installed as a distribution (a script, a source tree)
+            return ""
+
+    # ponytail: the distribution named as the top module (ms_flow, amdockvs...); one named
+    # otherwise (sklearn of scikit-learn) reads as "". packages_distributions() takes ~1 s.
+    packages = {top: of(top) for top in {module.partition(".")[0] for module in modules} if top}
+    return {"host": socket.gethostname(), "python": platform.python_version(), "platform": platform.platform(),
+            "ms_flow": of("ms_flow"), "packages": packages}
 
 
 def _busy_seconds() -> float | None:

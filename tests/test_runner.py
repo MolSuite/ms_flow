@@ -1,6 +1,7 @@
 """`ms_flow.runner`: a staged directory run to its end, and one stopped and run again."""
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -43,6 +44,7 @@ def test_a_staged_job_runs_to_its_end_and_says_which_element_failed(tmp_path):
     told = _progress(home)
     assert (told["status"], told["total"], told["done"], told["failed"]) == ("completed_with_errors", 12, 11, 1)
     assert sorted(_indexes(home)) == [i for i in range(12) if i != 7]
+    assert told["ran_on"]["python"] == platform.python_version() and "ms_flow" in told["ran_on"]  # its provenance
     (line,) = (home / "errors.jsonl").read_text().splitlines()
     assert json.loads(line)["index"] == 7 and "worker process died" in line
     assert _runner(home).wait(60) == 0 and len(_indexes(home)) == 11  # ended: a second run does nothing

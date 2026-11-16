@@ -51,6 +51,7 @@ from functools import partial
 from pathlib import Path
 
 from ms_flow.engine import Busy, Engine, ProcessExecutor, RayExecutor, content_key
+from ms_flow.engine.engine import ran_on
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.engine.tokens import usable_cpus
 from ms_flow.payloads import Payload, PayloadGroup, PayloadPart, _packed_group
@@ -263,8 +264,12 @@ class _Parts:
                 os.replace(self.open, self.folder / f"part-{self.n:05d}.jsonl")
 
 
+_RAN_ON: dict = {}  # what this runner runs with, told with every progress (see `ran_on`)
+
+
 def _tell(home: Path, **progress) -> None:
-    (home / "progress.tmp").write_text(json.dumps({**progress, "home": str(home.resolve()), "at": time.time()}))
+    told = {**progress, "home": str(home.resolve()), "at": time.time(), "ran_on": _RAN_ON}
+    (home / "progress.tmp").write_text(json.dumps(told))
     os.replace(home / "progress.tmp", home / "progress.json")
 
 
@@ -284,6 +289,8 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1, g
         # Every node of a cluster's allocation sees its disk: Ray carries no file.
         engine.register("run", ProcessExecutor(cpus, gpus=gpus) if ray is None else RayExecutor(ray, shared=True))
         engine.attach("journal", home / "journal.db")
+        calls = [stage["fn"] for stage in spec["stages"]] if "stages" in spec else [spec["call"]]
+        _RAN_ON.update(ran_on(*(str(call.get("$call", "")).partition(":")[0] for call in calls)))
         if "stages" in spec:
             return _stages(engine, home, spec)
         fn = unplain(spec["call"], refs=True)

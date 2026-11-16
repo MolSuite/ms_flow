@@ -1,4 +1,5 @@
 """`@task`, `@job` and `Flow.submit` on the new engine: params, sinks, batch levels, table dependencies."""
+import platform
 import json
 import sqlite3
 import time
@@ -392,6 +393,12 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
         moved = ms.engine.wait(ms.move("moved", "local"), 120)
         assert (ms.engine.status(moving).status, moved.status, moved.chunks_done) == ("canceled", "completed", 300)
         assert ms.origin("moved")["options"] == {"executor": "local", "cpu": 2}
+        made = ms.provenance("moved")  # what it ran with, to keep next to what it made
+        assert (made["job"], made["status"], made["done"], made["executor"]) == (ms.origin("moved")["job"], "completed", 300, "local")
+        ran = made["usage"]["ran_on"]
+        assert ran["python"] == platform.python_version() and ran["ms_flow"] is not None and made["finished_at"]
+        with pytest.raises(KeyError):
+            ms.provenance("never")
         assert rows + 300 <= sql(db, "SELECT count(*) FROM docking_results")[0][0] < rows + 320
     finally:
         ms.shutdown()
