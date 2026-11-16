@@ -1,6 +1,7 @@
 """The engine's journal: what reaches the disk, what a finished job leaves there, who owns the file."""
 import os
 import sqlite3
+import sys
 import time
 from contextlib import closing
 
@@ -257,7 +258,9 @@ def test_a_job_on_this_machine_keeps_what_its_cpus_and_cards_did(tmp_path, monke
         gpu, cpu = engine.wait(gpu, 30).usage, engine.wait(cpu, 30).usage
     assert gpu["peak_gpu"] == 2 and gpu["gpu_s"] >= 0.5
     assert gpu["vram_mb"] == 1000 and gpu["gpu_util"] == 50.0  # it held both cards
-    assert cpu["vram_mb"] is None and cpu["busy_s"] > 0.15  # a core spinning, shared with the other job while both ran
+    # a core spinning, shared with the other job while both ran; a macOS runner (psutil, a VM)
+    # counts far less than it spun, so there only that it is counted
+    assert cpu["vram_mb"] is None and cpu["busy_s"] > (0 if sys.platform == "darwin" else 0.15)
 
 
 def test_a_file_system_without_locks_is_said_so_and_is_not_another_owner(tmp_path, monkeypatch):
