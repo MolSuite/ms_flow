@@ -41,7 +41,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Test + development tooling.
-dev = ["pytest>=7.0", "pyarrow>=15"]
+dev = ["pytest>=7.0", "pyarrow>=15", "tqdm", "psutil"]  # tqdm: ms_flow.progress; psutil: busy CPU time on macOS
 # `ms_flow.core.data.shard`: shards are Parquet files.
 parquet = ["pyarrow>=15"]
 # `ms_flow.engine.RayExecutor`: the machines of a network, or the nodes of an HPC job.

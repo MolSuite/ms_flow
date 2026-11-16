@@ -328,6 +328,7 @@ def test_the_facade_runs_a_job_in_the_project_and_closing_it_interrupts(tmp_path
 
     monkeypatch.setattr("ms_flow.core.settings.manager.Path.home", lambda: tmp_path)
     monkeypatch.setattr("ms_flow.core.settings.models.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("ms_flow.engine.tokens.usable_cpus", lambda: 4)  # `local` leaves 2 to the desktop; a CI runner may have 3
 
     def sql(db, text):
         with closing(sqlite3.connect(str(db))) as conn, conn:

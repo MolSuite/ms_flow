@@ -812,7 +812,7 @@ class Engine:
                 self._settle(job, chunk.key, chunk.attempt, None, n=chunk.n)
             else:
                 self._deliveries.put((job, chunk.key, chunk.attempt, result, chunk.n))
-        elif status == LOST and chunk.doomed:
+        elif chunk.doomed:  # the engine stopped it: why, whatever the task raised as it went down
             self._attempt_failed(chunk, chunk.doomed)
         elif status == LOST and not chunk.alone:
             job.slot.suspects.append(chunk)  # collateral or culprit: running it alone will tell
