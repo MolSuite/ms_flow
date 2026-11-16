@@ -98,4 +98,24 @@ def directives(scheduler: str, *, partition: str = "", account: str = "", nodes:
                       *(line for line in own if not line.startswith(mark))])
 
 
-__all__ = ["RESOURCES", "directives", "read"]
+def seconds(time: str) -> int:
+    """A Slurm time (`MM`, `MM:SS`, `H:MM:SS`, `D-H`, `D-H:MM`, `D-H:MM:SS`) in seconds."""
+    days, _, rest = str(time).rpartition("-")
+    parts = [int(part) for part in rest.split(":")]
+    if days:
+        h, m, s = (parts + [0, 0])[:3]
+    else:
+        h, m, s = [(0, parts[0], 0), (0, *parts), tuple(parts)][len(parts) - 1]
+    return ((int(days or 0) * 24 + h) * 60 + m) * 60 + s
+
+
+def grown(field: str, value, factor: float):
+    """`value` of a resource `field` times `factor`, up: memory in whole GB, time as Slurm writes it."""
+    if field == "time":
+        days, rest = divmod(math.ceil(seconds(value) * factor), 86400)
+        clock = f"{rest // 3600:02}:{rest % 3600 // 60:02}:{rest % 60:02}"
+        return f"{days}-{clock}" if days else clock
+    return math.ceil(float(value) * factor)
+
+
+__all__ = ["RESOURCES", "directives", "grown", "read", "seconds"]

@@ -60,6 +60,7 @@ from ms_flow.engine.flow import job, task
 from ms_env import HostError
 from ms_flow.remote import RemoteExecutor, _untar, read_usage, unreachable
 from ms_flow.runner import part_number, read_part, stage_campaign, unplain
+from ms_flow.site_script import grown
 
 log = logging.getLogger(__name__)
 
@@ -193,6 +194,8 @@ class Campaign:
         self.executor, self.total, self.steps = executor or None, None, []
         self.queue_usage, self._accounted = None, 0.0
         self._why = ("", "")  # the queue's word for its job and why it waits, while it is in the queue
+        # What this run asks of the queue over the executor's, and how often it asked for more (`_grow`).
+        self._asks, self._grown = dict(asks or {}), 0
         # What its job asks of the queue, for whoever shows it: the executor's asks, `asks` over them.
         self.asked = {key: value for key, value in {**remote.asks, **(asks or {})}.items()
                       if key in ("nodes", "cpus", "gpus", "memory_gb") and value not in (None, "", 0)}
@@ -586,6 +589,13 @@ class Campaign:
                     self._run(f"touch {self.remote.workdir}/{self.dir}/cancelled")
                     raise RuntimeError(f"campaign {self.dir} was canceled in the queue{self._kept()}")
                 now = (told.get("stages_done", 0), told.get("done", 0))
+                grown = self._grow(state)
+                if grown:  # it may not have gone any further: what it lacked is what it asks for now
+                    was, ending = now, False
+                    log.warning("campaign %s left the queue at %s%s: queued again asking for %s",
+                                self.dir, now, self._ended_as(state), grown)
+                    self._submit()
+                    continue
                 if was is not None and now <= was:
                     raise RuntimeError(f"campaign {self.dir} left the queue before its end{self._ended_as(state)}, "
                                        f"no further than when it was queued again{self._kept()}")
@@ -683,6 +693,25 @@ class Campaign:
         if state.startswith("failed 37"):
             hint = ": a limit of the queue (h_rt, h_cpu or h_vmem) ran out, it may ask for more"
         return f" ({state}{hint})" if state else ""
+
+    def _grow(self, state: str) -> str:
+        """Ask the queue for more of what its job ran out of, as the executor's `grow` says for the
+        state it ended in, at most `grow_times` times: what it asks now, or "" when it does not.
+        A resource the job did not ask for is the queue's default, unknown here: not grown."""
+        rule = self.remote.grow.get(state.split()[0] if state else "")
+        # ponytail: Slurm only, as `site_script.directives` writes resources for Slurm only
+        if not rule or self._grown >= self.remote.grow_times or self.remote._script[0] != "slurm":
+            return ""
+        asks = {**self.remote.asks, **self._asks}
+        more = {field: grown(field, asks[field], factor) for field, factor in rule.items() if asks.get(field)}
+        if not more:
+            return ""
+        self._asks.update(more)
+        self._grown += 1
+        self.asked.update({field: value for field, value in more.items() if field in self.asked})
+        (self._tmp / "job.sh").write_text(self.remote.script_for(self._asks))
+        self._upload(["job.sh"])
+        return ", ".join(f"{field} {value}" for field, value in more.items())
 
     def _kept(self) -> str:
         return self.remote._said(self.dir)

@@ -299,6 +299,11 @@ class RemoteExecutor:
     `modules`, written as `#SBATCH` lines above `setup` (see `site_script.directives`); a campaign
     and any job with a key may ask otherwise for itself (`ask`, `script_for`).
 
+    `grow` says what a campaign's job asks for more of when the queue says it ended for want
+    of it, `{state: {resource: factor}}` (`{"OUT_OF_MEMORY": {"memory_gb": 2}, "TIMEOUT":
+    {"time": 1.5}}`), at most `grow_times` times: it is queued again asking for that, however
+    far it went. Slurm only. Nothing by default: a job that left early goes once more as it was.
+
     `keep_after` is how many days a campaign's directory stays there (see `ms_flow.campaign`)
     once all of it came back or it was canceled: 0 removes it then.
 
@@ -316,7 +321,8 @@ class RemoteExecutor:
                  template: str = JOB_SH, python: str = "python", setup: str = "", runner: str = "",
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
-                 poll_timeout: float = 120, asks: dict | None = None):
+                 poll_timeout: float = 120, asks: dict | None = None, grow: dict | None = None,
+                 grow_times: int = 2):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
@@ -328,6 +334,7 @@ class RemoteExecutor:
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
         self.keep_after, self.poll_timeout = keep_after, poll_timeout
+        self.grow, self.grow_times = dict(grow or {}), grow_times
         # While the other machine does not answer: since when and what was said, for whoever shows
         # the jobs; `retries` grows with each `reconnect`.
         self.unreachable, self.retries, self._misses, self._since = None, 0, 0, None
