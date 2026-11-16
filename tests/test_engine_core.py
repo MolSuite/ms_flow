@@ -633,7 +633,9 @@ def test_the_workers_of_the_pool_leave_when_idle_and_come_back():
         waits = [{"s": 0.1, "idx": i} for i in range(2)]
         assert engine.wait(engine.submit("process", _waits_for_a_program, waits, thread=True), 30).chunks_done == 2
         host = pool._host
-        host.process.join(15)
+        deadline = time.monotonic() + 15  # not join(): loky's returns once the pipe closes, a little before the exit
+        while host.process.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert host.over and not host.process.is_alive()
         assert engine.wait(engine.submit("process", _waits_for_a_program, waits, thread=True), 30).chunks_done == 2
         assert pool._host is not host
