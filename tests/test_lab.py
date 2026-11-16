@@ -351,6 +351,17 @@ def test_a_node_that_fails_mid_run_sends_the_job_again(request, said):
     assert downed and set(got()) == set(range(20))
 
 
+@slurm_only
+def test_a_job_whose_time_ran_out_goes_again_asking_for_more(request, said):
+    """A minute is not enough for it; asked for four times that, it ends, going on from its journal."""
+    ex = far(nodes=1, cpus=2, time="1")
+    ex.grow = {"TIMEOUT": {"time": 4}}
+    assert run(params(request, n=30, nap=12), said, ex, seconds=900).status == "completed"
+    assert set(got()) == set(range(30))
+    asked = lab(f"grep -e --time= $(ls -td {FAR}/c*-* | head -1)/job.sh")
+    assert asked == "#SBATCH --time=00:04:00", asked
+
+
 def admin(command):
     """What root does on the head node."""
     return subprocess.run(["docker", "exec", "vhpc-molsuite-slurm-headnode-1", "bash", "-c", command],

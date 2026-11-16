@@ -139,7 +139,7 @@ def build_executor(name: str, settings, host_env=None):
                               runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
                               poll_s=config.poll_seconds, shared=config.shared_disk, env=env,
-                              keep_after=host.keep_after)
+                              keep_after=host.keep_after, grow=_grow(config))
     from ms_flow.engine import ProcessExecutor
 
     return ProcessExecutor(_here(hosts[0])[0])
@@ -158,6 +158,13 @@ def _retake(executor, settings, name: str) -> None:
     executor.script = executor.script_for()
     executor.capacity, executor.batch = config.max_jobs or sys.maxsize, config.elements_per_job or sys.maxsize
     executor.poll_s, executor.keep_after = config.poll_seconds, settings.hosts[config.hosts[0]].keep_after
+    executor.grow = _grow(config)
+
+
+def _grow(config) -> dict:
+    """What a queue's job asks for more of, by how it ended (see `RemoteExecutor`)."""
+    rules = {"OUT_OF_MEMORY": ("memory_gb", config.grow_memory), "TIMEOUT": ("time", config.grow_time)}
+    return {state: {field: factor} for state, (field, factor) in rules.items() if factor > 1}
 
 
 def hosted(lazy: bool = False, settings: bool = False):

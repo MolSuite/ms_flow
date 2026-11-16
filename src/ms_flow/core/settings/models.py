@@ -112,6 +112,10 @@ class ExecutorConfig(BaseModel):
     memory_gb: int = _asked(0, "how much memory each job asks for on each node. 0: the queue's default.",
                             ge=0, title="Memory (GB)")
     time: str = _asked("", "how long a job may run, as the queue writes it (`2-00:00:00`). Empty: its default.")
+    grow_memory: float = _asked(0, "Slurm: a job that ran out of memory goes again asking for this many times "
+                                "the memory it asked for. 0: as it was.", ge=0, title="Memory × on OOM")
+    grow_time: float = _asked(0, "Slurm: a job whose time ran out goes again asking for this many times its "
+                              "time. 0: as it was.", ge=0, title="Time × on timeout")
     modules: List[str] = _asked([], "the `module` commands before the runner starts, in order, without the "
                             "word `module`: `purge`, `load gcc/12`.")
     setup: str = _of("queue", "", "the site's own lines: other `#SBATCH` (`#$`) lines, then the shell lines that "

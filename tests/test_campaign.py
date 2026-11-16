@@ -366,3 +366,29 @@ def test_a_job_out_of_the_queue_says_nothing_of_why(tmp_path):
     said = {q: subprocess.run(["bash", "-c", f"id=7; {c._alive_why()}"], capture_output=True, text=True, cwd=tmp_path,
                               env={"QUEUE": q, "PATH": "/usr/bin:/bin"}).stdout for q in ("", "7")}
     assert said == {"": "", "7": "7\nwhy=PENDING|JobHeldUser\n"}
+
+
+def test_times_and_memory_grow_as_slurm_writes_them():
+    from ms_flow.site_script import grown, seconds
+    assert [seconds(t) for t in ("30", "1:30", "2:00:00", "1-0", "1-2:30", "1-00:00:10")] == \
+        [1800, 90, 7200, 86400, 95400, 86410]
+    assert grown("time", "1:00:00", 1.5) == "01:30:00" and grown("time", "20:00:00", 1.5) == "1-06:00:00"
+    assert grown("time", "1", 3) == "00:03:00" and grown("memory_gb", 3, 1.5) == 5
+
+
+def test_a_job_that_ran_out_asks_for_more_at_most_grow_times(tmp_path):
+    c = Campaign.__new__(Campaign)
+    sent = []
+    c.remote = RemoteExecutor(None, scheduler="slurm", asks={"memory_gb": 4, "time": "1:00:00"},
+                              grow={"OUT_OF_MEMORY": {"memory_gb": 2}, "TIMEOUT": {"time": 1.5, "memory_gb": 1}},
+                              grow_times=2)
+    c._asks, c._grown, c.asked, c._tmp = {}, 0, {"memory_gb": 4}, tmp_path
+    c._upload = sent.extend
+    assert c._grow("NODE_FAIL") == "" and c._grow("") == ""
+    assert c._grow("OUT_OF_MEMORY") == "memory_gb 8" and c.asked == {"memory_gb": 8}
+    assert "--mem=8G" in (tmp_path / "job.sh").read_text() and sent == ["job.sh"]
+    assert c._grow("TIMEOUT") == "time 01:30:00, memory_gb 8"
+    assert "--time=01:30:00" in (tmp_path / "job.sh").read_text()
+    assert c._grow("OUT_OF_MEMORY") == ""  # twice already
+    c._asks, c._grown, c.remote.asks = {}, 0, {}
+    assert c._grow("TIMEOUT") == ""  # it asked for no time: the queue's default, unknown here
