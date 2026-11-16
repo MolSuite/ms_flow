@@ -192,7 +192,7 @@ class Campaign:
         _check(stages)
         self.remote, self.stages, self.dir, self.n, self.job = remote, stages, None, 0, ""
         self.executor, self.total, self.steps = executor or None, None, []
-        self.queue_usage, self._accounted = None, 0.0
+        self.queue_usage, self._accounted, self.ran_on = None, 0.0, None  # `ran_on`: what the runner there says
         self._why = ("", "")  # the queue's word for its job and why it waits, while it is in the queue
         # What this run asks of the queue over the executor's, and how often it asked for more (`_grow`).
         self._asks, self._grown = dict(asks or {}), 0
@@ -655,6 +655,7 @@ class Campaign:
 
     def _tell(self, told: dict, alive: bool) -> None:
         """`note` from what the runner over there last said (`progress.json`)."""
+        self.ran_on = told.get("ran_on") or getattr(self, "ran_on", None)
         job = f"job {self.job}" if self.job else "its job"
         if str(told.get("status", "")).startswith("completed"):
             self.note = "it ended there: bringing back what it made"
