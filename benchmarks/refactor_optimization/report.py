@@ -94,6 +94,15 @@ STEPS = {
                               "machine in use; run side by side with the previous step, alternating four times, "
                               "import is 294 against 291 ms, the first job 83 against 84 ms and a process chunk "
                               "0.0130 against 0.0132 ms.", False),
+    "now-2026-11-16": (None, "main on 2026-11-16 (ms_flow 0.11.0 + PR #46), 34 merges after the previous column: "
+                             "thread hosts, chunk states, fair dispatch, HPC, engine in a child process (off by "
+                             "default, not measured here: the bench drives the engine directly). Same session, "
+                             "previous commit re-run: the long measures rose 32 to 49 % (process chunk 0.0139 to "
+                             "0.0195 ms). Measured merge by merge, it is all PR #36 (robust channel): "
+                             "content_key went from a pickle to canonical JSON so a key is the same in every "
+                             "process (0.0007 to 0.0029 ms a key, on the feeder thread). main with the pickle "
+                             "key back: process 0.0154, thread 0.0348 ms. The nice 10 of the workers (#41) "
+                             "costs nothing here.", False),
 }
 
 # What the design aims for once the journal is in (02-diseno-motor.md); without it, 0.05 ms per chunk.
