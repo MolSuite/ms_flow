@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -165,6 +167,24 @@ def _grow(config) -> dict:
     return {state: {field: factor} for state, (field, factor) in rules.items() if factor > 1}
 
 
+def hosted(lazy: bool = False, settings: bool = False):
+    """A method that the engine's process runs when the engine has a process of its own (see
+    `Workspace(engine_host=...)`). `lazy`: one that never builds the engine, run here while there
+    is none. `settings`: one that changes the settings, read again here after it."""
+    def wrap(method):
+        @functools.wraps(method)
+        def run(self, *args, **kwargs):
+            if self._host != "process" or (lazy and self._engine is None):
+                return method(self, *args, **kwargs)
+            try:
+                return self.engine.call(method.__name__, args, kwargs)
+            finally:
+                if settings:
+                    self.settings_manager.reload()
+        return run
+    return wrap
+
+
 class WorkspaceJobApiMixin:
     #: Set by the app: `host_env(address, busy, on_line) -> path` makes sure the host has the
     #: environment that runs its jobs and says where. It is for a host with no `env` named,
@@ -172,6 +192,11 @@ class WorkspaceJobApiMixin:
     #: be changed now (see `ms_env.ensure`); `on_line`, when given, is told each line of what
     #: is done there.
     host_env = None
+    #: Set by the app: `jobs_setup(workspace)` is called where the jobs run (in the engine's
+    #: process when it has one) once the active project's jobs can be submitted there. What the
+    #: app's sources and writers read of the project and not of their params is said there.
+    #: A module-level function: it travels by name.
+    jobs_setup = None
 
     @property
     def engine(self):
@@ -179,7 +204,14 @@ class WorkspaceJobApiMixin:
         with its threads as `thread` and its pool of processes as `local`.
 
         Raises `ms_flow.engine.Busy` when another process of this user already runs one.
+        With an engine in a process of its own, this is its `EngineProxy`: the process starts
+        aside when a project opens (or here, if that has not happened yet), and a use of it
+        after that process died starts another.
         """
+        if self._engine is None and self._host == "process":
+            with self._hosting:
+                if self._engine is None:
+                    self._engine = self._start_host()
         if self._engine is None:
             from ms_flow.engine import Engine, ThreadExecutor
 
@@ -190,9 +222,44 @@ class WorkspaceJobApiMixin:
             self._local_back()
         return self._engine
 
+    _restart_after = 5.0  # s an engine's process lived for another to start when it dies
+
+    def _start_host(self):
+        from ms_flow._api_impl.engine_host import callback, start
+
+        # `host_env` is the app's: it is called back here
+        proxy = start({"workspace": self._init, "host_env": self.host_env and callback(self.host_env),
+                       "jobs_setup": self.jobs_setup},
+                      lambda: self._engine_gone(proxy))
+        proxy.started = time.monotonic()
+        project = self._runtime_state.active_project
+        if project is not None and project.context is not None:
+            proxy.call("_hosted_open", (str(project.context.id),))
+            self._flow = True  # the engine's process has the project: see `_close_project_runtime`
+        return proxy
+
+    def _hosted_open(self, project_id: str) -> None:
+        """In the engine's process: the project, and its journal, whose opening marks what a
+        process before this one left unfinished as interrupted, so the app sees it at once."""
+        self.open_project(project_id, touch_master=False)
+        self._project_flow()
+
+    def _engine_gone(self, proxy) -> None:
+        if self._engine is proxy:
+            self._engine = self._flow = None  # the next use starts another
+        if proxy.closed:
+            return
+        self.app_logger.error("The engine's process ended: its jobs are interrupted (see `resume`).")
+        # Another starts now, aside: it marks those jobs interrupted. Not for one that died
+        # young, which would only die again.
+        if self._runtime_state.active_project is not None and time.monotonic() - proxy.started > self._restart_after:
+            self._warming = threading.Thread(target=self._warm, name="ms_flow-engine-start", daemon=True)
+            self._warming.start()
+
     def _local_back(self) -> None:
         self._engine.register("local", build_executor("local", self.settings_manager.settings))
 
+    @hosted(lazy=True)
     def _active(self) -> set[str]:
         """The executors that take jobs now. Never builds the engine: before its first use
         nothing does but the pool of this machine."""
@@ -223,36 +290,41 @@ class WorkspaceJobApiMixin:
         is done on a host that is being prepared. It waits for its hosts: not from a thread
         that cannot.
         """
-        settings, engine = self.settings_manager.settings, self.engine
-        if name not in settings.executors:
+        if name not in self.settings_manager.settings.executors:
             raise ValueError(f"no executor is kept as `{name}`")
         self._starting.add(name)
         try:
-            with self._activation:
-                if name in engine._executors:
-                    return
-                why = blocked(name, settings, self._active())
-                if why:
-                    raise ValueError(f"`{name}` is not started: {why}")
-                config = settings.executors[name]
-                aside = config.kind == "ray" and "local" in config.hosts and "local" in engine._executors
-                if aside:
-                    try:
-                        engine.unregister("local")
-                    except ValueError:
-                        raise ValueError(f"`{name}` takes this machine, and its pool has jobs that have not ended") from None
-                try:
-                    host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, on_line))
-                    engine.register(name, build_executor(name, settings, host_env))
-                except BaseException:
-                    if aside:
-                        self._local_back()
-                    raise
-                if aside:
-                    self._aside = name
+            self._activate(name, on_line=on_line)
         finally:
             self._starting.discard(name)
 
+    @hosted()
+    def _activate(self, name: str, on_line=None) -> None:
+        settings, engine = self.settings_manager.settings, self.engine
+        with self._activation:
+            if name in engine._executors:
+                return
+            why = blocked(name, settings, self._active())
+            if why:
+                raise ValueError(f"`{name}` is not started: {why}")
+            config = settings.executors[name]
+            aside = config.kind == "ray" and "local" in config.hosts and "local" in engine._executors
+            if aside:
+                try:
+                    engine.unregister("local")
+                except ValueError:
+                    raise ValueError(f"`{name}` takes this machine, and its pool has jobs that have not ended") from None
+            try:
+                host_env = self.host_env and (lambda address, busy: self.host_env(address, busy, on_line))
+                engine.register(name, build_executor(name, settings, host_env))
+            except BaseException:
+                if aside:
+                    self._local_back()
+                raise
+            if aside:
+                self._aside = name
+
+    @hosted(lazy=True)
     def deactivate(self, name: str) -> None:
         """Stop the executor active as `name`. Refused with `ValueError` while a job submitted
         to it has not ended. The pool of this machine comes back if it was aside for this one."""
@@ -302,17 +374,21 @@ class WorkspaceJobApiMixin:
                 if users:
                     self._local_back()
 
+    @hosted(lazy=True, settings=True)
     def save_host(self, name: str, **fields) -> None:
         """`SettingsManager.save_host`, refused while an active executor works on that machine."""
         self._change("hosts", name, lambda: self.settings_manager.save_host(name, **fields), fields)
 
+    @hosted(lazy=True, settings=True)
     def remove_host(self, name: str) -> None:
         self._change("hosts", name, lambda: self.settings_manager.remove_host(name))
 
+    @hosted(lazy=True, settings=True)
     def save_executor(self, name: str, **fields) -> None:
         """`SettingsManager.save_executor`, refused while that executor is active."""
         self._change("executors", name, lambda: self.settings_manager.save_executor(name, **fields), fields)
 
+    @hosted(lazy=True, settings=True)
     def remove_executor(self, name: str) -> None:
         self._change("executors", name, lambda: self.settings_manager.remove_executor(name))
 
@@ -323,8 +399,11 @@ class WorkspaceJobApiMixin:
 
             self.engine.attach("project", project.context.path / "executor.db")
             self._flow = Flow(self.engine, project.project_db)
+            if self.jobs_setup is not None:
+                self.jobs_setup(self)
         return self._flow
 
+    @hosted()
     def submit(self, job, params=None, *, executor: str | None = None, **options) -> int:
         """Run a `ms_flow.engine.job` in the active project and return its id, for `engine.status`
         and `engine.wait`.
@@ -334,6 +413,9 @@ class WorkspaceJobApiMixin:
         `key=` continues it. `executor` is `thread` or the name of an active one (see
         `activate`), by default the one the settings give (`general.default_executor`);
         `options` are those of `ms_flow.engine.Flow.submit`.
+        With the engine in a process of its own, `job` goes there by its name, so it is a
+        module-level function, and `params` are values: what the job reads of the project, its
+        source and its writer read there.
         """
         flow = self._project_flow()
         name = executor or self.settings_manager.settings.general.default_executor
@@ -346,11 +428,13 @@ class WorkspaceJobApiMixin:
                 f"the pool of this machine is aside while `{self._aside}` has it" if name == "local" and self._aside
                 else f"`{name}` is not active: see `Workspace.activate`")
 
+    @hosted()
     def origin(self, key: str) -> dict:
         """What the job recorded under `key` in the active project was submitted with: `job` (its
         `module:qualname`), `params` and `options`. Raises for one `resume` cannot submit again."""
         return self._project_flow().origin(key, journal="project")
 
+    @hosted()
     def provenance(self, key: str) -> dict:
         """What the job recorded under `key` in the active project ran with and made, to keep next
         to what it made: `job`, `params` and `options` (its `origin`, when it has one), `executor`,
@@ -372,6 +456,7 @@ class WorkspaceJobApiMixin:
                 "status": row["status"], "error": row["error"], **when, "total": row["total"], "done": row["done"],
                 "failed": row["failed"], "usage": _usage(row)}
 
+    @hosted()
     def resume(self, key: str, **options) -> int:
         """Submit again the job recorded under `key` (`JobSnapshot.key`) in the active project,
         with the params and options it was submitted with: one that was interrupted (the project
@@ -382,6 +467,7 @@ class WorkspaceJobApiMixin:
         origin = self.origin(key)
         return self.submit(named(origin["job"]), origin["params"], key=key, **{**origin["options"], **options})
 
+    @hosted()
     def move(self, key: str, executor: str, **options) -> int:
         """Continue on `executor` the job recorded under `key`: `resume`, for one that may be running.
         A job this session runs is canceled first and waited for, so not from a thread that cannot
@@ -394,6 +480,7 @@ class WorkspaceJobApiMixin:
                 self._engine.wait(job.id)
         return self.resume(key, executor=executor, **options)
 
+    @hosted()
     def remote_jobs(self, executor: str) -> list[dict]:
         """What the executor of that name has on another machine, whichever session or project
         sent it and with or without a project open: see `RemoteExecutor.jobs_there`. Nothing
@@ -401,6 +488,7 @@ class WorkspaceJobApiMixin:
         slot = self.engine._executors.get(executor)
         return slot.impl.jobs_there() if hasattr(getattr(slot, "impl", None), "jobs_there") else []
 
+    @hosted(lazy=True)
     def node_metrics(self, executor: str) -> dict:
         """For a Ray executor that is active, the URL where each of its machines says what it is
         using, by host name: see `RayExecutor.nodes`. Nothing for any other, and never builds the
@@ -409,6 +497,7 @@ class WorkspaceJobApiMixin:
         nodes = getattr(getattr(slot, "impl", None), "nodes", None)
         return nodes() if nodes is not None else {}
 
+    @hosted(lazy=True)
     def queue_nodes(self, executor: str) -> list[dict]:
         """For a queue that is active, its nodes and what is taken of each: see
         `RemoteExecutor.queue_nodes`. Nothing for any other, and never builds the engine. It
@@ -417,6 +506,7 @@ class WorkspaceJobApiMixin:
         nodes = getattr(getattr(slot, "impl", None), "queue_nodes", None)
         return nodes() if nodes is not None else []
 
+    @hosted()
     def remove_remote_job(self, executor: str, dir: str) -> None:
         """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
         this session waits for is refused: cancel the job."""
@@ -435,9 +525,9 @@ class WorkspaceJobApiMixin:
         from ms_flow.engine import JobSnapshot
         from ms_flow.engine.journal import recorded
 
-        live = {(job.key, job.started_at): job for job in (self._engine.jobs() if self._flow is not None else ())}
-        # ponytail: a job of a process that died reads as running until this session's first
-        # submit opens the journal, which is what marks it interrupted.
+        live = {(job.key, job.started_at): job for job in self._live_jobs()}
+        # A job of an engine's process that died reads as running until the one that replaces it
+        # opens the journal, which marks it interrupted (see `_engine_gone`).
         listed = [live.pop((row["job_id"], row["started_at"]), None)
                   or JobSnapshot(None, row["name"], row["status"], row["total"], row["done"], row["failed"], 0,
                                  row["error"], (usage := _usage(row)).get("peak_mem_mb", 0), row["started_at"],
@@ -448,6 +538,17 @@ class WorkspaceJobApiMixin:
         # One just submitted is not in the file until the journal's next write. Only the active
         # project has jobs that have not ended: closing a project interrupts its own.
         return listed + [job for job in live.values() if job.finished_at is None]
+
+    def _live_jobs(self) -> list:
+        engine = self._engine
+        if engine is None or self._flow is None:
+            return []
+        from ms_flow._api_impl.engine_host import EngineGone
+
+        try:
+            return engine.jobs()
+        except EngineGone:  # its process has just died: its jobs are on record
+            return []
 
     def job_tasks(self, job_id: int | None) -> list:
         """The tasks in flight of a job this session runs, by its `JobSnapshot.id`: see

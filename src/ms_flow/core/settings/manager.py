@@ -252,6 +252,16 @@ class SettingsManager:
             self._save_overrides(self.project_path, self._local_overrides)
         self._refresh_effective()
 
+    def reload(self) -> None:
+        """Read the files again: another process (the engine's) may have changed them."""
+        self._global_overrides = self._prune_equal(self._load_overrides(self.global_path),
+                                                   self._default.model_dump(mode="json"))
+        self._global = self._compose(self._global_overrides)
+        if self.project_path is not None:
+            self._local_overrides = self._prune_equal(self._load_overrides(self.project_path),
+                                                      self._global.model_dump(mode="json"))
+        self._refresh_effective()
+
     def clear_project(self):
         """Clear the local context so the global configuration is used again."""
         self.project_path = None
