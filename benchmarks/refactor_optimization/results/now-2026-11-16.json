@@ -1,0 +1,135 @@
+{
+  "label": "now-2026-11-16",
+  "recorded_at": "2026-11-16T15:28:33+00:00",
+  "commit": "9c5c6b5",
+  "machine": {
+    "cpus": 16,
+    "engine_cpus": 14,
+    "python": "3.12.12"
+  },
+  "sizes": {
+    "chunks_per_job": 2000,
+    "chunks_scale_job": 20000,
+    "chunks_long_job": 200000
+  },
+  "quick": false,
+  "metrics": {
+    "import_ms": {
+      "values": [
+        356.615,
+        352.2353,
+        359.5691,
+        359.6093,
+        365.9431
+      ],
+      "unit": "ms"
+    },
+    "first_job_ms": {
+      "values": [
+        130.4294,
+        118.8213,
+        106.3101
+      ],
+      "unit": "ms"
+    },
+    "thread_ms_per_chunk": {
+      "values": [
+        0.0234,
+        0.0397,
+        0.0309
+      ],
+      "unit": "ms"
+    },
+    "process_ms_per_chunk": {
+      "values": [
+        0.028,
+        0.0174,
+        0.0192
+      ],
+      "unit": "ms"
+    },
+    "scale_first_ms": {
+      "values": [
+        0.0247
+      ],
+      "unit": "ms"
+    },
+    "scale_last_ms": {
+      "values": [
+        0.0388
+      ],
+      "unit": "ms"
+    },
+    "scale_growth": {
+      "values": [
+        1.5734
+      ],
+      "unit": "x"
+    },
+    "state_kb_per_chunk": {
+      "values": [
+        0.001
+      ],
+      "unit": "KB"
+    },
+    "peak_rss_mb": {
+      "values": [
+        41.0547
+      ],
+      "unit": "MB"
+    },
+    "thread_long_ms": {
+      "values": [
+        0.0432,
+        0.0453,
+        0.0452,
+        0.0463,
+        0.0458
+      ],
+      "unit": "ms"
+    },
+    "process_long_ms": {
+      "values": [
+        0.0188,
+        0.0195,
+        0.0196,
+        0.0197,
+        0.0187
+      ],
+      "unit": "ms"
+    },
+    "scale_long_last_ms": {
+      "values": [
+        0.0433,
+        0.0432,
+        0.0394
+      ],
+      "unit": "ms"
+    },
+    "write_long_ms": {
+      "values": [
+        0.0245,
+        0.0241,
+        0.0245
+      ],
+      "unit": "ms"
+    },
+    "api_long_ms": {
+      "values": [
+        0.0294,
+        0.0294,
+        0.0288
+      ],
+      "unit": "ms"
+    }
+  },
+  "checks": {
+    "worker_death_isolated": true,
+    "worker_death_pool_recovers": true,
+    "kill9_no_orphans": true,
+    "resume_skips_done": true,
+    "second_engine_safe": true,
+    "retry_then_done": true,
+    "hung_chunk_cut": true
+  }
+}
