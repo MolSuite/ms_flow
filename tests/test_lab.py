@@ -143,7 +143,8 @@ def test_a_campaign_runs_there(request, said):
     assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
     used = ended.usage["queue"]  # what the queue's accounting says its job used, its last word
     assert used["final"] and used["job"] and used["cpus"] == 2 and used["wall_s"] > 0
-    assert used["cpu_s"] > 0 and used["peak_mem_mb"] > 0
+    assert used["cpu_s"] > 0 and (used["peak_mem_mb"] is None or used["peak_mem_mb"] > 0)
+    # ponytail: Slurm samples memory every JobAcctGatherFrequency (30 s in the lab): a shorter job may have none
 
 
 @slurm_only
@@ -191,7 +192,6 @@ def test_a_campaign_waits_out_a_network_that_goes_and_says_so(request, said):
     assert seen and "has not answered since" in seen[0]
 
 
-@pytest.mark.skipif(SGE, reason="SoGE's qacct tells a qdel from a killed runner by nothing: it goes again")
 def test_a_job_cancelled_there_fails_and_goes_again_when_sent_again(request, said):
     def cancel(engine, job):
         until(lambda: lab_tasks.GOT)
@@ -317,6 +317,80 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(request, said, monke
         lab(f"rm {there}/said.txt")
         assert locations.reconcile(project, ex) == ["said.txt"]
 
+
+
+def test_a_job_held_in_the_queue_says_so_and_runs_once_released(request, said):
+    seen = []
+
+    def release(engine, job):
+        until(lambda: "held" in (engine.status(job).note or ""), 120)
+        seen.append(engine.status(job).note)
+        lab(f"{'qrls' if SGE else 'scontrol release'} $(cat $(ls -td {FAR}/c*-* | head -1)/queue.id)")
+
+    assert run(params(request), said, far("#$ -h" if SGE else "#SBATCH --hold"), during=release).status == "completed"
+    assert got() == list(range(8))
+    assert seen and "held in the queue" in seen[0], seen
+
+
+@slurm_only
+def test_a_node_that_fails_mid_run_sends_the_job_again(request, said):
+    """The node of its job goes down (as slurmd stops answering): the job leaves as NODE_FAIL,
+    is sent again to the other node, and resumes there from its journal."""
+    def down(engine, job):
+        until(lambda: len(lab_tasks.GOT) >= 2)
+        node = lab(f"squeue -h -o %N -j $(cat $(ls -td {FAR}/c*-* | head -1)/queue.id)")
+        downed.append(node)
+        admin(f"scontrol update nodename={node} state=down reason=lab")
+
+    downed = []
+    try:
+        assert run(params(request, n=20), said, during=down).status == "completed"
+    finally:
+        for node in downed:
+            admin(f"scontrol update nodename={node} state=resume")
+    assert downed and set(got()) == set(range(20))
+
+
+def admin(command):
+    """What root does on the head node."""
+    return subprocess.run(["docker", "exec", "vhpc-molsuite-slurm-headnode-1", "bash", "-c", command],
+                          capture_output=True, text=True).stdout.strip()
+
+
+N = 160  # ten rounds of the runner on the lab login node (it takes its 16 CPUs): long enough to fill mid-run
+SHM = "/dev/shm/ms_flow_lab"  # a tmpfs of 64M on the lab's login node: filled up at will
+
+
+def on_the_login_node():
+    ex = RemoteExecutor(ADDR, workdir=SHM, scheduler="none", template=TEMPLATES["none"], env="/opt/venv",
+                        poll_s=2, part_seconds=1, keep_after=7,
+                        setup=f"export PYTHONPATH={THERE}/flow:{THERE}/env:{THERE}/tasks")
+    ex.remote = Faulty(ADDR, ssh=SSH)
+    return ex
+
+
+@pytest.mark.parametrize("when", ["before", "mid-run"])
+def test_a_full_disk_there_fails_the_campaign_and_it_goes_once_freed(request, said, when):
+    def fill(engine=None, job=None):
+        if engine:
+            until(lambda: len(lab_tasks.GOT) >= 3)
+        lab("fallocate -l $(df --output=avail -B1 /dev/shm | tail -n 1) /dev/shm/full")
+
+    lab(f"rm -rf {SHM} /dev/shm/full")
+    p = params(request, n=N, nap=2)
+    try:
+        if when == "before":
+            fill()
+        failed = run(p, said, on_the_login_node(), seconds=300, during=fill if when == "mid-run" else None)
+    finally:
+        lab("rm -f /dev/shm/full")
+    assert failed.status == "failed"
+    assert "space" in (failed.error or "").lower(), failed.error
+    before = set(got())
+    lab_tasks.GOT.clear()
+    assert run(p, said, on_the_login_node(), seconds=300).status == "completed"
+    assert before | set(got()) == set(range(N))  # none of them failed for good
+    lab(f"rm -rf {SHM}")
 
 if __name__ == "__main__":  # one client of test_two_clients_of_one_campaign_queue_one_job
     os.environ["CAMPAIGN_FILE"] = str(Path(sys.argv[2]) / "said.txt")
