@@ -328,3 +328,41 @@ def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(
     assert ended.status == "completed_with_errors", ended.error
     assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(12) if n != 3}  # parts on the rounds
     assert len(glances) > 5
+
+
+@pytest.mark.parametrize("said, note", [
+    (b"123\nwhy=PENDING|Priority\n", "waiting in the queue (job 9): Priority"),
+    (b"123\nwhy=PENDING|None\n", "waiting in the queue (job 9)"),
+    (b"123\nwhy=PENDING|launch failed requeued held\n",
+     "held in the queue, waiting to be released or canceled (job 9): launch failed requeued held"),
+    (b"123\nwhy=qw|\n", "waiting in the queue (job 9)"),
+    (b"123\nwhy=hqw|\n", "held in the queue, waiting to be released or canceled (job 9)"),
+    (b"123\nwhy=Eqw|can't chdir to /gone\n", "in error in the queue, waiting for its error to be cleared "
+                                             "(qmod -cj) or for a cancel (job 9): can't chdir to /gone"),
+    (b"123\n", "waiting in the queue (job 9)")])  # a queue without `why`
+def test_a_job_waiting_in_the_queue_says_why(said, note):
+    c = Campaign.__new__(Campaign)
+    c.job, c.stages, c.steps = "9", [], []
+    c._why_from(said)
+    c._tell({}, True)
+    assert c.note == note
+
+
+@pytest.mark.parametrize("state, said", [
+    ("NODE_FAIL", " (NODE_FAIL: its node failed)"), ("OUT_OF_MEMORY", " (OUT_OF_MEMORY: it needs more memory than "
+                                                                     "it asked the queue for)"),
+    ("failed 37  : qmaster enforced h_rt, h_cpu, or h_vmem limit", " (failed 37  : qmaster enforced h_rt, h_cpu, or "
+     "h_vmem limit: a limit of the queue (h_rt, h_cpu or h_vmem) ran out, it may ask for more)"), ("", "")])
+def test_a_job_that_left_the_queue_early_says_how(state, said):
+    assert Campaign.__new__(Campaign)._ended_as(state) == said
+
+
+def test_a_job_out_of_the_queue_says_nothing_of_why(tmp_path):
+    """Its runner told it ended (interrupted: its node went down): out of the queue, it is not alive."""
+    import subprocess
+    (tmp_path / "progress.json").write_text('{"status": "interrupted"}')
+    c = Campaign.__new__(Campaign)
+    c.remote = type("R", (), {"queue": {"alive": "echo $QUEUE", "why": "echo 'PENDING|JobHeldUser'"}})()
+    said = {q: subprocess.run(["bash", "-c", f"id=7; {c._alive_why()}"], capture_output=True, text=True, cwd=tmp_path,
+                              env={"QUEUE": q, "PATH": "/usr/bin:/bin"}).stdout for q in ("", "7")}
+    assert said == {"": "", "7": "7\nwhy=PENDING|JobHeldUser\n"}

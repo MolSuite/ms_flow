@@ -262,8 +262,11 @@ def test_grid_engine_says_canceled_only_when_qacct_says_who_deleted():
         return subprocess.run(["sh", "-c", command], input=qacct, capture_output=True, text=True).stdout.strip()
 
     assert state("failed       100 : assumedly after job\ndeleted_by   user@sge\nexit_status  137\n") == "CANCELLED"
-    # qdel and a runner the system killed: SoGE says both alike, so neither is taken for a cancel
-    assert state("failed       100 : assumedly after job\nexit_status  137                  (Killed)\n") == ""
+    # qdel and a runner the system killed: SoGE says both alike (its qdel is told by the `deleted`
+    # mark the job's USR2 trap leaves), so qacct only says how it ended
+    assert state("failed       100 : assumedly after job\nexit_status  137                  (Killed)\n") == \
+        "failed 100 : assumedly after job"
+    assert state("failed       37  : qmaster enforced h_rt, h_cpu, or h_vmem limit\n").startswith("failed 37 :")
     assert state("failed       0    \nexit_status  0                   \n") == ""
     assert state("failed       0    \nexit_status  1                   \n") == ""
     assert state("") == ""  # deleted while it waited: no record
