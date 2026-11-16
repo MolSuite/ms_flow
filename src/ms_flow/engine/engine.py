@@ -34,6 +34,7 @@ from .journal import INTERRUPTED, RESUMABLE, Journal, own
 from .tokens import Tokens, memory_budget_mb, usable_cpus
 
 log = logging.getLogger(__name__)
+_REOPEN = "close the project and open it again once the disk has room or is reachable"
 
 WAITING = "waiting"  # for the jobs it was submitted after
 RUNNING = "running"
@@ -477,8 +478,10 @@ class Engine:
         job.came_after = tuple(dict.fromkeys(k for dep in job.after if (k := getattr(dep, "uid", dep.key))))  # kept once they ended
         if journal is not None:
             job.journal = self._journals.get(journal)
-            if job.journal is None or job.journal.failed:
+            if job.journal is None:
                 raise ValueError(f"no usable journal {journal!r}; attached: {sorted(self._journals)}")
+            if job.journal.failed:
+                raise ValueError(f"journal {journal!r} could not be written: {_REOPEN}")
             job.uid, job.key = key or uuid.uuid4().hex, key  # `key`: what another run can ask for it by
             job.spec = json.dumps({
                 "executor": job.executor, "fn": f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', repr(fn))}",
@@ -654,7 +657,7 @@ class Engine:
                     if journal.failed is None:
                         journal.wait_if_behind()
                     else:
-                        self._on_stop_jobs_of(journal, FAILED, "the journal could not be written\n" + journal.failed)
+                        self._on_stop_jobs_of(journal, FAILED, f"the journal could not be written: {_REOPEN}\n" + journal.failed)
             except Exception:
                 log.exception("engine loop: dispatch failed")
 

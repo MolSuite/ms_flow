@@ -553,12 +553,22 @@ class WorkspaceJobApiMixin:
     def job_tasks(self, job_id: int | None) -> list:
         """The tasks in flight of a job this session runs, by its `JobSnapshot.id`: see
         `Engine.tasks`. Nothing for a job of another session. Never builds the engine."""
-        return self._engine.tasks(job_id) if self._engine is not None and job_id is not None else []
+        from ms_flow._api_impl.engine_host import EngineGone
+
+        try:
+            return self._engine.tasks(job_id) if self._engine is not None and job_id is not None else []
+        except EngineGone:  # its process has just died: nothing is in flight
+            return []
 
     def job_chunks(self, job_id: int | None) -> bytes | None:
         """A byte per chunk of a job this session runs: see `Engine.chunk_states`. None for a job
         of another session or one that ended. Never builds the engine."""
-        return self._engine.chunk_states(job_id) if self._engine is not None and job_id is not None else None
+        from ms_flow._api_impl.engine_host import EngineGone
+
+        try:
+            return self._engine.chunk_states(job_id) if self._engine is not None and job_id is not None else None
+        except EngineGone:  # its process has just died: the job ended here
+            return None
 
     def job_failures(self, key: str, limit: int = 200) -> list[dict]:
         """`attempt`, `error` (the traceback) and `input` (a short repr of the element) of the
