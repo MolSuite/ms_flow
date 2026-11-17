@@ -49,9 +49,12 @@ __all__ = [
 
 FORMAT = "ms_flow-shard-parquet-v1"
 METADATA_KEY = b"ms_flow.shard"
-# ponytail: the writer holds the whole shard in memory until close, so the range is capped;
-# a streaming writer (one row group per batch) lifts this if shards ever need to grow.
-MAX_RECORDS = 0xFFFF
+# ponytail: the writer streams, but `Shard.open` still decodes the whole file into memory, so
+# the id range stays capped; a reader that maps row groups lifts this if shards ever need more.
+MAX_RECORDS = 1 << 20
+# The writer sends a row group to disk once this many record bytes wait in memory, so a shard of
+# any size is built holding one row group at most.
+_ROW_GROUP_BYTES = 16 << 20
 _LEGACY_MAGIC = b"MSHARD"
 
 
@@ -157,9 +160,11 @@ def _fsync_dir(directory: Path) -> None:
 class ShardWriter:
     """Builds one shard file. Ids must be added in strictly increasing order.
 
-    Commits atomically: writes ``<path>.tmp``, fsyncs it and ``os.replace()``s it onto
-    ``path``. A crash mid-write leaves only the ``.tmp`` behind — ``path`` never exists
-    half-written. ``metadata`` may still be edited until the writer closes.
+    Records stream to ``<path>.tmp`` a row group at a time, so memory stays flat however big the
+    shard. Commits atomically: on close the header goes into the file's metadata, the ``.tmp`` is
+    fsynced and ``os.replace()``d onto ``path``. A crash mid-write leaves only the ``.tmp``
+    behind — ``path`` never exists half-written. ``metadata`` may still be edited until the
+    writer closes.
 
     ``slot_count`` is the *capacity* of the id range; the writer shrinks it on close to the
     highest id actually written, so a partial last shard does not claim ids it never had.
@@ -194,8 +199,13 @@ class ShardWriter:
         self.serializer = _check_uint("serializer", serializer, 16)
         self.codec = codec
         self.metadata = dict(metadata or {})
-        self._ids: list[int] = []
+        self._ids: list[int] = []  # the row group being filled
         self._records: list[bytes] = []
+        self._buffered = 0
+        self._count = 0
+        self._last: int | None = None
+        self._file: Any = None
+        self._writer: Any = None
         self._closed = False
 
     def add(self, id_: int, data: bytes) -> None:
@@ -211,48 +221,81 @@ class ShardWriter:
             raise ValueError(
                 f"id {id_} out of range [{self.base_id}, {self.base_id + self.slot_count})"
             )
-        if self._ids and id_ <= self._ids[-1]:
-            raise ValueError(f"ids must be strictly increasing: {id_} after {self._ids[-1]}")
+        if self._last is not None and id_ <= self._last:
+            raise ValueError(f"ids must be strictly increasing: {id_} after {self._last}")
         self._ids.append(id_)
         self._records.append(bytes(data))
+        self._last, self._count, self._buffered = id_, self._count + 1, self._buffered + len(data)
+        if self._buffered >= _ROW_GROUP_BYTES:
+            self._flush()
+
+    def _flush(self) -> None:
+        """The waiting records as one row group; the first call opens the ``.tmp``."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        try:
+            text = self.serializer == Serializer.UTF8  # text DuckDB can read
+            if self._writer is None:
+                self._file = open(self._tmp_path, "wb")
+                schema = pa.schema([("id", pa.uint64()), ("record", pa.string() if text else pa.binary())])
+                self._writer = pq.ParquetWriter(self._file, schema, compression="zstd",
+                                                write_page_checksum=True)
+            if self._ids:
+                records = pa.array(self._records, type=pa.binary())
+                if text:
+                    records = records.cast(pa.string())  # also validates the UTF-8
+                self._writer.write_table(
+                    pa.table({"id": pa.array(self._ids, type=pa.uint64()), "record": records})
+                )
+        except BaseException:
+            self._discard()
+            raise
+        self._ids, self._records, self._buffered = [], [], 0
+
+    def _discard(self) -> None:
+        """Drop what was written: the ``.tmp`` goes, ``path`` is never touched."""
+        self._closed = True
+        self._ids, self._records = [], []
+        for closing in (self._writer, self._file):
+            try:
+                if closing is not None:
+                    closing.close()
+            except Exception:
+                pass
+        self._writer = self._file = None
+        self._tmp_path.unlink(missing_ok=True)
 
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
+        self._flush()  # the last row group (and the file itself, when nothing has gone yet)
         # Trailing empty slots are not information: nothing distinguishes "id never came"
         # from "id past the end".
-        self.slot_count = self._ids[-1] - self.base_id + 1 if self._ids else 0
-        records = pa.array(self._records, type=pa.binary())
-        if self.serializer == Serializer.UTF8:
-            records = records.cast(pa.string())  # text DuckDB can read; also validates the UTF-8
+        self.slot_count = self._last - self.base_id + 1 if self._last is not None else 0
         header = {
             "format": FORMAT,
             "dataset_id": str(self.dataset_id),
             "shard_id": self.shard_id,
             "base_id": self.base_id,
             "slot_count": self.slot_count,
-            "record_count": len(self._ids),
+            "record_count": self._count,
             "kind": self.kind,
             "serializer": self.serializer,
             "codec": self.codec,
             "metadata": self.metadata,
         }
-        table = pa.table(
-            {"id": pa.array(self._ids, type=pa.uint64()), "record": records}
-        ).replace_schema_metadata({METADATA_KEY: json.dumps(header).encode("utf-8")})
-        self._ids, self._records = [], []
         try:
-            with open(self._tmp_path, "wb") as fh:
-                pq.write_table(table, fh, compression="zstd", write_page_checksum=True)
-                fh.flush()
-                os.fsync(fh.fileno())
+            self._writer.add_key_value_metadata({METADATA_KEY: json.dumps(header).encode("utf-8")})
+            self._writer.close()
+            self._file.flush()
+            os.fsync(self._file.fileno())
+            self._file.close()
         except BaseException:
-            self._tmp_path.unlink(missing_ok=True)
+            self._discard()
             raise
+        self._closed = True
+        self._writer = self._file = None
         os.replace(self._tmp_path, self.path)
         _fsync_dir(self.path.parent)
 
@@ -261,8 +304,7 @@ class ShardWriter:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc_type is not None:
-            self._closed = True  # nothing was written yet: the records only lived in memory
-            self._tmp_path.unlink(missing_ok=True)
+            self._discard()
             return False
         self.close()
         return False
@@ -299,7 +341,7 @@ class Record:
 
 
 class Shard:
-    """A read-only shard, decoded into memory on open (a shard is a few MB)."""
+    """A read-only shard, decoded into memory on open."""
 
     def __init__(self, path: Path, header: dict[str, Any], ids: list[int], records: Any) -> None:
         self.path = path
@@ -322,7 +364,11 @@ class Shard:
 
         path = Path(path)
         try:
-            table = pq.read_table(path, page_checksum_verification=True)
+            with pq.ParquetFile(path, page_checksum_verification=True) as parquet:
+                table = parquet.read()
+                # The writer adds the header on close, so it lives in the file's key-value
+                # metadata, which shards written in one go (before streaming) also have.
+                raw = (parquet.metadata.metadata or {}).get(METADATA_KEY)
         except (OSError, pa.ArrowException) as exc:  # a failed page CRC is an OSError
             with open(path, "rb") as fh:  # a missing file raises here, as itself
                 if fh.read(len(_LEGACY_MAGIC)) == _LEGACY_MAGIC:
@@ -330,7 +376,6 @@ class Shard:
                         f"{path}: a .mshard container from an older version; re-import the library"
                     ) from None
             raise ValueError(f"{path}: unreadable shard ({exc})") from exc
-        raw = (table.schema.metadata or {}).get(METADATA_KEY)
         if raw is None:
             raise ValueError(f"{path}: Parquet file without a shard header, not a shard")
         header = json.loads(raw.decode("utf-8"))
