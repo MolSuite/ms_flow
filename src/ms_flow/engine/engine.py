@@ -257,10 +257,10 @@ def _room(slot: _Slot, needs) -> bool:
     return total is None or all(h + n <= t for h, n, t in zip(slot.held, needs, total) if n)
 
 
-def _at_once(slot: _Slot, needs) -> int:
+def _at_once(slot: _Slot, needs, tokens=None) -> int:
     """How many tasks of `needs` the executor runs side by side: on Ray two GPUs run two GPU tasks,
-    however many CPUs the cluster has."""
-    total, most = getattr(slot.impl, "total", None), slot.impl.capacity
+    however many CPUs the cluster has; on an executor of the engine's `tokens`, as many as they hold."""
+    total, most = getattr(slot.impl, "total", None) or tokens, slot.impl.capacity
     for n, t in zip(needs, total or ()):
         if n:
             most = min(most, int(t // n))
@@ -1146,7 +1146,7 @@ class Engine:
                 pack, size = [chunk], job.pack
                 if job.fed_all and (not job.batch or job.auto is not None):
                     # the tail is shared out, or the last tasks take it all and workers idle
-                    share = -(-(len(ready) + 1) // _at_once(slot, chunk.needs))
+                    share = -(-(len(ready) + 1) // _at_once(slot, chunk.needs, self.tokens.total if slot.impl.uses_tokens else None))
                     if job.batch:  # in whole floors: the least a task of the job may take
                         share = job.batch * -(-share // job.batch)
                     size = min(size, share)

@@ -130,3 +130,4 @@ def test_the_tail_is_shared_by_the_tasks_that_run_at_once():
     assert _at_once(ray, (1, 1, 0)) == 2  # two GPUs, however many CPUs
     assert _at_once(ray, (1, 0, 0)) == 16
     assert _at_once(SimpleNamespace(impl=SimpleNamespace(capacity=4)), (1, 1, 0)) == 4
+    assert _at_once(SimpleNamespace(impl=SimpleNamespace(capacity=14)), (1, 1, 0), (14, 1, 0)) == 1  # one card here

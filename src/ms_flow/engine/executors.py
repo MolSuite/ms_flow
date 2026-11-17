@@ -205,7 +205,9 @@ class ProcessExecutor:
             self._slots.free(index)
         # ponytail: no peak of memory. The process is not the task's, and the program it runs
         # is not measured: its `Popen` would have to be waited with `os.wait4`.
-        self._on_done(tag, *future.result(), 0)
+        status, value, error = future.result()
+        result, used = value if status == DONE else (None, 0)
+        self._on_done(tag, status, result, error, used)
 
     def cancel(self, handle) -> None:
         host = getattr(handle, "host", None)
@@ -581,7 +583,9 @@ def _serve(conn, workers: int) -> None:
 
 def _hosted(task):
     call, *task = pickle.loads(task)
-    return call(*task)[0]
+    result, used = call(*task)
+    # ponytail: where and how long only; cores and memory would be the process's, shared by its threads.
+    return result, {"where": used["where"], "seconds": used["seconds"]}
 
 
 # --- Worker side --------------------------------------------------------------------
