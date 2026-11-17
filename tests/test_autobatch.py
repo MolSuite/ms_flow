@@ -25,12 +25,41 @@ def test_without_a_fixed_cost_the_jobs_size_stays():
     assert _settle(_Autobatch(8, start=64), lambda n: 0.01 * n) == 64
 
 
-def test_it_times_the_jobs_size_then_twice_and_three_times_it():
+def test_it_measures_one_task_of_the_jobs_size_then_twice_and_three_times_it():
     auto, sizes = _Autobatch(32, start=128), []
     while not auto.settled:
         sizes.append(auto.size)
         auto.seen(auto.size, 1 + 0.01 * auto.size)
-    assert sizes == [128, 128, 256, 256, 384, 384] and auto.size == 1888  # 19·a/b = 1900
+    assert sizes == [128, 256, 384] and auto.size == 1888  # 19·a/b = 1900
+
+
+def _card(vram, held):
+    """What `_Usage` tells of a task holding `held` MB of a card with `vram` MB, 500 MB of it others'."""
+    return {"where": "node:0", "vram": held, "vram_used": 500 + held, "vram_total": vram, "gpu": 60, "gpu_top": 90}
+
+
+def test_the_next_size_goes_on_only_if_it_fits_in_the_card():
+    # 128 holds 1000 MB of 6000: 2x and 3x fit; 19·a/b = 1900 would need 14.8 GB, so it stops
+    # at what fits in 90 % of the card: (5400 - 500) MB at 7.8 MB a chunk = 627, 608 in floors of 32.
+    auto, sizes = _Autobatch(32, start=128), []
+    while not auto.settled:
+        n = auto.size
+        sizes.append(n)
+        auto.seen(n, 1 + 0.01 * n, used=_card(6000, 1000 * n / 128))
+    assert sizes == [128, 256, 384] and auto.size == 608
+
+
+def test_a_task_that_fills_the_card_halves_the_size():
+    auto = _Autobatch(32, start=128)
+    auto.seen(128, 2.0, used=_card(4000, 3500))  # 4000 MB in use of 4000
+    assert (auto.size, auto.settled) == (64, True)
+    auto = _Autobatch(1)
+    auto.seen(1, 60.0, used=_card(4000, 3500))
+    assert auto.size == 1  # never under the floor
+    # two tasks to a card: each grows, and both have to fit
+    auto = _Autobatch(32, start=128)
+    auto.seen(128, 2.0, used=_card(6000, 1000), sharing=2)  # 2500 of 6000: room for 2.3 times
+    assert auto.size == 256
 
 
 def test_a_slow_task_of_one_grows_only_as_far_as_the_limit_allows():
@@ -53,7 +82,7 @@ def test_two_cards_of_different_speed_settle_where_both_get_through_near_the_mos
         heapq.heappush(ends, (card(auto.size), index, auto.size, card(auto.size)))
     while not auto.settled:
         now, index, n, took = heapq.heappop(ends)
-        auto.seen(n, took, width=2)
+        auto.seen(n, took, width=2, used={"where": f"card{index}"})
         heapq.heappush(ends, (now + cards[index](auto.size), index, auto.size, cards[index](auto.size)))
     most = 11.4 + 4.8
     assert 256 <= auto.size <= 1024 and together(auto.size) >= 0.93 * most
@@ -81,6 +110,21 @@ def test_a_lost_task_halves_it_down_to_the_floor():
     auto.size = 8
     auto.lost()
     assert auto.size == 8
+
+
+def test_a_task_tells_what_it_used():
+    from ms_flow.engine.executors import _call_whole
+
+    def busy(payloads):
+        end = time.perf_counter() + 0.5
+        while time.perf_counter() < end:
+            pass
+        return payloads
+
+    outcomes, used = _call_whole(busy, [1, 2])
+    assert outcomes == [(1, None), (2, None)]
+    assert used["where"] and used["seconds"] >= 0.5 and 0.5 < used["cpu"] <= 1.5 and used["mb"] > 0
+    assert used["ram"] > 0 and used["ram_used"] <= used["ram_total"]  # psutil: read while it ran
 
 
 def _costly(payloads):
