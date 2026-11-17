@@ -301,20 +301,22 @@ class _Autobatch:
     there (the smaller stays). After 3x, or as soon as the next step would pass it, the size
     kept is the one that reaches `_SHARE` of the most (19·a/b for 95 %, a and b from the sizes
     that worker took), as far as it fits. A task of the size kept that fills its worker's
-    memory halves it, whenever that happens. Nothing here knows what a chunk is. No task is ever stopped
+    memory halves it, whenever that happens; a worker whose memory is known from one size only
+    holds the size back unsettled, until a task of another size tells its fixed part. Nothing here knows what a chunk is. No task is ever stopped
     for taking long: a task past `seconds` shrinks the ones that follow, and a lost task (its
     worker died: out of memory, say) halves them.
     """
 
     # ponytail: one size for the whole job, frozen once it settles; a refit as it goes if work drifts.
-    __slots__ = ("floor", "start", "size", "ceiling", "seconds", "points", "most", "settled")
+    __slots__ = ("floor", "start", "size", "ceiling", "seconds", "points", "held", "most", "settled")
 
     def __init__(self, floor: int, ceiling: int = 0, seconds: float = 0, start: int = 0):
         self.floor = max(1, int(floor))
         self.ceiling = self._fit(ceiling) if ceiling else 0
         self.size = self.start = min(self._fit(start or self.floor), self.ceiling or start or self.floor)
         self.seconds = float(seconds or 0)
-        self.points, self.most, self.settled = {}, {}, False  # by worker: (n, seconds) and the most chunks that fit
+        # by worker: (n, seconds) of its tasks, what a task of n used, and the most chunks that fit
+        self.points, self.held, self.most, self.settled = {}, {}, {}, False
 
     def _fit(self, n: float) -> int:
         """`n` down to whole floors, and never under one: the floor is the job's unit."""
@@ -333,21 +335,24 @@ class _Autobatch:
         known = self.points.setdefault(where, [])
         before = [point for point in known if point[0] < n]
         known.append((n, took))
-        most = _fits(n, used, width, sharing)
-        if most is not None:
-            self.most[where] = most
+        held = self.held.setdefault(where, {})
+        other = max((m for m in held if m != n), default=None, key=lambda m: (m < n, m))
+        held[n] = used
+        most = _fits(n, used, width, sharing, None if other is None else (other, held[other]))
+        if most is not None:  # and whether it is sure of it: a line through two sizes
+            self.most[where] = most, other is not None
         if self.seconds and took > self.seconds:  # it ran on; the next ones are made to fit
             self._keep(min(self.size, n * self.seconds / took))
             return
         if n != self.size:
             return  # a tail task, or one sent before the size changed
-        room = min(self.most.values(), default=None)
-        if room is not None and room < n:  # it filled the memory: half as big, whenever that is
+        if most is not None and most < n:  # it filled its worker's memory: half as big, whenever that is
             self.settled = False
             self._keep(n / 2)
             return
         if self.settled:
             return
+        room, sure = min(self.most.values(), default=(None, True))
         if before:  # the size before it, on the same worker: no more chunks a second, it stays
             last, spent = max(before)
             if n / took <= last / spent * (1 + _GAIN):
@@ -356,16 +361,27 @@ class _Autobatch:
         line = _line(known)
         limit = self.ceiling or math.inf
         if self.seconds:  # along the line once two sizes are known, else in proportion (the safe guess)
-            limit = min(limit, (self.seconds - line[0]) / line[1] if line else n * self.seconds / took)
+            limit = min(limit, (self.seconds - line[0]) / line[1] if line and line[1] > 0 else n * self.seconds / took)
         if room is not None:
             limit = min(limit, room)
-        target = line[0] / line[1] * _SHARE / (1 - _SHARE) if line else None
-        if target is not None and (target < n + self.start or n >= _STEPS * self.start):
-            self._keep(max(n, min(target, limit)))  # the size worth having, as far as it fits
-        elif self._fit(min(n + self.start, limit)) <= n:
+        # the memory of a worker known from one size only holds it back: it waits for a second
+        waits = room is not None and limit == room and not sure
+        target = None
+        if line:  # no dearer with more chunks: as big as allowed; nothing fixed: the job's size
+            fixed, per = line
+            target = math.inf if per <= 0 else self.start if fixed <= 0 else fixed / per * _SHARE / (1 - _SHARE)
+        if target is not None and (target < self.start * (n // self.start + 1) or n >= _STEPS * self.start):
+            size = max(n, min(target, limit))  # the size worth having, as far as it fits
+            if size == math.inf:
+                size = max(m for m, _ in known)
+            if waits:
+                self.size = self._fit(size)
+            else:
+                self._keep(size)
+        elif self._fit(min(self.start * (n // self.start + 1), limit)) > n:
+            self.size = self._fit(min(self.start * (n // self.start + 1), limit))
+        elif not waits:
             self._keep(n)
-        else:
-            self.size = self._fit(min(n + self.start, limit))
 
     def lost(self) -> None:
         """A task's worker died: whatever the cause, a smaller task is the safer one."""
@@ -373,8 +389,7 @@ class _Autobatch:
 
 
 def _line(points):
-    """(a, b) of the line t = a + b·n through `points` (seconds a task, a chunk), when a bigger
-    task takes longer and there is a fixed part to spread; else None."""
+    """(a, b) of the line t = a + b·n through `points` (seconds a task, a chunk); None with one size."""
     count = len(points)
     mean_n = sum(n for n, _ in points) / count
     mean_t = sum(t for _, t in points) / count
@@ -382,8 +397,7 @@ def _line(points):
     if not spread:
         return None
     per = sum((n - mean_n) * (t - mean_t) for n, t in points) / spread
-    fixed = mean_t - per * mean_n
-    return (fixed, per) if per > 0 and fixed > 0 else None
+    return mean_t - per * mean_n, per
 
 
 def _told(used: dict) -> str:
@@ -397,19 +411,27 @@ def _told(used: dict) -> str:
     return ", ".join(told)
 
 
-def _fits(n: int, used: dict, width: int, sharing: int) -> float | None:
+def _fits(n: int, used: dict, width: int, sharing: int, other=None) -> float | None:
     """The most chunks a task fits in what its worker had, `_FULL` of it; None when unknown.
 
-    What a task holds grows in proportion to its chunks (the safe guess: a part is fixed), and
-    the job's other tasks there grow with it: `width` on the machine (all of them, as none can
-    be told apart), `sharing` on a card."""
+    What a task holds grows along the line through what a task of `n` and one of another size
+    (`other`: (size, used), the same worker's) held, a fixed part and a part per chunk; with one
+    size, in proportion to its chunks (the safe guess). The job's other tasks there grow with
+    it: `width` on the machine (all of them, as none can be told apart), `sharing` on a card."""
     rooms = []
     for held, used_at, total, others in (("ram", "ram_used", "ram_total", width),
                                          ("vram", "vram_used", "vram_total", sharing)):
         held_mb, total_mb = used.get(held, 0), used.get(total, 0)
-        if held_mb > 0 and total_mb > 0:
-            rest = used.get(used_at, 0) - held_mb * others  # what the job's tasks do not hold
-            rooms.append(n * (_FULL * total_mb - rest) / (held_mb * others))
+        if held_mb <= 0 or total_mb <= 0:
+            continue
+        rest = used.get(used_at, 0) - held_mb * others  # what the job's tasks do not hold
+        per, fixed = held_mb / n, 0.0
+        if other is not None and other[1].get(held, 0) > 0:
+            per = (held_mb - other[1][held]) / (n - other[0])
+            fixed = held_mb - per * n
+            if per <= 0:  # no more with more chunks: nothing to bound here
+                continue
+        rooms.append(((_FULL * total_mb - rest) / others - fixed) / per)
     return min(rooms) if rooms else None
 
 
@@ -952,7 +974,7 @@ class Engine:
                 if job.elastic:
                     job.window = 2 * slot.impl.capacity * job.pack
             elif job.auto is not None:
-                settled, n = job.auto.settled, len(pack) if pack else 1
+                settled, was, n = job.auto.settled, job.auto.size, len(pack) if pack else 1
                 gpu = job.needs[1]
                 job.auto.seen(n, took * n, len(job.flying) + 1, used, math.ceil(1 / gpu) if gpu else 1)
                 job.pack = job.auto.size
@@ -962,7 +984,7 @@ class Engine:
                     job.window = max(job.window, 2 * slot.impl.capacity * job.pack)
                 if job.auto.settled and not settled:
                     log.info("job %s: %d chunks to a task (autobatch, from %d)", job.id, job.pack, job.batch)
-                elif not job.auto.settled:
+                elif job.pack != was and not job.auto.settled:
                     log.info("job %s: next size %d (autobatch)", job.id, job.pack)
         if status == LOST and not chunk.spared and job.auto is not None:
             job.auto.lost()

@@ -49,6 +49,31 @@ def test_the_next_size_goes_on_only_if_it_fits_in_the_card():
     assert sizes == [128, 256, 384] and auto.size == 608
 
 
+def test_with_two_sizes_held_the_card_fits_along_their_line():
+    # The 1050 Ti of the Ray runs: 128 held 1474 MB, 256 held 2422 MB of 4096 (a fixed ~530 MB).
+    # In proportion 128 allows 288; along the line through both, 256 allows (3686 - 526) / 7.4 = 427.
+    auto = _Autobatch(32, start=128)
+    laptop = lambda held: {"where": "laptop:0", "vram": held, "vram_used": held + 4, "vram_total": 4096}
+    auto.seen(128, 20.0, used=laptop(1474))  # times with a large fixed part: only memory bounds it
+    assert auto.size == 256
+    auto.seen(256, 30.0, used=laptop(2422))
+    assert auto.size == 384  # 3x fits now; in proportion it would have stopped at 288
+
+
+def test_a_card_known_from_one_size_holds_the_size_back_until_it_tells_more():
+    # The run 8 order: the 1660 ends 128 and 256 before the 1050 Ti ends its second task.
+    auto = _Autobatch(32, start=128)
+    fast = lambda held: {"where": "pc:0", "vram": held, "vram_used": held + 500, "vram_total": 6144}
+    slow = lambda held: {"where": "laptop:0", "vram": held, "vram_used": held + 4, "vram_total": 4096}
+    auto.seen(128, 20.0, width=2, used=fast(1389))
+    auto.seen(128, 31.5, width=2, used=slow(1474))  # 288 in proportion
+    auto.seen(256, 30.8, width=2, used=fast(2711))
+    assert (auto.size, auto.settled) == (288, False)
+    auto.seen(256, 57.5, width=2, used=slow(2422))  # its line allows 427
+    auto.seen(288, 34.3, width=2, used=fast(2961))
+    assert auto.size == 384
+
+
 def test_a_task_that_fills_the_card_halves_the_size():
     auto = _Autobatch(32, start=128)
     auto.seen(128, 2.0, used=_card(4000, 3500))  # 4000 MB in use of 4000
