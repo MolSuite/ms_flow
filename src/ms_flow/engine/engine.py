@@ -51,9 +51,10 @@ _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a 
 # ponytail: one figure for every executor; let the executor name its own when a remote one,
 # whose tasks cost far more than a local process's, starts packing.
 _TASK_SECONDS, _PACK_MAX = 0.1, 64
-# Autobatch: each size is timed on _PROBES tasks for each the job has running, and the size kept
-# gets through _SHARE of the most chunks a second any size could.
-_PROBES, _SHARE = 2, 0.95
+# Autobatch: each size is timed on _PROBES tasks for each the job has running; twice the job's
+# size goes on only if it gets through _GAIN more chunks a second, and the size kept gets
+# through _SHARE of the most any size could.
+_PROBES, _GAIN, _SHARE = 2, 0.03, 0.95
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
 _RECOUNT = 30.0  # seconds between two counts of what a source has left
@@ -291,24 +292,26 @@ class _Autobatch:
     Nearly anything run in tasks takes a fixed time per task (a program that starts, maps to
     build, a trip to another machine) and a time per chunk: t(n) = a + b·n, so a task of n gets
     through n / (a + b·n) chunks a second, a rectangular hyperbola that nears 1/b and never gets
-    there. Two sizes measured, `start` and three times it, give a and b; the size kept is the
-    one that gets to `_SHARE` of the most (19·a/b for 95 %): past it a bigger task gains little
-    and only makes the end of the job wait longer on the last ones. Each size is the mean of the
-    tasks it took on whatever ran them, so where tasks run side by side on resources of
+    there. The job's `start` (its guess of a good size; the floor otherwise) is timed first, then
+    twice it: if that gets through no more chunks a second, `start` stays. Otherwise three times
+    it is timed too, a and b come from the three, and the size kept is the one that reaches
+    `_SHARE` of the most (19·a/b for 95 %), never under `start`: past it a bigger task gains
+    little and only makes the end of the job wait longer on the last ones. Each size is the mean
+    of the tasks it took on whatever ran them, so where tasks run side by side on resources of
     different speed (two cards, two nodes) one size fits them all. Nothing here knows what a
-    chunk is. No task is ever stopped for taking long: `seconds` (0: no limit) keeps the
-    tasks that follow under it, and that is all.
+    chunk is. No task is ever stopped for taking long: `seconds` (0: no limit) keeps the tasks
+    that follow under it, and a lost task (its worker died: out of memory, say) halves them.
     """
 
-    # ponytail: one fit from two sizes, then frozen; a refit as the job goes if work drifts.
-    __slots__ = ("floor", "size", "ceiling", "seconds", "first", "probes", "settled")
+    # ponytail: one fit from the sizes timed, then frozen; a refit as the job goes if work drifts.
+    __slots__ = ("floor", "start", "size", "ceiling", "seconds", "points", "probes", "settled")
 
     def __init__(self, floor: int, ceiling: int = 0, seconds: float = 0, start: int = 0):
         self.floor = max(1, int(floor))
         self.ceiling = self._fit(ceiling) if ceiling else 0
-        self.size = min(self._fit(start or self.floor), self.ceiling or start or self.floor)
+        self.size = self.start = min(self._fit(start or self.floor), self.ceiling or start or self.floor)
         self.seconds = float(seconds or 0)
-        self.first, self.probes, self.settled = None, [], False
+        self.points, self.probes, self.settled = [], [], False
 
     def _fit(self, n: float) -> int:
         """`n` down to whole floors, and never under one: the floor is the job's unit."""
@@ -331,26 +334,48 @@ class _Autobatch:
         if len(self.probes) < _PROBES * max(1, width):
             return
         mean, longest = sum(self.probes) / len(self.probes), max(self.probes)
+        self.points.append((n, mean))
         self.probes = []
-        if self.first is None:  # the second size: three times the first, if it fits
-            bigger = min(3 * n, self.ceiling or 3 * n)
-            if bigger <= n or (self.seconds and 3 * longest > self.seconds):
-                self._keep(n)
+        if len(self.points) == 2:
+            (n1, t1), (n2, t2) = self.points
+            if n2 / t2 < n1 / t1 * (1 + _GAIN):  # twice as big gets through no more: `start` stays
+                self._keep(n1)
+                return
+        if len(self.points) < 3:
+            bigger = min((len(self.points) + 1) * self.start, self.ceiling or n + self.start)
+            # How long the next size would take: in proportion while one size is known (as if
+            # nothing were fixed, the safe guess), along the line through two once they are.
+            if len(self.points) == 1:
+                foretold = longest * bigger / n
             else:
-                self.first, self.size = (n, mean), bigger
-            return
-        n1, t1 = self.first
-        per = (mean - t1) / (n - n1)  # b: the seconds a chunk adds
-        fixed = t1 - per * n1  # a: the seconds a task takes whatever it holds
+                (n1, t1), (n2, t2) = self.points
+                foretold = longest / mean * (t2 + (t2 - t1) / (n2 - n1) * (bigger - n2))
+            # the next size would pass the limit: what is known decides
+            if bigger > n and not (self.seconds and foretold > self.seconds):
+                self.size = bigger
+                return
+            if len(self.points) == 1:
+                self._keep(n)
+                return
+        self._keep(self._target())
+
+    def _target(self) -> float:
+        """The size `_SHARE` of the most, from the line t = a + b·n through the sizes timed."""
+        count = len(self.points)
+        mean_n = sum(n for n, _ in self.points) / count
+        mean_t = sum(t for _, t in self.points) / count
+        spread = sum((n - mean_n) ** 2 for n, _ in self.points)
+        per = sum((n - mean_n) * (t - mean_t) for n, t in self.points) / spread  # b: a chunk's seconds
+        fixed = mean_t - per * mean_n  # a: a task's seconds whatever it holds
+        largest = max(n for n, _ in self.points)
         if per <= 0:  # no dearer with more chunks: as big as allowed
-            self._keep(self.ceiling or n)
-        elif fixed <= 0:  # nothing to spread: small tasks lose nothing, and share best
-            self._keep(self.floor)
-        else:
-            target = fixed / per * _SHARE / (1 - _SHARE)
-            if self.seconds:
-                target = min(target, max(self.floor, (self.seconds - fixed) / per))
-            self._keep(target)
+            return self.ceiling or largest
+        if fixed <= 0:  # nothing to spread: the job's size is as good as any
+            return self.start
+        target = fixed / per * _SHARE / (1 - _SHARE)
+        if self.seconds:
+            target = min(target, (self.seconds - fixed) / per)
+        return max(self.start, target)
 
     def lost(self) -> None:
         """A task's worker died: whatever the cause, a smaller task is the safer one."""
@@ -499,9 +524,10 @@ class Engine:
         where chunks with different needs meet. With `batched`, `fn` takes the list of payloads
         of a task and returns one result for each, in order; if it raises, all of them failed.
         `autobatch` lets the executor size the tasks, in whole multiples of `batch` (the least the
-        job takes to one): it times tasks of two sizes, works out the fixed and the per-chunk
-        cost, and keeps the size that gets near the most chunks a second for the rest of the job.
-        An int is where it starts (the job's guess of a good size; `batch` otherwise). None: as
+        job takes to one): it times the job's size, then twice and three times it while bigger
+        tasks pay, works out the fixed and the per-chunk cost, and keeps the size that gets near
+        the most chunks a second for the rest of the job, never under the job's size. An int is
+        that size (the job's guess of a good one; `batch` otherwise). None: as
         the executor says (its `autobatch`, with `batch_max` and `task_seconds`); a task is never
         stopped for running long, the ones after it are made to fit `task_seconds`. Without
         `batch` the unit is one.

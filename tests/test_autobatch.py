@@ -1,4 +1,4 @@
-"""Autobatch: two task sizes timed give the fixed and per-chunk cost; the size kept follows."""
+"""Autobatch: task sizes timed give the fixed and per-chunk cost; the size kept follows."""
 import heapq
 import time
 
@@ -21,16 +21,23 @@ def test_a_fixed_cost_per_task_is_spread_to_near_the_most():
     assert _settle(_Autobatch(8), lambda n: 1 + 0.01 * n) == 1896
 
 
-def test_without_a_fixed_cost_it_stays_at_the_floor():
-    assert _settle(_Autobatch(8, start=64), lambda n: 0.01 * n) == 8
+def test_without_a_fixed_cost_the_jobs_size_stays():
+    assert _settle(_Autobatch(8, start=64), lambda n: 0.01 * n) == 64
 
 
-def test_it_starts_where_the_job_says_and_tries_three_times_that():
-    auto = _Autobatch(32, start=128)
-    assert auto.size == 128
-    for _ in range(2):
-        auto.seen(128, 1 + 0.01 * 128)
-    assert (auto.size, auto.settled) == (384, False)
+def test_it_times_the_jobs_size_then_twice_and_three_times_it():
+    auto, sizes = _Autobatch(32, start=128), []
+    while not auto.settled:
+        sizes.append(auto.size)
+        auto.seen(auto.size, 1 + 0.01 * auto.size)
+    assert sizes == [128, 128, 256, 256, 384, 384] and auto.size == 1888  # 19·a/b = 1900
+
+
+def test_a_slow_task_of_one_grows_only_as_far_as_the_limit_allows():
+    # 60 s a task of one, 50 s of it fixed. Under 130 s: two (120 s in proportion, the safe guess
+    # while one size is known), three (80 s along the line), then (130 - 50) / 10 = 8.
+    assert _settle(_Autobatch(1, seconds=130), lambda n: 50 + 10 * n) == 8
+    assert _settle(_Autobatch(1, seconds=100), lambda n: 50 + 10 * n) == 1  # two might pass it
 
 
 def test_two_cards_of_different_speed_settle_where_both_get_through_near_the_most():
