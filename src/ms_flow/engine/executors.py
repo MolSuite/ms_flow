@@ -59,7 +59,6 @@ import os
 import pickle
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -332,7 +331,7 @@ class RayExecutor:
             if self._names is not None:
                 call = partial(_placed, self._tally, index, call)
         if cost[1]:
-            call = partial(_on_cards, None, call)  # Ray names the cards: only which ones, for `_Usage`
+            call = partial(_on_cards, None, call)  # Ray names the cards: only which ones, for the log
         ref = run.remote(call, fn, payload)
         self._flying.add(ref)
         ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
@@ -582,7 +581,6 @@ def _serve(conn, workers: int) -> None:
 
 def _hosted(task):
     call, *task = pickle.loads(task)
-    _task.bare = True
     return call(*task)[0]
 
 
@@ -627,113 +625,27 @@ def _watched(path, index, call, fn, payload):
         _task.at = None
 
 
-_READ_EVERY = (0.2, 1.0)  # seconds to a task's first read of what it uses, then between two
-
-
 class _Usage:
-    """What the task in this block uses, read now and then while it runs.
-
-    `report()`: where it ran (host, and its cards), its seconds, the cores it kept busy (its CPU
-    time and that of the programs it waited for, over its seconds), its peak RAM in MB (this
-    worker and what it started, with psutil) beside the machine's RAM in use and in all, and on
-    the cards it holds (`_task.cards`, with nvidia-smi) their mean and top use in %, the VRAM in
-    MB it added to them at the most, theirs in use then and in all. What cannot be read is left
-    out. `mb` is `_peak_mb()`, as before.
+    """What the task in this block used: where it ran (host, and its cards), its seconds, the
+    cores it kept busy (its CPU time and that of the programs it waited for, over its seconds)
+    and `mb`, `_peak_mb()`. Two clock reads and no thread: cheap enough for every task.
     """
 
-    def __init__(self):
-        bare = getattr(_task, "bare", False)  # a task on a thread shares its process: nothing is its own
-        self.cards = None if bare else getattr(_task, "cards", None)
-        self.me = None
-        if not bare:
-            try:
-                import psutil
-
-                self.me, self.psutil = psutil.Process(), psutil
-            except ImportError:
-                pass
-        self.read, self.over, self.lock = {}, threading.Event(), threading.Lock()
+    # ponytail: no RAM/VRAM sampling. Tried (nvidia-smi + psutil on a thread): memory never
+    # bound the size in the GPU runs and the guesses cost throughput; a lost task halves it.
 
     def __enter__(self):
         self.began, self.cpu = time.perf_counter(), sum(os.times()[:4])
-        if self.cards:
-            self.base = self._cards()
-        self.watch = None
-        if self.me is not None or self.cards:
-            self.watch = threading.Thread(target=self._watch, daemon=True)
-            self.watch.start()
         return self
 
     def __exit__(self, *_):
-        self.over.set()
-        if self.watch is not None:
-            self.watch.join(15)  # a read under way ends first: nvidia-smi gives up in 10 s
         self.seconds = time.perf_counter() - self.began
         self.cpu = (sum(os.times()[:4]) - self.cpu) / max(self.seconds, 1e-6)
 
-    def _watch(self):
-        waits = iter(_READ_EVERY)
-        while not self.over.wait(next(waits, _READ_EVERY[-1])):
-            read = {}
-            if self.me is not None:
-                read.update(self._ram())
-            if self.cards and getattr(self, "base", None):
-                cards = self._cards()
-                if cards:
-                    use, vram, total = cards
-                    read.update(gpu=use, vram=vram - self.base[1], vram_used=vram, vram_total=total)
-            with self.lock:
-                for name, value in read.items():
-                    if name in ("ram", "vram"):  # the peak, and what the machine held then
-                        if value >= self.read.get(name, -1):
-                            self.read[name] = value
-                            self.read[name + "_used"] = read[name + "_used"]
-                    elif name == "gpu":
-                        self.read["gpu_sum"] = self.read.get("gpu_sum", 0) + value
-                        self.read["gpu_reads"] = self.read.get("gpu_reads", 0) + 1
-                        self.read["gpu_top"] = max(self.read.get("gpu_top", 0), value)
-                    elif name.endswith("total"):
-                        self.read[name] = value
-
-    def _ram(self) -> dict:
-        psutil, rss = self.psutil, 0
-        try:
-            tree = [self.me, *self.me.children(recursive=True)]
-        except psutil.Error:
-            return {}
-        for process in tree:
-            try:
-                rss += process.memory_info().rss
-            except psutil.Error:  # it ended between the two
-                pass
-        machine = psutil.virtual_memory()
-        return {"ram": rss / 2 ** 20, "ram_used": (machine.total - machine.available) / 2 ** 20,
-                "ram_total": machine.total / 2 ** 20}
-
-    def _cards(self):
-        """(mean use %, VRAM in use MB, VRAM in all MB) of the task's cards; None when unread."""
-        try:
-            out = subprocess.run(["nvidia-smi", "-i", self.cards,
-                                  "--query-gpu=utilization.gpu,memory.used,memory.total",
-                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10)
-            rows = [[float(cell) for cell in line.split(",")] for line in out.stdout.splitlines() if line.strip()]
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
-        if out.returncode or not rows:
-            return None
-        return sum(r[0] for r in rows) / len(rows), sum(r[1] for r in rows), sum(r[2] for r in rows)
-
     def report(self) -> dict:
-        with self.lock:
-            read = dict(self.read)
-        reads = read.pop("gpu_reads", 0)
-        if reads:
-            read["gpu"] = read.pop("gpu_sum") / reads
-        else:
-            for name in ("gpu_sum", "gpu_top", "vram", "vram_used", "vram_total"):
-                read.pop(name, None)
-        where = socket.gethostname() + (f":{self.cards}" if self.cards else "")
-        return {"where": where, "seconds": self.seconds, "cpu": self.cpu, "mb": _peak_mb(), **read}
+        cards = getattr(_task, "cards", None)
+        return {"where": socket.gethostname() + (f":{cards}" if cards else ""), "seconds": self.seconds,
+                "cpu": self.cpu, "mb": _peak_mb()}
 
 
 def _call(fn, payload):
@@ -745,7 +657,7 @@ def _call(fn, payload):
 def _on_cards(cards, call, *task):
     if cards is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cards  # what the programs it starts see too
-    _task.cards = os.environ.get("CUDA_VISIBLE_DEVICES") or None  # on Ray, the cards it gave
+    _task.cards = os.environ.get("CUDA_VISIBLE_DEVICES") or None  # on Ray, the cards it gave: for the log
     try:
         return call(*task)
     finally:
