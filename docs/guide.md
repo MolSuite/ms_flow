@@ -19,7 +19,8 @@ def weigh(molecule: dict, params) -> dict:
 | `cpu=`, `gpu=`, `mem_mb=` | What one element needs; the engine admits no more than the machine has |
 | `retries=` | How many times a failed element runs again |
 | `label=` | What an element goes by in the monitor and in a failure: a template its keys fill, or a function |
-| `batch=`, `batched=` | How many elements travel together; with `batched` the function takes the list and returns one result for each |
+| `batch=`, `batched=` | How many elements travel together, at least; with `batched` the function takes the list and returns one result for each |
+| `autobatch=` | Whether the executor sizes the tasks in whole multiples of `batch`: it times two sizes, works out the fixed and the per-element cost, and keeps the size that gets near the most elements a second. A number is the size to start from (default: the executor's `autobatch` setting, on). A task is never stopped for running long |
 | `thread=` | The function only waits for a program it starts: it runs on a thread and no worker is kept for it |
 
 A job is a function `(params, project)` marked with `@job`. It gives the

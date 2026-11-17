@@ -41,11 +41,13 @@ log = logging.getLogger(__name__)
 
 
 def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0, batch: int | None = None,
-         batched: bool = False, label=None, thread: bool = False):
+         batched: bool = False, autobatch: bool | int | None = None, label=None, thread: bool = False):
     """Mark a function as a task: what runs on one element, and what it needs to run.
 
     `batch` is how many elements the author wants to travel together; `batched` says the
-    function takes the list of them and returns one result for each.
+    function takes the list of them and returns one result for each. `batch` is the least: the
+    executor sizes the tasks in whole multiples of it, from `autobatch` if that is a number,
+    unless `autobatch=False` (see `Engine.submit`).
     `label` is what an element goes by in the monitor and in a failure: a template its keys
     fill (`"dock-R{receptor}-L{ligand}"`) or a function `(element)` that returns the text.
     `thread` is for a function that only waits for a program it starts (a docking binary): on
@@ -54,7 +56,7 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
     """
     def mark(fn):
         fn.__task__ = {"cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "retries": retries, "batch": batch,
-                       "batched": batched, "label": label, "thread": thread}
+                       "batched": batched, "autobatch": autobatch, "label": label, "thread": thread}
         return fn
     return mark
 

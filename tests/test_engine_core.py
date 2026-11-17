@@ -522,7 +522,7 @@ def test_a_batch_of_a_set_size_and_a_function_that_takes_it_whole():
                 time.sleep(0.001)
                 yield i
 
-        snap = engine.wait(engine.submit("process", _sizes, slowly(), batch=10, batched=True,
+        snap = engine.wait(engine.submit("process", _sizes, slowly(), batch=10, batched=True, autobatch=False,
                                          on_result=sizes.__setitem__), 60)
         assert (snap.status, snap.chunks_done) == ("completed", 95)
         assert sorted(sizes.values()) == [5] * 5 + [10] * 90
@@ -534,7 +534,7 @@ def test_a_batch_of_a_set_size_and_a_function_that_takes_it_whole():
         assert engine.wait(engine.submit("process", _echo, [f"p{i}" for i in range(25)], batch=10), 60).chunks_done == 25
         # raising, or answering short, fails the batch it happened in and no other
         payloads = [f"p{i}" for i in range(8)] + ["fail", "p9"] + ["short"] + [f"q{i}" for i in range(9)]
-        snap = engine.wait(engine.submit("process", _sizes, payloads + [f"r{i}" for i in range(10)], batch=10, batched=True,
+        snap = engine.wait(engine.submit("process", _sizes, payloads + [f"r{i}" for i in range(10)], batch=10, batched=True, autobatch=False,
                                          on_error=errors.__setitem__), 60)
         assert (snap.status, snap.chunks_done, snap.chunks_failed) == ("completed_with_errors", 10, 20)
         assert "asked to" in errors[content_key("p9")] and "0 results for 10 payloads" in errors[content_key("q0")]

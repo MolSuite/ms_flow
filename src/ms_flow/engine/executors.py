@@ -124,6 +124,7 @@ class ProcessExecutor:
     """
 
     uses_tokens = threads = watches_all = True  # watching: a float in a file the worker has mapped
+    autobatch, batch_max, task_seconds = True, 4096, 0.0  # see `Engine.submit(autobatch=)`
 
     def __init__(self, max_workers: int, idle: float | None = 60.0, gpus: int = 0):
         from loky.process_executor import BrokenProcessPool, ProcessPoolExecutor
@@ -262,6 +263,7 @@ class RayExecutor:
     # chunks ask for more CPUs than Ray has free spends part of it waiting there. The task
     # saying when it began, through the tally, is what would count only the run.
     uses_tokens, wants_cost = False, True
+    autobatch, batch_max, task_seconds = True, 4096, 0.0  # see `Engine.submit(autobatch=)`
 
     def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None,
                  names: dict | None = None, **init):
