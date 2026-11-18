@@ -8,7 +8,13 @@ record — and queried in place by DuckDB or pyarrow (``SELECT id, record FROM '
 
 The file is plain Parquet: an ``id`` column (uint64) and a ``record`` column (``string`` when
 the serializer is UTF-8, ``binary`` otherwise), zstd-compressed, with the header below as JSON
-under the ``ms_flow.shard`` key of the file metadata.
+under the ``ms_flow.shard`` key of the file metadata. An optional ``source_index`` column
+(uint64) keeps where each record came from in its source file.
+
+One file may hold many *logical* shards: contiguous id ranges, each closed as its own row group
+(`ShardWriter.end_group`). ``Shard.open(path, ids=(lo, hi))`` reads only the row groups whose
+``id`` statistics overlap the range, so a catalog can address a shard as (file, id range) and a
+library of millions sits in a few big files instead of one small file per shard.
 
 What the container guarantees:
 
@@ -182,6 +188,7 @@ class ShardWriter:
         slot_count: int = 4096,
         codec: int = Codec.NONE,
         metadata: dict[str, Any] | None = None,
+        source_index: bool = False,
     ) -> None:
         if codec != Codec.NONE:
             raise ValueError("shards only write codec=Codec.NONE; Parquet compresses the column")
@@ -199,8 +206,10 @@ class ShardWriter:
         self.serializer = _check_uint("serializer", serializer, 16)
         self.codec = codec
         self.metadata = dict(metadata or {})
+        self._with_source = bool(source_index)
         self._ids: list[int] = []  # the row group being filled
         self._records: list[bytes] = []
+        self._sources: list[int] = []
         self._buffered = 0
         self._count = 0
         self._last: int | None = None
@@ -208,7 +217,7 @@ class ShardWriter:
         self._writer: Any = None
         self._closed = False
 
-    def add(self, id_: int, data: bytes) -> None:
+    def add(self, id_: int, data: bytes, source_index: int | None = None) -> None:
         if self._closed:
             raise ValueError(f"{self.path}: shard already closed")
         if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -223,10 +232,20 @@ class ShardWriter:
             )
         if self._last is not None and id_ <= self._last:
             raise ValueError(f"ids must be strictly increasing: {id_} after {self._last}")
+        if self._with_source:
+            if source_index is None:
+                raise ValueError("this writer stores a source_index per record; pass one")
+            self._sources.append(int(source_index))
         self._ids.append(id_)
         self._records.append(bytes(data))
         self._last, self._count, self._buffered = id_, self._count + 1, self._buffered + len(data)
         if self._buffered >= _ROW_GROUP_BYTES:
+            self._flush()
+
+    def end_group(self) -> None:
+        """Close the row group being filled. A caller packing several logical shards into one
+        file calls this at each shard's end, so reading one shard back touches only its own."""
+        if self._ids:
             self._flush()
 
     def _flush(self) -> None:
@@ -238,25 +257,30 @@ class ShardWriter:
             text = self.serializer == Serializer.UTF8  # text DuckDB can read
             if self._writer is None:
                 self._file = open(self._tmp_path, "wb")
-                schema = pa.schema([("id", pa.uint64()), ("record", pa.string() if text else pa.binary())])
-                self._writer = pq.ParquetWriter(self._file, schema, compression="zstd",
-                                                write_page_checksum=True)
+                fields = [("id", pa.uint64()), ("record", pa.string() if text else pa.binary())]
+                if self._with_source:
+                    fields.append(("source_index", pa.uint64()))
+                # Statistics on `id` only: they are what finds a shard's row groups; a min/max over
+                # the record text is most of the footer and nothing filters on it.
+                self._writer = pq.ParquetWriter(self._file, pa.schema(fields), compression="zstd",
+                                                write_page_checksum=True, write_statistics=["id"])
             if self._ids:
                 records = pa.array(self._records, type=pa.binary())
                 if text:
                     records = records.cast(pa.string())  # also validates the UTF-8
-                self._writer.write_table(
-                    pa.table({"id": pa.array(self._ids, type=pa.uint64()), "record": records})
-                )
+                columns = {"id": pa.array(self._ids, type=pa.uint64()), "record": records}
+                if self._with_source:
+                    columns["source_index"] = pa.array(self._sources, type=pa.uint64())
+                self._writer.write_table(pa.table(columns), row_group_size=len(self._ids))
         except BaseException:
             self._discard()
             raise
-        self._ids, self._records, self._buffered = [], [], 0
+        self._ids, self._records, self._sources, self._buffered = [], [], [], 0
 
     def _discard(self) -> None:
         """Drop what was written: the ``.tmp`` goes, ``path`` is never touched."""
         self._closed = True
-        self._ids, self._records = [], []
+        self._ids, self._records, self._sources = [], [], []
         for closing in (self._writer, self._file):
             try:
                 if closing is not None:
@@ -340,6 +364,32 @@ class Record:
         return f"Record(id={self.id}, index={self._index})"
 
 
+# path -> ((mtime_ns, size), footer, [(min id, max id) per row group]). A worker reading many
+# shards of one big file parses its footer once. ponytail: cleared whole past 256 files.
+_FOOTERS: dict[Path, tuple[tuple[int, int], Any, list[tuple[int, int]]]] = {}
+
+
+def _footer(path: Path) -> tuple[Any, list[tuple[int, int]]]:
+    import pyarrow.parquet as pq
+
+    stat = path.stat()
+    key = (stat.st_mtime_ns, stat.st_size)
+    hit = _FOOTERS.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1], hit[2]
+    meta = pq.read_metadata(path)
+    column = meta.schema.names.index("id") if "id" in meta.schema.names else None
+    spans = []
+    for index in range(meta.num_row_groups):
+        stats = None if column is None else meta.row_group(index).column(column).statistics
+        has = stats is not None and stats.has_min_max
+        spans.append((int(stats.min), int(stats.max)) if has else (0, (1 << 64) - 1))
+    if len(_FOOTERS) >= 256:
+        _FOOTERS.clear()
+    _FOOTERS[path] = (key, meta, spans)
+    return meta, spans
+
+
 class Shard:
     """A read-only shard, decoded into memory on open."""
 
@@ -358,17 +408,42 @@ class Shard:
         self._records = records
 
     @classmethod
-    def open(cls, path: str | Path, *, dataset_id: uuid.UUID | str | bytes | None = None) -> "Shard":
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        ids: tuple[int, int] | None = None,
+        record_ids: Any = None,
+        dataset_id: uuid.UUID | str | bytes | None = None,
+    ) -> "Shard":
+        """The whole file, or with ``ids=(lo, hi)`` the logical shard of ids ``lo <= id < hi``
+        inside it: only the row groups that can hold them are read. ``record_ids`` narrows
+        further to those ids (what survives the exclusions, a Top-N); unknown ones are ignored."""
         import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
 
         path = Path(path)
         try:
-            with pq.ParquetFile(path, page_checksum_verification=True) as parquet:
-                table = parquet.read()
+            meta, spans = _footer(path)
+            with pq.ParquetFile(path, metadata=meta, page_checksum_verification=True) as parquet:
+                wanted = None if record_ids is None else sorted({int(i) for i in record_ids})
+                if ids is None and wanted is None:
+                    table = parquet.read(columns=["id", "record"])
+                else:
+                    lo, hi = (0, 1 << 64) if ids is None else (int(ids[0]), int(ids[1]))
+                    if wanted is not None:  # prune row groups by the wanted ids' span too
+                        lo, hi = (max(lo, wanted[0]), min(hi, wanted[-1] + 1)) if wanted else (0, 0)
+                    groups = [i for i, (first, last) in enumerate(spans) if first < hi and last >= lo]
+                    table = parquet.read_row_groups(groups, columns=["id", "record"])
+                    table = table.filter(pc.and_(pc.greater_equal(table["id"], lo), pc.less(table["id"], hi)))
+                    if wanted is not None:
+                        table = table.filter(pc.is_in(table["id"], pa.array(wanted, type=table["id"].type)))
+                    if ids is not None:
+                        lo, hi = int(ids[0]), int(ids[1])
                 # The writer adds the header on close, so it lives in the file's key-value
                 # metadata, which shards written in one go (before streaming) also have.
-                raw = (parquet.metadata.metadata or {}).get(METADATA_KEY)
+                raw = (meta.metadata or {}).get(METADATA_KEY)
         except (OSError, pa.ArrowException) as exc:  # a failed page CRC is an OSError
             with open(path, "rb") as fh:  # a missing file raises here, as itself
                 if fh.read(len(_LEGACY_MAGIC)) == _LEGACY_MAGIC:
@@ -384,6 +459,10 @@ class Shard:
         if dataset_id is not None and _uuid(dataset_id) != uuid.UUID(str(header["dataset_id"])):
             raise ValueError(f"{path}: dataset_id mismatch")
         records = table.column("record").combine_chunks().cast(pa.binary())
+        if ids is not None:  # the header describes the file; this is one shard of it
+            header = {**header, "base_id": lo, "slot_count": hi - lo}
+        if ids is not None or record_ids is not None:
+            header = {**header, "record_count": table.num_rows}
         return cls(path, header, table.column("id").to_pylist(), records)
 
     def _record_index_for_id(self, id_: int) -> int | None:

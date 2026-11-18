@@ -184,3 +184,38 @@ def test_bad_text_leaves_no_shard_behind(tmp_path):
 def test_an_empty_shard_is_a_valid_file(tmp_path):
     with Shard.open(_write(tmp_path / "empty.parquet", [])) as shard:
         assert len(shard) == 0 and shard.slot_count == 0
+
+
+def test_one_file_many_shards_each_read_by_its_id_range(tmp_path):
+    """A big file of logical shards: each is a row group, read alone by its id range."""
+    path = tmp_path / "vol.parquet"
+    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=PayloadKind.SMILES,
+                     serializer=Serializer.UTF8, slot_count=1000, source_index=True) as writer:
+        for id_ in range(1000):
+            if id_ != 305:  # a hole inside the second shard
+                writer.add(id_, f"mol-{id_}".encode(), source_index=10 * id_)
+            if id_ % 256 == 255:
+                writer.end_group()
+    meta = pq.read_metadata(path)
+    assert meta.num_row_groups == 4
+    stats = {meta.schema.column(c).name: meta.row_group(0).column(c).is_stats_set for c in range(meta.num_columns)}
+    assert stats == {"id": True, "record": False, "source_index": False}
+    with Shard.open(path, ids=(256, 512)) as shard:
+        assert (shard.base_id, shard.slot_count, shard.record_count) == (256, 256, 255)
+        assert [r.id for r in shard][:2] == [256, 257] and 305 not in shard
+        assert shard[511].load() == "mol-511" and 512 not in shard
+    with Shard.open(path, ids=(250, 260)) as shard:  # straddles two row groups
+        assert [r.id for r in shard] == list(range(250, 260))
+    with Shard.open(path) as shard:  # the whole file still opens as one shard
+        assert shard.record_count == 999
+    assert pq.read_table(path, columns=["source_index"]).column(0)[3].as_py() == 30
+
+
+def test_a_rewritten_file_is_not_read_through_a_stale_footer(tmp_path):
+    path = _write(tmp_path / "f.parquet", range(10), slot_count=10)
+    with Shard.open(path, ids=(0, 10)) as shard:
+        assert len(shard) == 10
+    _write(path, range(3), slot_count=10)
+    os.utime(path, ns=(1, 1))  # same second on a coarse clock: the size still differs
+    with Shard.open(path, ids=(0, 10)) as shard:
+        assert len(shard) == 3
