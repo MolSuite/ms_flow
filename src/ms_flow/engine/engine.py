@@ -46,11 +46,12 @@ CANCELED = "canceled"
 PENDING_CHUNK, RUNNING_CHUNK, DONE_CHUNK, FAILED_CHUNK = range(4)
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
-# Chunks shorter than this share a task, as many as it takes to fill it and at most _PACK_MAX.
-# A task costs about 1 ms to hand out with every core busy, so 100 ms keeps that near 1 %.
-# ponytail: one figure for every executor; let the executor name its own when a remote one,
-# whose tasks cost far more than a local process's, starts packing.
-_TASK_SECONDS, _PACK_MAX = 0.1, 64
+# Chunks shorter than a task should last share one, as many as it takes to fill it and at most
+# _PACK_MAX. A task lasts _TRIPS times what handing it out and back costs on its executor
+# (measured: the trip less what the worker says it ran), so that cost stays near 1 %; never
+# under _TASK_SECONDS, which is that for a local process (~1 ms a task with every core busy).
+# ponytail: _PACK_MAX also caps a remote executor's packs; raise it if its trips stay above 1 %.
+_TASK_SECONDS, _TRIPS, _PACK_MAX = 0.1, 100, 64
 # Autobatch: one task of the job's size, then of twice and _STEPS times it; the size kept gets
 # through _SHARE of the most any size could.
 _SHARE, _STEPS = 0.95, 3
@@ -405,7 +406,7 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives", "threads", "watches_all", "places", "held")
+                 "outlives", "threads", "watches_all", "places", "held", "trip")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
@@ -413,6 +414,7 @@ class _Slot:
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
         self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
         self.watches_all = getattr(impl, "watches_all", False)
+        self.trip = 0.0  # seconds a task spends going to its worker and back, as last seen
         self.places = hasattr(impl, "hosts")
         self.held = [0, 0, 0]  # (cpu, gpu, mem_mb) its tasks asked for, where it says its `total`
 
@@ -916,10 +918,15 @@ class Engine:
         if slot.packs and status == DONE:
             # Seconds per chunk as seen from here, so with the trip to the worker and back: a
             # payload that is expensive to send is never mistaken for a short chunk.
-            took = max(time.perf_counter() - chunk.started, 1e-6) / (len(pack) if pack else 1)
+            took = max(time.perf_counter() - chunk.started, 1e-6)
+            if "seconds" in used:  # down at once, up warily: a worker's start-up is one long trip
+                trip = max(took - used["seconds"], 0.0)
+                slot.trip = trip if not slot.trip or trip < slot.trip else (slot.trip + trip) / 2
+            took /= len(pack) if pack else 1
             job.pace = took if took > job.pace else (job.pace + took) / 2  # slow down at once, speed up warily
             if not job.batch:
-                job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
+                task = max(_TASK_SECONDS, _TRIPS * slot.trip)
+                job.pack = max(1, min(int(task / job.pace), _PACK_MAX))
                 if job.elastic:
                     job.window = 2 * slot.impl.capacity * job.pack
             elif job.auto is not None:
