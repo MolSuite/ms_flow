@@ -479,6 +479,27 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         assert "worker process died" in died.error and pool.tasks < 1500 and engine.tokens.free[0] == 4
 
 
+class _FarPool(_CountingPool):
+    """A pool whose every task costs 10 ms to hand out, as a remote one's would."""
+
+    def submit(self, *args, **options):
+        time.sleep(0.01)
+        return super().submit(*args, **options)
+
+
+@pytest.mark.slow
+def test_where_a_task_costs_more_to_hand_out_more_chunks_share_it():
+    typical = {}
+    for pool in (_CountingPool(4), _FarPool(4)):
+        pool.sizes = []
+        with Engine(cpus=4, mem_mb=0) as engine:
+            engine.register("process", pool)
+            job = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.005} for i in range(2000)]), 120)
+            assert job.chunks_done == 2000
+        typical[type(pool)] = sorted(pool.sizes)[len(pool.sizes) // 2]  # a task's, past the start
+    assert typical[_CountingPool] < 40 <= typical[_FarPool], typical
+
+
 @pytest.mark.slow
 def test_a_task_that_needs_a_card_sees_the_one_it_holds(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5,7")  # what the queue gave the job
