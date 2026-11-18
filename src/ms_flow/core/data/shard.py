@@ -50,6 +50,7 @@ __all__ = [
     "Shard",
     "ShardWriter",
     "get_serializer",
+    "merge_shards",
     "register",
 ]
 
@@ -517,3 +518,42 @@ class Shard:
             f"base_id={self.base_id}, slot_count={self.slot_count}, "
             f"record_count={self.record_count})"
         )
+
+
+def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: dict[str, Any] | None = None) -> list[dict[str, int]]:
+    """Many shards into one file, each its own row group: ``sources`` are ``(path, ids)`` in
+    id order (``ids=None`` = the whole file), ``dest`` may be one of them. Returns each source's
+    ``base_id``, ``slot_count`` and ``record_count``, which is what its catalog row becomes.
+
+    What a worker writes per task (a shard, a prepared twin) is adopted into a big file by the
+    parent once the job is done; the file count is what a library of millions pays for.
+    Atomic like any `ShardWriter`: ``dest`` is replaced only once everything is written.
+    ponytail: records only — a source with a ``source_index`` column is refused, not merged
+    without it (nothing merges those today: the import already writes big files).
+    """
+    import pyarrow.parquet as pq
+
+    ranges: list[dict[str, int]] = []
+    writer: ShardWriter | None = None
+    try:
+        for path, ids in sources:
+            path = Path(path)
+            if "source_index" in pq.read_schema(path).names:
+                raise ValueError(f"{path}: merging a shard with a source_index column is not supported")
+            with Shard.open(path, ids=None if ids is None else (int(ids[0]), int(ids[1]))) as shard:
+                if writer is None:
+                    writer = ShardWriter(dest, dataset_id=shard.dataset_id, shard_id=0, base_id=shard.base_id,
+                                         kind=shard.kind, serializer=shard.serializer, slot_count=MAX_RECORDS,
+                                         metadata={**shard.metadata, **dict(metadata or {})})
+                for record in shard:
+                    writer.add(record.id, record.view())
+                writer.end_group()
+                ranges.append({"base_id": shard.base_id, "slot_count": shard.slot_count,
+                               "record_count": len(shard)})
+    except BaseException:
+        if writer is not None:
+            writer._discard()
+        raise
+    if writer is not None:
+        writer.close()
+    return ranges

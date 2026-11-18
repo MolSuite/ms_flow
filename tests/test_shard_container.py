@@ -219,3 +219,25 @@ def test_a_rewritten_file_is_not_read_through_a_stale_footer(tmp_path):
     os.utime(path, ns=(1, 1))  # same second on a coarse clock: the size still differs
     with Shard.open(path, ids=(0, 10)) as shard:
         assert len(shard) == 3
+
+
+def test_merge_shards_adopts_files_into_one_even_over_a_source(tmp_path):
+    from ms_flow.core.data.shard import merge_shards
+
+    big = tmp_path / "big.parquet"
+    with ShardWriter(big, dataset_id=uuid.UUID(int=7), shard_id=0, base_id=0, kind=PayloadKind.SDF,
+                     serializer=Serializer.UTF8, slot_count=MAX_RECORDS) as writer:
+        for lo in (0, 10):
+            for id_ in (lo, lo + 1):
+                writer.add(id_, f"mol-{id_}".encode())
+            writer.end_group()
+    late = _write(tmp_path / "late.parquet", [21], base_id=20, slot_count=5)
+    # A redone shard (late) joins the shards that were already merged, into the same file.
+    ranges = merge_shards([(big, (0, 10)), (big, (10, 20)), (late, None)], big, metadata={"merged": True})
+    assert ranges == [{"base_id": 0, "slot_count": 10, "record_count": 2},
+                      {"base_id": 10, "slot_count": 10, "record_count": 2},
+                      {"base_id": 20, "slot_count": 2, "record_count": 1}]
+    assert pq.ParquetFile(big).num_row_groups == 3
+    with Shard.open(big, ids=(20, 22)) as shard:
+        assert [r.load() for r in shard] == ["mol-21"] and shard.metadata["merged"] is True
+

@@ -127,6 +127,63 @@ def add_shards(project_db, rows: Iterable[Mapping[str, Any]], *, generation_id: 
         session.commit()
 
 
+def compact(project_db, generation_id: int) -> int:
+    """The whole-file shards of a generation (a worker's file per task) merged into big files,
+    one row group each, a file per scope and folder up to `MAX_RECORDS` ids. Returns how many
+    files went. For the parent once a step is done, before anything derives from its paths
+    (a twin named after a shard's file would be left behind).
+
+    Crash-safe in order: the big file is complete before a row points at it, and the small
+    files go only after the rows moved.
+    """
+    import json
+    from uuid import uuid4
+
+    import pyarrow.parquet as pq
+    from sqlmodel import select
+
+    from ms_flow.core.data.shard import MAX_RECORDS, METADATA_KEY, merge_shards
+    from ms_flow.core.database.project_models import CatalogShard
+
+    with project_db.get_session() as session:
+        rows = list(session.exec(select(CatalogShard).where(
+            CatalogShard.generation_id == int(generation_id), CatalogShard.base_id == None,  # noqa: E711 - SQL
+        )).all())
+    groups: dict[tuple[Any, str], list[tuple[int, int, Any]]] = {}
+    for row in rows:
+        path = Path(str(row.path))
+        header = json.loads(pq.read_metadata(path).metadata[METADATA_KEY])
+        groups.setdefault((row.scope, str(path.parent)), []).append(
+            (int(header["base_id"]), int(header["slot_count"]), row))
+    moved: dict[int, tuple[str, dict[str, int]]] = {}
+    for (_scope, folder), members in groups.items():
+        members.sort(key=lambda item: item[0])
+        files: list[list[tuple[int, int, Any]]] = []
+        for member in members:  # a new file when the id span would pass what one file holds
+            if not files or member[0] + member[1] - files[-1][0][0] > MAX_RECORDS:
+                files.append([])
+            files[-1].append(member)
+        for batch in files:
+            if len(batch) < 2:
+                continue  # one file already
+            dest = Path(folder) / f"merged_{uuid4().hex[:12]}{Path(str(batch[0][2].path)).suffix}"
+            ranges = merge_shards([(row.path, None) for _base, _slots, row in batch], dest)
+            moved.update({int(row.id): (str(dest), span) for (_b, _s, row), span in zip(batch, ranges)})
+    if not moved:
+        return 0
+    with project_db.get_session() as session:
+        old = set()
+        for row in session.exec(select(CatalogShard).where(CatalogShard.id.in_(list(moved)))).all():
+            dest, span = moved[int(row.id)]
+            old.add(str(row.path))
+            row.path, row.base_id, row.slot_count = dest, span["base_id"], span["slot_count"]
+            session.add(row)
+        session.commit()
+    for text in old:
+        Path(text).unlink(missing_ok=True)
+    return len(old)
+
+
 def _pinned(project_db, spec: QuerySpec | None) -> QuerySpec:
     """Any shard query, on the active generation. A spec that names one is left alone: that is
     how a redo reads its parent, and how a step counts what it has written so far."""
@@ -170,6 +227,6 @@ def record_count(project_db, spec: QuerySpec | None = None, *, whole: bool = Fal
 
 
 __all__ = [
-    "FIELDS", "TABLE", "activate_generation", "active_generation_id", "add_shards", "count",
+    "FIELDS", "TABLE", "activate_generation", "active_generation_id", "add_shards", "compact", "count",
     "create_generation", "record_count", "shard_spec", "shards",
 ]
