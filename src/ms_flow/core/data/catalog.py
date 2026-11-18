@@ -57,16 +57,21 @@ def create_generation(project_db, *, step: str, folder: str | Path = "", job_id:
         return int(row.id)
 
 
-def activate_generation(project_db, generation_id: int) -> None:
-    """Make one generation the library and forget its grandparent, rows and files.
+def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None:
+    """Make one generation the library and forget the ones outside the window, rows and files.
 
-    The switch is one UPDATE over a handful of generation rows; the shard rows are only
-    touched by the sweep of the generations outside the window.
+    ``on_drop(session, shards)``: the app's turn to clear what it keeps per shard (a prepared
+    twin...) before a generation goes, in the same transaction; it returns the paths of files
+    of its own to delete with the shards'. A generation the app still references through a
+    foreign key (docking receipts...) is kept as it is: what was computed on it stays readable,
+    and the next activation tries again once that reference is gone.
     """
+    from sqlalchemy.exc import IntegrityError
     from sqlmodel import select
 
     from ms_flow.core.database.project_models import CatalogShard, ShardGeneration
 
+    paths: set[str] = set()
     with project_db.get_session() as session:
         generations = {int(row.id): row for row in session.exec(select(ShardGeneration)).all()}
         target = generations.get(int(generation_id))
@@ -77,30 +82,35 @@ def activate_generation(project_db, generation_id: int) -> None:
             session.add(row)
         keep = {int(target.id)} | ({int(target.parent_id)} if target.parent_id is not None else set())
         doomed = [gen_id for gen_id in generations if gen_id not in keep]
-        # A file holds many shards: it goes only when no surviving row points at it.
-        paths = set(session.exec(
-            select(CatalogShard.path).where(CatalogShard.generation_id.in_(doomed))
-        ).all()) - set(session.exec(
-            select(CatalogShard.path).where(CatalogShard.generation_id.in_(keep))
-        ).all()) if doomed else set()
-        for gen_id in keep:
-            # Its parent is about to go: cut the link first, or the delete trips the foreign key.
-            if generations[gen_id].parent_id is not None and int(generations[gen_id].parent_id) in doomed:
-                generations[gen_id].parent_id = None
-                session.add(generations[gen_id])
+        for row in generations.values():
+            # Its parent may go: cut the link first, or that delete trips the foreign key.
+            if row.parent_id is not None and int(row.parent_id) in doomed:
+                row.parent_id = None
+                session.add(row)
         session.flush()
-        # ponytail: an app row that references a doomed shard (a prepared twin, a receipt) makes
-        # this delete fail on its foreign key, as it did when the catalog was the app's. Give
-        # this an on_drop(shard_ids) hook when a library is rewritten three times after docking.
+        dropped: set[str] = set()
         for gen_id in doomed:
-            for shard in session.exec(select(CatalogShard).where(CatalogShard.generation_id == gen_id)).all():
-                session.delete(shard)
-            session.delete(generations[gen_id])
+            shards = list(session.exec(select(CatalogShard).where(CatalogShard.generation_id == gen_id)).all())
+            savepoint = session.begin_nested()
+            try:
+                extra = list(on_drop(session, shards) or ()) if on_drop is not None and shards else []
+                for shard in shards:
+                    session.delete(shard)
+                session.delete(generations[gen_id])
+                session.flush()
+            except IntegrityError:
+                savepoint.rollback()  # still referenced: kept, retried at the next activation
+                continue
+            savepoint.commit()
+            dropped |= {str(shard.path or "") for shard in shards} | {str(path) for path in extra}
+        # A file holds many shards: it goes only when no surviving row points at it.
+        paths = dropped - set(session.exec(select(CatalogShard.path)).all())
         session.commit()
     # Files last: a row that survives a missing file is a bug you can see, a file that survives
     # its row is an orphan nothing will ever look at again.
     for text in paths:
-        Path(str(text or "")).unlink(missing_ok=True)
+        if text:
+            Path(text).unlink(missing_ok=True)
 
 
 def add_shards(project_db, rows: Iterable[Mapping[str, Any]], *, generation_id: int | None) -> None:

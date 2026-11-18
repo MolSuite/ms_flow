@@ -1,4 +1,6 @@
 """The shard catalog: generations (window of two), registered shards, reads already narrowed."""
+from pathlib import Path
+
 from ms_flow.core.data import catalog
 from ms_flow.core.data.exclusions import exclude
 from ms_flow.core.database import ProjectStore
@@ -54,5 +56,42 @@ def test_activating_forgets_the_grandparent_and_its_files(tmp_path):
         assert [p.exists() for p in files] == [False, True, True]
         assert catalog.count(db, catalog.shard_spec(generation_id=gen - 1), whole=True) == 1
         assert catalog.count(db, catalog.shard_spec(generation_id=gen - 2), whole=True) == 0
+    finally:
+        db.disconnect()
+
+
+def test_a_generation_the_app_still_references_is_kept_and_on_drop_clears_the_rest(tmp_path):
+    db = _project(tmp_path)
+    try:
+        with db.get_session() as session:
+            session.connection().exec_driver_sql(
+                "CREATE TABLE receipts (shard_id INTEGER REFERENCES ms_shards(id))")
+            session.commit()
+        files, dropped = [], []
+        for step in range(4):
+            gen = catalog.create_generation(db, step=f"s{step}")
+            path = tmp_path / f"g{step}.parquet"
+            path.write_bytes(b"x")
+            files.append(path)
+            catalog.add_shards(db, [{"scope": 1, "path": str(path), "n_records": 1}], generation_id=gen)
+            if step == 0:  # something computed on the first generation: it must survive
+                (shard,) = catalog.shards(db, catalog.shard_spec(generation_id=gen), whole=True)
+                with db.get_session() as session:
+                    session.connection().exec_driver_sql(f"INSERT INTO receipts VALUES ({shard['id']})")
+                    session.commit()
+            twin = tmp_path / f"twin{step}"
+            twin.write_bytes(b"x")
+
+            def on_drop(_session, shards):
+                dropped.extend(shard.path for shard in shards)
+                return [tmp_path / f"twin{int(Path(shards[0].path).stem[1:])}"]
+
+            catalog.activate_generation(db, gen, on_drop=on_drop)
+        # g0 is pinned by its receipt, g1 went (with its twin), g2 + g3 are the window.
+        assert [p.exists() for p in files] == [True, False, True, True]
+        assert dropped.count(str(files[1])) == 1 and not (tmp_path / "twin1").exists()
+        assert (tmp_path / "twin0").exists()
+        assert catalog.count(db, catalog.shard_spec(generation_id=1), whole=True) == 1
+        assert catalog.active_generation_id(db) == 4
     finally:
         db.disconnect()
