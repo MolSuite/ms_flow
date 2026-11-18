@@ -46,11 +46,15 @@ CANCELED = "canceled"
 PENDING_CHUNK, RUNNING_CHUNK, DONE_CHUNK, FAILED_CHUNK = range(4)
 
 _PER_CHUNK = ("_cpu_required", "_gpu_required", "_mem_mb")  # in the order of a cost
-# Chunks shorter than this share a task, as many as it takes to fill it and at most _PACK_MAX.
-# A task costs about 1 ms to hand out with every core busy, so 100 ms keeps that near 1 %.
-# ponytail: one figure for every executor; let the executor name its own when a remote one,
-# whose tasks cost far more than a local process's, starts packing.
-_TASK_SECONDS, _PACK_MAX = 0.1, 64
+# Chunks shorter than a task should last share one, as many as it takes to fill it and at most
+# _PACK_MAX. A task lasts _TRIPS times what handing it out and back costs on its executor
+# (measured: the trip less what the worker says it ran), so that cost stays near 1 %; never
+# under _TASK_SECONDS, which is that for a local process (~1 ms a task with every core busy).
+# ponytail: _PACK_MAX also caps a remote executor's packs; raise it if its trips stay above 1 %.
+_TASK_SECONDS, _TRIPS, _PACK_MAX = 0.1, 100, 64
+# Autobatch: one task of the job's size, then of twice and _STEPS times it; the size kept gets
+# through _SHARE of the most any size could.
+_SHARE, _STEPS = 0.95, 3
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
 _RECOUNT = 30.0  # seconds between two counts of what a source has left
@@ -174,7 +178,7 @@ class _Job:
                  "flying", "cpu_used", "seq", "ready", "room", "hungry", "fed_all", "fatal", "error",
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "came_after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
-                 "retried", "batch", "batched", "source", "fine", "needs", "key", "label", "thread",
+                 "retried", "batch", "batched", "auto", "source", "fine", "needs", "key", "label", "thread",
                  "states", "executor", "usage", "held", "far", "canceling")
 
     def used(self) -> dict:
@@ -254,6 +258,16 @@ def _room(slot: _Slot, needs) -> bool:
     return total is None or all(h + n <= t for h, n, t in zip(slot.held, needs, total) if n)
 
 
+def _at_once(slot: _Slot, needs, tokens=None) -> int:
+    """How many tasks of `needs` the executor runs side by side: on Ray two GPUs run two GPU tasks,
+    however many CPUs the cluster has; on an executor of the engine's `tokens`, as many as they hold."""
+    total, most = getattr(slot.impl, "total", None) or tokens, slot.impl.capacity
+    for n, t in zip(needs, total or ()):
+        if n:
+            most = min(most, int(t // n))
+    return max(1, most)
+
+
 def _take(slot: _Slot, needs, sign: int) -> None:
     if getattr(slot.impl, "total", None) is not None:
         slot.held = [h + sign * n for h, n in zip(slot.held, needs)]
@@ -270,6 +284,105 @@ def _hold(job: _Job, needs, sign: int) -> None:
     job.held = [cpu, gpu, now, reads]
     job.usage["peak_cpu"] = max(job.usage["peak_cpu"], cpu)
     job.usage["peak_gpu"] = max(job.usage["peak_gpu"], gpu)
+
+
+class _Autobatch:
+    """How many chunks go to each task of a job, worked out from how long its tasks take.
+
+    Nearly anything run in tasks takes a fixed time per task (a program that starts, maps to
+    build, a trip to another machine) and a time per chunk: t(n) = a + b·n, so a task of n gets
+    through n / (a + b·n) chunks a second, a rectangular hyperbola that nears 1/b and never gets
+    there. One task of each size is timed: the job's `start` (its guess of a good size; the
+    floor otherwise), then twice and three times it, each only if it would end under `seconds`
+    (0: no limit) and the ceiling. a and b come from the sizes each worker took (two cards of
+    different speed are two lines), and the size kept is one for all of them: the smallest
+    whose chunks a second, summed over the workers, reach `_SHARE` of the most (19·a/b for 95 %
+    with one), never under `start`. Past it a bigger task gains little and only makes the end
+    of the job wait longer on the last ones. Nothing here knows what a chunk is. No task is
+    ever stopped for taking long: one past `seconds` shrinks the ones that follow, and a lost
+    task (its worker died: out of memory, say) halves them.
+    """
+
+    # ponytail: one fit from the sizes timed, then frozen; a refit as the job goes if work drifts.
+    __slots__ = ("floor", "start", "size", "ceiling", "seconds", "points", "settled")
+
+    def __init__(self, floor: int, ceiling: int = 0, seconds: float = 0, start: int = 0):
+        self.floor = max(1, int(floor))
+        self.ceiling = self._fit(ceiling) if ceiling else 0
+        self.size = self.start = min(self._fit(start or self.floor), self.ceiling or start or self.floor)
+        self.seconds = float(seconds or 0)
+        self.points, self.settled = {}, False  # by worker: (n, seconds) of its tasks
+
+    def _fit(self, n: float) -> int:
+        """`n` down to whole floors, and never under one: the floor is the job's unit."""
+        return self.floor * max(1, int(n // self.floor))
+
+    def _keep(self, n: float) -> None:
+        if self.ceiling:
+            n = min(n, self.ceiling)
+        self.size, self.settled = self._fit(n), True
+
+    def seen(self, n: int, took: float, where: str = "") -> None:
+        """A task of `n` chunks ended in `took` seconds on `where` (a worker: host and cards)."""
+        took = max(took, 1e-6)
+        known = self.points.setdefault(where, [])
+        known.append((n, took))
+        if self.seconds and took > self.seconds:  # it ran on; the next ones are made to fit
+            self._keep(min(self.size, n * self.seconds / took))
+            return
+        if self.settled or n != self.size:
+            return  # a tail task, or one sent before the size changed
+        bigger = n + self.start
+        line = _line(known)
+        # how long it would take: along the line once two sizes are known, else in proportion
+        foretold = line[0] + line[1] * bigger if line and line[1] > 0 else took * bigger / n
+        if bigger <= _STEPS * self.start and bigger <= (self.ceiling or bigger) and not (
+                self.seconds and foretold > self.seconds):
+            self.size = bigger
+        else:
+            self._keep(self._target())
+
+    def _target(self) -> float:
+        """The smallest size whose chunks a second, summed over the workers' lines, reach
+        `_SHARE` of the most; as big as allowed when one gets no dearer with more chunks."""
+        lines = [line for line in map(_line, self.points.values()) if line]
+        largest = max(n for points in self.points.values() for n, _ in points)
+        if not lines:
+            return self.size
+        if any(per <= 0 for _, per in lines):
+            return self.ceiling or largest
+        lines = [(max(fixed, 0.0), per) for fixed, per in lines]
+        if not any(fixed for fixed, _ in lines):  # nothing to spread: the job's size is as good as any
+            return self.start
+        most = sum(1 / per for _, per in lines)
+        far = max(fixed / per for fixed, per in lines) * _SHARE / (1 - _SHARE)  # each one's 95 % is there
+        if self.seconds:
+            far = min(far, min((self.seconds - fixed) / per for fixed, per in lines))
+        n = self.start
+        while n < far and sum(n / (fixed + per * n) for fixed, per in lines) < _SHARE * most:
+            n += self.floor
+        return max(self.start, min(n, far))
+
+    def lost(self) -> None:
+        """A task's worker died: whatever the cause, a smaller task is the safer one."""
+        self._keep(self.size / 2)
+
+
+def _line(points):
+    """(a, b) of the line t = a + b·n through `points` (seconds a task, a chunk); None with one size."""
+    count = len(points)
+    mean_n = sum(n for n, _ in points) / count
+    mean_t = sum(t for _, t in points) / count
+    spread = sum((n - mean_n) ** 2 for n, _ in points)
+    if not spread:
+        return None
+    per = sum((n - mean_n) * (t - mean_t) for n, t in points) / spread
+    return mean_t - per * mean_n, per
+
+
+def _told(used: dict) -> str:
+    """What a task used, for the log."""
+    return f"cpu {used['cpu']:.1f}, ram {used.get('mb', 0)} MB peak" if "cpu" in used else "?"
 
 
 class _Chunk:
@@ -293,7 +406,7 @@ class _Slot:
     """A registered executor and what the loop tracks about it."""
 
     __slots__ = ("impl", "inflight", "suspects", "isolating", "packs", "kills", "killing", "tells", "costs",
-                 "outlives", "threads", "watches_all", "places", "held")
+                 "outlives", "threads", "watches_all", "places", "held", "trip")
 
     def __init__(self, impl):
         self.impl, self.inflight, self.suspects, self.isolating = impl, 0, deque(), False
@@ -301,6 +414,7 @@ class _Slot:
         self.tells, self.costs = hasattr(impl, "progress"), getattr(impl, "wants_cost", False)
         self.outlives, self.threads = getattr(impl, "outlives", False), getattr(impl, "threads", False)
         self.watches_all = getattr(impl, "watches_all", False)
+        self.trip = 0.0  # seconds a task spends going to its worker and back, as last seen
         self.places = hasattr(impl, "hosts")
         self.held = [0, 0, 0]  # (cpu, gpu, mem_mb) its tasks asked for, where it says its `total`
 
@@ -397,8 +511,8 @@ class Engine:
                window: int | None = None, max_cpu: float | None = None, priority: int = 0,
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
-               batch: int | None = None, batched: bool = False, progress: bool | None = None, origin=None,
-               label=None, thread: bool = False,
+               batch: int | None = None, batched: bool = False, autobatch: bool | int | None = None,
+               progress: bool | None = None, origin=None, label=None, thread: bool = False,
                on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -413,6 +527,14 @@ class Engine:
         `batch` settles it instead: that many chunks to a task, fewer only in the last one and
         where chunks with different needs meet. With `batched`, `fn` takes the list of payloads
         of a task and returns one result for each, in order; if it raises, all of them failed.
+        `autobatch` lets the executor size the tasks, in whole multiples of `batch` (the least the
+        job takes to one): it times the job's size, then twice and three times it while bigger
+        tasks pay, works out the fixed and the per-chunk cost, and keeps the size that gets near
+        the most chunks a second for the rest of the job, never under the job's size. An int is
+        that size (the job's guess of a good one; `batch` otherwise). None: as
+        the executor says (its `autobatch`, with `batch_max` and `task_seconds`); a task is never
+        stopped for running long, the ones after it are made to fit `task_seconds`. Without
+        `batch` the unit is one.
         A chunk's key is `content_key(payload)`, or the `_key` of a dict payload.
         `on_result(key, result)`, `on_error(key, error)` and `on_terminal(snapshot)` run on
         the delivery thread, in order; a chunk counts as done once `on_result` returns.
@@ -462,7 +584,10 @@ class Engine:
             raise ValueError(f"unknown executor {executor!r}; registered: {sorted(self._executors)}")
         if on_result is not None and on_results is not None:
             raise ValueError("on_result or on_results, not both")
-        batch = batch or getattr(slot.impl, "batch", None)
+        start = 0 if autobatch is None or type(autobatch) is bool else int(autobatch)
+        if autobatch is None or start:  # the executor's own `batch` (a queue's) is how it works, not a floor
+            autobatch = bool(batch) and getattr(slot.impl, "autobatch", False)
+        batch = batch or getattr(slot.impl, "batch", None) or (1 if autobatch else None)
         if (batch or batched) and not slot.packs:
             raise ValueError(f"executor {executor!r} takes one chunk to a task")
         if timeout is not None and not slot.kills:
@@ -497,6 +622,12 @@ class Engine:
         job.thread = thread and slot.threads
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
         job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
+        job.auto = _Autobatch(batch, getattr(slot.impl, "batch_max", 0), getattr(slot.impl, "task_seconds", 0),
+                              start) if autobatch else None
+        if job.auto is not None:
+            job.pack = job.auto.size
+            if job.elastic:
+                job.window = max(job.window, 2 * slot.impl.capacity * job.pack)
         job.priority, job.on_result, job.on_error, job.on_terminal = priority, on_result, on_error, on_terminal
         job.on_results, job.on_finish, job.finishing = on_results, on_finish, False
         job.status, job.chunks = WAITING if job.after else RUNNING, chunks
@@ -741,9 +872,9 @@ class Engine:
         for job in (*self._waiting, *self._active):  # waiting ones first: they are stopped, not failed
             self._on_stop_job(job, INTERRUPTED)
 
-    def _chunk_done(self, chunk, status, result, error, peak_mb=0) -> None:
+    def _chunk_done(self, chunk, status, result, error, used=0) -> None:
         """What executors call. Any thread."""
-        self._events.put((self._on_done, chunk, status, result, error, peak_mb))
+        self._events.put((self._on_done, chunk, status, result, error, used))
 
     def _part_done(self, chunk, index, status, result, error) -> None:
         """What executors call for one chunk of a task that is still running. Any thread."""
@@ -760,7 +891,11 @@ class Engine:
             member.attempt = chunk.attempt
         self._chunk_ended(member, status, result, error)
 
-    def _on_done(self, chunk: _Chunk, status: str, result, error, peak_mb: int) -> None:
+    def _on_done(self, chunk: _Chunk, status: str, result, error, used) -> None:
+        # `used`: what the task used, as `_Usage` tells it; an executor that cannot tell gives its
+        # peak of memory in MB, or 0
+        used = used if isinstance(used, dict) else {"mb": used or 0}
+        peak_mb = used.get("mb", 0)
         job = chunk.job
         slot = job.slot
         slot.inflight -= 1
@@ -783,12 +918,32 @@ class Engine:
         if slot.packs and status == DONE:
             # Seconds per chunk as seen from here, so with the trip to the worker and back: a
             # payload that is expensive to send is never mistaken for a short chunk.
-            took = max(time.perf_counter() - chunk.started, 1e-6) / (len(pack) if pack else 1)
+            took = max(time.perf_counter() - chunk.started, 1e-6)
+            if "seconds" in used:  # down at once, up warily: a worker's start-up is one long trip
+                trip = max(took - used["seconds"], 0.0)
+                slot.trip = trip if not slot.trip or trip < slot.trip else (slot.trip + trip) / 2
+            took /= len(pack) if pack else 1
             job.pace = took if took > job.pace else (job.pace + took) / 2  # slow down at once, speed up warily
             if not job.batch:
-                job.pack = max(1, min(int(_TASK_SECONDS / job.pace), _PACK_MAX))
+                task = max(_TASK_SECONDS, _TRIPS * slot.trip)
+                job.pack = max(1, min(int(task / job.pace), _PACK_MAX))
                 if job.elastic:
                     job.window = 2 * slot.impl.capacity * job.pack
+            elif job.auto is not None:
+                settled, was, n = job.auto.settled, job.auto.size, len(pack) if pack else 1
+                job.auto.seen(n, took * n, used.get("where", ""))
+                job.pack = job.auto.size
+                log.info("job %s: task of %d on %s, %.1f s: %s", job.id, n, used.get("where") or "?", took * n,
+                         _told(used))
+                if job.elastic:  # never smaller: what is already read ahead stays readable
+                    job.window = max(job.window, 2 * slot.impl.capacity * job.pack)
+                if job.auto.settled and not settled:
+                    log.info("job %s: %d chunks to a task (autobatch, from %d)", job.id, job.pack, job.batch)
+                elif job.pack != was and not job.auto.settled:
+                    log.info("job %s: next size %d (autobatch)", job.id, job.pack)
+        if status == LOST and not chunk.spared and job.auto is not None:
+            job.auto.lost()
+            job.pack = job.auto.size
         if status == LOST and chunk.spared:  # it fell with a chunk the engine stopped
             for member in reversed(pack or (chunk,)):
                 if member is not None:
@@ -973,9 +1128,13 @@ class Engine:
                 or slot.killing):
             return False
         ready = job.ready
-        need = 1 if job.fed_all else job.batch or 1  # a batch of a set size waits until it is whole
+        # A batch of a set size waits until it is whole; a growing one until its current size is,
+        # or its tasks come out smaller than the size being tried and that size is never judged.
+        need = 1 if job.fed_all else min(job.pack, job.window) if job.auto is not None else job.batch or 1
         if len(ready) < need:
             job.hungry = True  # the feeder wakes the loop once that many are there...
+            if not job.room.is_set():
+                job.room.set()  # ...and may itself be waiting under a window since grown
             if len(ready) < need:  # ...unless they arrived in between
                 return False
         chunk = ready[0]
@@ -992,8 +1151,12 @@ class Engine:
         if cost is None or self.tokens.ever_fits(cost):
             if job.pack > 1 or job.batched:  # the ones behind it with the same needs share its task
                 pack, size = [chunk], job.pack
-                if job.fed_all and not job.batch:  # the tail is shared out, or the last tasks take it all and workers idle
-                    size = min(size, -(-(len(ready) + 1) // slot.impl.capacity))
+                if job.fed_all and (not job.batch or job.auto is not None):
+                    # the tail is shared out, or the last tasks take it all and workers idle
+                    share = -(-(len(ready) + 1) // _at_once(slot, chunk.needs, self.tokens.total if slot.impl.uses_tokens else None))
+                    if job.batch:  # in whole floors: the least a task of the job may take
+                        share = job.batch * -(-share // job.batch)
+                    size = min(size, share)
                 while (len(pack) < size and job.open < job.window and ready and ready[0].cost == cost
                        and ready[0].needs == chunk.needs):
                     pack.append(ready.popleft())

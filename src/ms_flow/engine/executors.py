@@ -5,9 +5,10 @@ The engine knows an executor only through this contract:
 - `capacity`: how many chunks it holds at once.
 - `uses_tokens`: whether its chunks spend the engine's local CPU, GPU and memory.
 - `bind(on_done)`: called once, at registration. The executor then calls
-  `on_done(tag, status, result, error, peak_mb)` exactly once per submitted chunk, from
-  whichever thread of the main process learns that the chunk ended. Nothing is polled
-  and nothing travels to the workers.
+  `on_done(tag, status, result, error, used)` exactly once per submitted chunk, from
+  whichever thread of the main process learns that the chunk ended. `used` is what the task
+  used, the dict `_Usage.report()` gives (or its peak of memory in MB, or 0, when it cannot
+  tell). Nothing is polled and nothing travels to the workers.
 - `submit(fn, payload, tag) -> handle`: `tag` is opaque and comes back in `on_done`.
 - `cancel(handle)`: best effort; a chunk that already started runs to its end.
 - `shutdown()`.
@@ -124,6 +125,7 @@ class ProcessExecutor:
     """
 
     uses_tokens = threads = watches_all = True  # watching: a float in a file the worker has mapped
+    autobatch, batch_max, task_seconds = True, 4096, 0.0  # see `Engine.submit(autobatch=)`
 
     def __init__(self, max_workers: int, idle: float | None = 60.0, gpus: int = 0):
         from loky.process_executor import BrokenProcessPool, ProcessPoolExecutor
@@ -195,15 +197,17 @@ class ProcessExecutor:
         if index is not None:
             self._slots.free(index)
         status, value, error = _outcome(future, self._lost)
-        result, peak_mb = value if status == DONE else (None, 0)
-        self._on_done(tag, status, result, error, peak_mb)
+        result, used = value if status == DONE else (None, 0)
+        self._on_done(tag, status, result, error, used)
 
     def _landed(self, tag, index, future) -> None:
         if index is not None:
             self._slots.free(index)
         # ponytail: no peak of memory. The process is not the task's, and the program it runs
         # is not measured: its `Popen` would have to be waited with `os.wait4`.
-        self._on_done(tag, *future.result(), 0)
+        status, value, error = future.result()
+        result, used = value if status == DONE else (None, 0)
+        self._on_done(tag, status, result, error, used)
 
     def cancel(self, handle) -> None:
         host = getattr(handle, "host", None)
@@ -262,6 +266,7 @@ class RayExecutor:
     # chunks ask for more CPUs than Ray has free spends part of it waiting there. The task
     # saying when it began, through the tally, is what would count only the run.
     uses_tokens, wants_cost = False, True
+    autobatch, batch_max, task_seconds = True, 4096, 0.0  # see `Engine.submit(autobatch=)`
 
     def __init__(self, address: str | None = None, capacity: int | None = None, shared: bool | None = None,
                  names: dict | None = None, **init):
@@ -327,6 +332,8 @@ class RayExecutor:
                 call = partial(_told, self._tally, index, call)
             if self._names is not None:
                 call = partial(_placed, self._tally, index, call)
+        if cost[1]:
+            call = partial(_on_cards, None, call)  # Ray names the cards: only which ones, for the log
         ref = run.remote(call, fn, payload)
         self._flying.add(ref)
         ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
@@ -401,7 +408,7 @@ class RayExecutor:
             if status != DONE:  # as when a pool is killed: the engine knows which one it was after
                 status, error = LOST, error or "stopped with its worker"
         if status == DONE and not self.shared:
-            (result, peak_mb), root, files = value
+            (result, used), root, files = value
 
             def here(text):  # a path of the node's directory, as the one it stands for here
                 if not text.startswith(root + os.sep):
@@ -415,9 +422,9 @@ class RayExecutor:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with open(target, "wb") as file:
                     file.write(data)
-            value = swap(result, here, str), peak_mb
-        result, peak_mb = value if status == DONE else (None, 0)
-        self._on_done(tag, status, result, error, peak_mb)
+            value = swap(result, here, str), used
+        result, used = value if status == DONE else (None, 0)
+        self._on_done(tag, status, result, error, used)
 
     def cancel(self, handle) -> None:
         self._ray.cancel(handle)
@@ -576,7 +583,9 @@ def _serve(conn, workers: int) -> None:
 
 def _hosted(task):
     call, *task = pickle.loads(task)
-    return call(*task)[0]
+    result, used = call(*task)
+    # ponytail: where and how long only; cores and memory would be the process's, shared by its threads.
+    return result, {"where": used["where"], "seconds": used["seconds"]}
 
 
 # --- Worker side --------------------------------------------------------------------
@@ -620,13 +629,43 @@ def _watched(path, index, call, fn, payload):
         _task.at = None
 
 
+class _Usage:
+    """What the task in this block used: where it ran (host, and its cards), its seconds, the
+    cores it kept busy (its CPU time and that of the programs it waited for, over its seconds)
+    and `mb`, `_peak_mb()`. Two clock reads and no thread: cheap enough for every task.
+    """
+
+    # ponytail: no RAM/VRAM sampling. Tried (nvidia-smi + psutil on a thread): memory never
+    # bound the size in the GPU runs and the guesses cost throughput; a lost task halves it.
+
+    def __enter__(self):
+        self.began, self.cpu = time.perf_counter(), sum(os.times()[:4])
+        return self
+
+    def __exit__(self, *_):
+        self.seconds = time.perf_counter() - self.began
+        self.cpu = (sum(os.times()[:4]) - self.cpu) / max(self.seconds, 1e-6)
+
+    def report(self) -> dict:
+        cards = getattr(_task, "cards", None)
+        return {"where": socket.gethostname() + (f":{cards}" if cards else ""), "seconds": self.seconds,
+                "cpu": self.cpu, "mb": _peak_mb()}
+
+
 def _call(fn, payload):
-    return fn(payload), _peak_mb()
+    with _Usage() as used:
+        result = fn(payload)
+    return result, used.report()
 
 
 def _on_cards(cards, call, *task):
-    os.environ["CUDA_VISIBLE_DEVICES"] = cards  # what the programs it starts see too
-    return call(*task)
+    if cards is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cards  # what the programs it starts see too
+    _task.cards = os.environ.get("CUDA_VISIBLE_DEVICES") or None  # on Ray, the cards it gave: for the log
+    try:
+        return call(*task)
+    finally:
+        _task.cards = None
 
 
 def _apply(call, fn, payload):
@@ -742,6 +781,12 @@ def _apply_far(call, fn, payload):
 
 
 def _call_many(fn, payloads):
+    with _Usage() as used:
+        outcomes = _each(fn, payloads)
+    return outcomes, used.report()
+
+
+def _each(fn, payloads):
     outcomes = []
     for payload in payloads:
         try:
@@ -751,17 +796,18 @@ def _call_many(fn, payloads):
         at = getattr(_task, "at", None)
         if at is not None:
             at[1] = _slots[1][at[0]] = len(outcomes)
-    return outcomes, _peak_mb()
+    return outcomes
 
 
 def _call_whole(fn, payloads):
     at = getattr(_task, "at", None)
     if at is not None:
         at[2] = len(payloads)
-    results = list(fn(payloads))
+    with _Usage() as used:
+        results = list(fn(payloads))
     if len(results) != len(payloads):
         raise ValueError(f"{len(results)} results for {len(payloads)} payloads: a batched function returns one for each")
-    return [(result, None) for result in results], _peak_mb()
+    return [(result, None) for result in results], used.report()
 
 
 def _peak_mb() -> int:

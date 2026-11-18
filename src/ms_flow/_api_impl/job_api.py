@@ -114,17 +114,17 @@ def build_executor(name: str, settings, host_env=None):
         # ponytail: memory is left to Ray, which takes its share of what the machine has.
         others = [host for host in hosts if host.address]
         if not others:
-            return RayExecutor(None, num_cpus=cpus, num_gpus=gpus)
+            return _batching(RayExecutor(None, num_cpus=cpus, num_gpus=gpus), config)
         from ms_flow.ray_hosts import RayOverHosts
 
         if host_env is None and not all(host.env for host in others):
             raise ValueError(f"a host of `executors.{name}` has no `env` and nothing prepares it: see `Workspace.host_env`")
         # Nothing of a Ray started here outlives its session: nobody to ask whether it is busy.
-        return RayOverHosts([host.address for host in others],
-                            [host.env or host_env(host.address, None) for host in others],
-                            limits=[(host.cpus, host.gpus, host.memory_gb) for host in others],
-                            names=[name for name in config.hosts if settings.hosts[name].address],
-                            num_cpus=cpus, num_gpus=gpus)
+        return _batching(RayOverHosts([host.address for host in others],
+                                      [host.env or host_env(host.address, None) for host in others],
+                                      limits=[(host.cpus, host.gpus, host.memory_gb) for host in others],
+                                      names=[name for name in config.hosts if settings.hosts[name].address],
+                                      num_cpus=cpus, num_gpus=gpus), config)
     if config.kind == "queue":
         from ms_flow.remote import TEMPLATES, RemoteExecutor
         from ms_flow.site_script import RESOURCES
@@ -142,7 +142,14 @@ def build_executor(name: str, settings, host_env=None):
                               keep_after=host.keep_after, grow=_grow(config))
     from ms_flow.engine import ProcessExecutor
 
-    return ProcessExecutor(_here(hosts[0])[0])
+    return _batching(ProcessExecutor(_here(hosts[0])[0]), config)
+
+
+def _batching(executor, config):
+    """`executor` growing the tasks of its jobs as `config` says (see `Engine.submit(autobatch=)`)."""
+    executor.autobatch, executor.batch_max, executor.task_seconds = (
+        config.autobatch, config.batch_max, config.task_seconds)
+    return executor
 
 
 def _retake(executor, settings, name: str) -> None:

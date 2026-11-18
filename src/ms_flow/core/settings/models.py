@@ -127,6 +127,18 @@ class ExecutorConfig(BaseModel):
     poll_seconds: float = _asked(30, "how often the queue is asked.", gt=0)
     shared_disk: Optional[bool] = _of(
         "queue", None, "whether the other side sees the disk of this machine. Unset: only on `local`.")
+    # How the tasks of a job that names a `batch` grow (`loky`, `ray`); see `Engine.submit(autobatch=)`.
+    autobatch: bool = Field(
+        default=True, description="`loky`, `ray`: a job that says how many elements a task takes at least gets "
+                                  "bigger tasks while they get through more elements a second.")
+    batch_max: int = Field(
+        default=4096, ge=1, title="Most elements in a task",
+        description="`loky`, `ray`: where autobatch stops growing a task. Past a few thousand elements a task "
+                    "rarely gets through them faster, it only takes longer to come back.")
+    task_seconds: float = Field(
+        default=0, ge=0, title="Longest task (s)",
+        description="`loky`, `ray`: autobatch keeps tasks under this. A task that runs longer is never stopped, "
+                    "the ones after it are made smaller. 0: no limit.")
 
 
 class DatabaseConfig(BaseModel):

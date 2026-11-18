@@ -197,8 +197,11 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
         return f"/envs/{address}"
 
     monkeypatch.setattr(remote, "RemoteExecutor", Far)
-    monkeypatch.setattr(ray_hosts, "RayOverHosts", lambda hosts, env, **init: (hosts, env, init))
-    monkeypatch.setattr(engine, "RayExecutor", lambda address, **init: (address, init))
+    class Said(tuple):  # what it was built with, and room for what the settings add to it
+        pass
+
+    monkeypatch.setattr(ray_hosts, "RayOverHosts", lambda hosts, env, **init: Said((hosts, env, init)))
+    monkeypatch.setattr(engine, "RayExecutor", lambda address, **init: Said((address, init)))
     monkeypatch.setattr(job_api, "_here", lambda local: (local.cpus, 1, None))
     settings = Settings(
         hosts={"local": {"cpus": 6}, "hpc": {"address": "login", "workdir": "scratch/jobs"},
@@ -216,6 +219,7 @@ def test_an_executor_is_built_from_its_hosts(monkeypatch):
     said = built("slurm2").said
     assert said["setup"] == "export A=1" and said["asks"]["cpus"] == 8 and said["asks"]["modules"] == ["load gcc"]
     assert built("alone") == (None, {"num_cpus": 6, "num_gpus": 1})  # a Ray of this machine alone
+    assert (built("alone").autobatch, built("alone").batch_max, built("alone").task_seconds) == (True, 4096, 0)
     assert built("lab") == (["pc2", "pc3"], ["/envs/pc2", "/envs/pc3"],
                             {"num_cpus": 6, "num_gpus": 1, "limits": [(-2, 0, 8), (0, 0, 0)], "names": ["pc2", "pc3"]})  # each host gives its share
     # the head here runs nothing
