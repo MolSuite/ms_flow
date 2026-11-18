@@ -677,7 +677,11 @@ result; it takes <code>params</code> too when it names it.</p>
 </tr>
 <tr>
 <td><code>batch=</code>, <code>batched=</code></td>
-<td>How many elements travel together; with <code>batched</code> the function takes the list and returns one result for each</td>
+<td>How many elements travel together, at least; with <code>batched</code> the function takes the list and returns one result for each</td>
+</tr>
+<tr>
+<td><code>autobatch=</code></td>
+<td>Whether the executor sizes the tasks in whole multiples of <code>batch</code>: it measures one task of the job's size, then one of twice and three times it (each only if it would end under the executor's <code>task_seconds</code>), works out each worker's fixed and per-element cost, and keeps one size for all of them: the smallest that gets 95 % of the most elements a second, never under the job's size. A lost task (its worker died) halves it. Each task's seconds, cores and peak RAM go to the log. A number is that size (default: the executor's <code>autobatch</code> setting, on). A task is never stopped for running long</td>
 </tr>
 <tr>
 <td><code>thread=</code></td>
