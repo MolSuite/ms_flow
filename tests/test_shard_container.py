@@ -1,10 +1,13 @@
 """The shard container: indexed access with holes, and a file that survives the trip."""
+import json
 import os
 import uuid
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from ms_flow.core.data import shard as shard_module
 from ms_flow.core.data.shard import (
     MAX_RECORDS,
     PayloadKind,
@@ -51,7 +54,7 @@ def test_slot_count_shrinks_to_the_last_id_written(tmp_path):
 
 
 def test_a_shard_bigger_than_the_cap_is_refused_up_front(tmp_path):
-    """The writer holds the shard in memory, so the range is capped when it opens."""
+    """The reader decodes a shard whole, so the range is capped when the writer opens."""
     with pytest.raises(ValueError, match="slot_count"):
         ShardWriter(
             tmp_path / "d.parquet",
@@ -138,3 +141,46 @@ def test_reading_a_shard_brings_no_database():
         "assert 'sqlalchemy' not in sys.modules and 'pyarrow' not in sys.modules"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_a_big_shard_streams_one_row_group_at_a_time(tmp_path, monkeypatch):
+    """Memory stays at one row group: the records reach the file as they come, not on close."""
+    monkeypatch.setattr(shard_module, "_ROW_GROUP_BYTES", 1000)
+    path = tmp_path / "big.parquet"
+    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
+                     serializer=Serializer.UTF8, slot_count=MAX_RECORDS) as writer:
+        for id_ in range(0, 2000, 2):
+            writer.add(id_, f"mol-{id_}".encode())
+        assert writer._tmp_path.stat().st_size > 0 and len(writer._ids) < 200
+    assert pq.ParquetFile(path).num_row_groups > 5
+    with Shard.open(path) as shard:
+        assert shard.record_count == 1000 and shard.slot_count == 1999
+        assert shard[1998].load() == "mol-1998" and 1997 not in shard
+
+
+def test_a_shard_written_in_one_go_still_opens(tmp_path):
+    """Shards from before streaming carry the header in the Arrow schema; they still read."""
+    header = {"format": "ms_flow-shard-parquet-v1", "dataset_id": str(uuid.UUID(int=0)),
+              "shard_id": 4, "base_id": 10, "slot_count": 2, "record_count": 2, "kind": 0,
+              "serializer": Serializer.RAW, "codec": 0, "metadata": {"old": True}}
+    table = pa.table({"id": pa.array([10, 11], pa.uint64()), "record": pa.array([b"a", b"b"])})
+    path = tmp_path / "old.parquet"
+    pq.write_table(table.replace_schema_metadata({b"ms_flow.shard": json.dumps(header).encode()}),
+                   path, compression="zstd", write_page_checksum=True)
+    with Shard.open(path) as shard:
+        assert shard.shard_id == 4 and shard.metadata == {"old": True}
+        assert shard[11].load() == b"b"
+
+
+def test_bad_text_leaves_no_shard_behind(tmp_path):
+    path = tmp_path / "bad.parquet"
+    with pytest.raises(pa.ArrowInvalid):
+        with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
+                         serializer=Serializer.UTF8, slot_count=8) as writer:
+            writer.add(0, b"\xff\xfe")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_empty_shard_is_a_valid_file(tmp_path):
+    with Shard.open(_write(tmp_path / "empty.parquet", [])) as shard:
+        assert len(shard) == 0 and shard.slot_count == 0
