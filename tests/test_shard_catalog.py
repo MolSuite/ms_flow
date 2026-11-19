@@ -95,3 +95,31 @@ def test_a_generation_the_app_still_references_is_kept_and_on_drop_clears_the_re
         assert catalog.active_generation_id(db) == 4
     finally:
         db.disconnect()
+
+
+def test_compact_merges_a_generations_files_into_one_per_scope(tmp_path):
+    from ms_flow.core.data.shard import PayloadKind, Serializer, Shard, ShardWriter
+
+    db = _project(tmp_path)
+    try:
+        gen = catalog.create_generation(db, step="chem")
+        rows = []
+        for scope, base in ((1, 0), (1, 4), (2, 0)):
+            path = tmp_path / f"s{scope}_{base}.mshard"
+            with ShardWriter(path, dataset_id=None, shard_id=0, base_id=base, kind=PayloadKind.SDF,
+                             serializer=Serializer.UTF8, slot_count=4, metadata={"step": "chem"}) as writer:
+                for id_ in (base, base + 2):  # holes stay holes
+                    writer.add(id_, f"r{scope}.{id_}".encode())
+            rows.append({"scope": scope, "shard_index": len(rows), "path": str(path), "n_records": 2})
+        catalog.add_shards(db, list(reversed(rows)), generation_id=gen)  # file order is not id order
+
+        assert catalog.compact(db, gen) == 2  # scope 2 is one file already
+        got = sorted(catalog.shards(db, catalog.shard_spec(generation_id=gen), whole=True),
+                     key=lambda r: (r["scope"], r["base_id"] or 0))
+        assert [(r["scope"], r["base_id"], r["slot_count"]) for r in got] == [(1, 0, 3), (1, 4, 3), (2, None, None)]
+        assert got[0]["path"] == got[1]["path"] and not Path(rows[0]["path"]).exists()
+        with Shard.open(got[1]["path"], ids=(4, 7)) as shard:
+            assert [r.load() for r in shard] == ["r1.4", "r1.6"] and shard.metadata["step"] == "chem"
+        assert catalog.compact(db, gen) == 0
+    finally:
+        db.disconnect()
