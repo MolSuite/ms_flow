@@ -152,6 +152,8 @@ def compact(project_db, generation_id: int) -> int:
     groups: dict[tuple[Any, str], list[tuple[int, int, Any]]] = {}
     for row in rows:
         path = Path(str(row.path))
+        if not path.is_file():
+            continue  # ponytail: left as it is; a missing file is the reader's error to raise
         header = json.loads(pq.read_metadata(path).metadata[METADATA_KEY])
         groups.setdefault((row.scope, str(path.parent)), []).append(
             (int(header["base_id"]), int(header["slot_count"]), row))
