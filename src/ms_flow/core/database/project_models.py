@@ -121,3 +121,36 @@ class PayloadDictionary(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     series: str = Field(default="", index=True)
     samples: int = 0
+
+
+class ShardGeneration(SQLModel, table=True):
+    """One rewrite of the sharded library (see `ms_flow.core.data.catalog`). Only one is active."""
+
+    __tablename__ = "ms_shard_generations"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    parent_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
+    step: str = ""  # what produced it: "import", or the step that rewrote the library
+    folder: str = ""
+    job_id: str = ""
+    is_active: bool = Field(default=False, index=True)
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
+
+
+class CatalogShard(SQLModel, table=True):
+    """One logical shard: ids ``base_id <= id < base_id + slot_count`` of ``path``. Many rows share
+    a file, each its own row group; NULL ids = the whole file. App tables reference ``id``."""
+
+    __tablename__ = "ms_shards"
+    __table_args__ = (UniqueConstraint("generation_id", "scope", "shard_index"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    generation_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
+    # What the app numbers records within (an import batch): an exclusion is keyed by (scope, id).
+    scope: Optional[int] = Field(default=None, index=True)
+    shard_index: int = Field(default=0, index=True)
+    path: str = ""
+    base_id: Optional[int] = None
+    slot_count: Optional[int] = None
+    n_records: int = 0
+    error: str = ""
