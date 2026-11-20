@@ -160,7 +160,7 @@ def _id_range(row: Mapping[str, Any], path_key: str) -> tuple[int, int]:
         return int(row["base_id"]), int(row["base_id"]) + int(row["slot_count"])
     from ms_flow.core.data.shard import METADATA_KEY, _footer
 
-    meta, _spans = _footer(Path(str(row[path_key])))
+    meta, _spans, _header = _footer(Path(str(row[path_key])))
     header = json.loads((meta.metadata or {})[METADATA_KEY].decode("utf-8"))
     return int(header["base_id"]), int(header["base_id"]) + int(header["slot_count"])
 

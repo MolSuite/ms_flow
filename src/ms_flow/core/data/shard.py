@@ -391,19 +391,20 @@ class Record:
         return f"Record(id={self.id}, index={self._index})"
 
 
-# path -> ((mtime_ns, size), footer, [(min id, max id) per row group]). A worker reading many
-# shards of one big file parses its footer once. ponytail: cleared whole past 256 files.
-_FOOTERS: dict[Path, tuple[tuple[int, int], Any, list[tuple[int, int]]]] = {}
+# path -> ((mtime_ns, size), footer, [(min id, max id) per row group], parsed header). A worker
+# reading many shards of one big file parses its footer and header once (a header lists every
+# group: parsing it per shard is quadratic). ponytail: cleared whole past 256 files.
+_FOOTERS: dict[Path, tuple[tuple[int, int], Any, list[tuple[int, int]], dict | None]] = {}
 
 
-def _footer(path: Path) -> tuple[Any, list[tuple[int, int]]]:
+def _footer(path: Path) -> tuple[Any, list[tuple[int, int]], dict | None]:
     import pyarrow.parquet as pq
 
     stat = path.stat()
     key = (stat.st_mtime_ns, stat.st_size)
     hit = _FOOTERS.get(path)
     if hit is not None and hit[0] == key:
-        return hit[1], hit[2]
+        return hit[1], hit[2], hit[3]
     meta = pq.read_metadata(path)
     column = meta.schema.names.index("id") if "id" in meta.schema.names else None
     spans = []
@@ -411,21 +412,38 @@ def _footer(path: Path) -> tuple[Any, list[tuple[int, int]]]:
         stats = None if column is None else meta.row_group(index).column(column).statistics
         has = stats is not None and stats.has_min_max
         spans.append((int(stats.min), int(stats.max)) if has else (0, (1 << 64) - 1))
+    raw = (meta.metadata or {}).get(METADATA_KEY)
+    header = None if raw is None else json.loads(raw.decode("utf-8"))
     if len(_FOOTERS) >= 256:
         _FOOTERS.clear()
-    _FOOTERS[path] = (key, meta, spans)
-    return meta, spans
+    _FOOTERS[path] = (key, meta, spans, header)
+    return meta, spans, header
 
 
 def file_groups(path: str | Path) -> list[tuple[int, int, int, int | None]]:
     """The shards of a file, ``(base_id, slot_count, record_count, scope)`` each, from its
-    header alone (footer cached). A file written before groups is one shard."""
-    meta, _spans = _footer(Path(path))
-    header = json.loads((meta.metadata or {})[METADATA_KEY].decode("utf-8"))
+    header alone (footer cached, and the list with it: callers must not mutate it). A file
+    written before groups is one shard."""
+    path = Path(path)
+    _meta, _spans, header = _footer(path)
+    if header is None:
+        raise KeyError(METADATA_KEY)
+    cached = _GROUPS.get(path)
+    if cached is not None and cached[0] is header:
+        return cached[1]
     groups = header.get("groups")
     if groups is None:
-        return [(int(header["base_id"]), int(header["slot_count"]), int(header["record_count"]), None)]
-    return [(int(g[0]), int(g[1]), int(g[2]), None if g[3] is None else int(g[3])) for g in groups]
+        result = [(int(header["base_id"]), int(header["slot_count"]), int(header["record_count"]), None)]
+    else:
+        result = [(int(g[0]), int(g[1]), int(g[2]), None if g[3] is None else int(g[3])) for g in groups]
+    if len(_GROUPS) >= 256:
+        _GROUPS.clear()
+    _GROUPS[path] = (header, result)
+    return result
+
+
+# path -> (the cached header it was built from, its groups): valid while that header is.
+_GROUPS: dict[Path, tuple[dict, list[tuple[int, int, int, int | None]]]] = {}
 
 
 class Shard:
@@ -463,7 +481,7 @@ class Shard:
 
         path = Path(path)
         try:
-            meta, spans = _footer(path)
+            meta, spans, header = _footer(path)
             with pq.ParquetFile(path, metadata=meta, page_checksum_verification=True) as parquet:
                 wanted = None if record_ids is None else sorted({int(i) for i in record_ids})
                 if ids is None and wanted is None:
@@ -479,9 +497,6 @@ class Shard:
                         table = table.filter(pc.is_in(table["id"], pa.array(wanted, type=table["id"].type)))
                     if ids is not None:
                         lo, hi = int(ids[0]), int(ids[1])
-                # The writer adds the header on close, so it lives in the file's key-value
-                # metadata, which shards written in one go (before streaming) also have.
-                raw = (meta.metadata or {}).get(METADATA_KEY)
         except (OSError, pa.ArrowException) as exc:  # a failed page CRC is an OSError
             with open(path, "rb") as fh:  # a missing file raises here, as itself
                 if fh.read(len(_LEGACY_MAGIC)) == _LEGACY_MAGIC:
@@ -489,9 +504,9 @@ class Shard:
                         f"{path}: a .mshard container from an older version; re-import the library"
                     ) from None
             raise ValueError(f"{path}: unreadable shard ({exc})") from exc
-        if raw is None:
+        # The writer adds the header on close, so it lives in the file's key-value metadata.
+        if header is None:
             raise ValueError(f"{path}: Parquet file without a shard header, not a shard")
-        header = json.loads(raw.decode("utf-8"))
         if header.get("format") != FORMAT:
             raise ValueError(f"{path}: unsupported shard format {header.get('format')!r}")
         if dataset_id is not None and _uuid(dataset_id) != uuid.UUID(str(header["dataset_id"])):
