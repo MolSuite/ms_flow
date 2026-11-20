@@ -97,14 +97,14 @@ def test_a_generation_the_app_still_references_is_kept_and_on_drop_clears_the_re
         db.disconnect()
 
 
-def test_compact_merges_a_generations_files_into_one_per_scope(tmp_path):
+def test_compact_merges_a_generations_files_scopes_together_ids_never(tmp_path):
     from ms_flow.core.data.shard import PayloadKind, Serializer, Shard, ShardWriter
 
     db = _project(tmp_path)
     try:
         gen = catalog.create_generation(db, step="chem")
         rows = []
-        for scope, base in ((1, 0), (1, 4), (2, 0)):
+        for scope, base in ((1, 0), (1, 4), (2, 0), (3, 8)):
             path = tmp_path / f"s{scope}_{base}.mshard"
             with ShardWriter(path, dataset_id=None, shard_id=0, base_id=base, kind=PayloadKind.SDF,
                              serializer=Serializer.UTF8, slot_count=4, metadata={"step": "chem"}) as writer:
@@ -113,11 +113,13 @@ def test_compact_merges_a_generations_files_into_one_per_scope(tmp_path):
             rows.append({"scope": scope, "shard_index": len(rows), "path": str(path), "n_records": 2})
         catalog.add_shards(db, list(reversed(rows)), generation_id=gen)  # file order is not id order
 
-        assert catalog.compact(db, gen) == 2  # scope 2 is one file already
+        # Scope 3 (ids 8-11) joins scope 1 in one file; scope 2 reuses ids 0-3, so it stays apart.
+        assert catalog.compact(db, gen) == 3
         got = sorted(catalog.shards(db, catalog.shard_spec(generation_id=gen), whole=True),
                      key=lambda r: (r["scope"], r["base_id"] or 0))
-        assert [(r["scope"], r["base_id"], r["slot_count"]) for r in got] == [(1, 0, 3), (1, 4, 3), (2, None, None)]
-        assert got[0]["path"] == got[1]["path"] and not Path(rows[0]["path"]).exists()
+        assert [(r["scope"], r["base_id"], r["slot_count"]) for r in got] == [
+            (1, 0, 3), (1, 4, 3), (2, None, None), (3, 8, 3)]
+        assert got[0]["path"] == got[1]["path"] == got[3]["path"] and not Path(rows[0]["path"]).exists()
         with Shard.open(got[1]["path"], ids=(4, 7)) as shard:
             assert [r.load() for r in shard] == ["r1.4", "r1.6"] and shard.metadata["step"] == "chem"
         assert catalog.compact(db, gen) == 0

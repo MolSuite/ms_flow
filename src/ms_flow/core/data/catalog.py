@@ -129,8 +129,9 @@ def add_shards(project_db, rows: Iterable[Mapping[str, Any]], *, generation_id: 
 
 def compact(project_db, generation_id: int) -> int:
     """The whole-file shards of a generation (a worker's file per task) merged into big files,
-    one row group each, a file per scope and folder up to `MAX_RECORDS` ids. Returns how many
-    files went. For the parent once a step is done, before anything derives from its paths
+    one row group each, up to `MAX_RECORDS` ids per file. Scopes share a file (a row says its
+    scope), ids never do: a shard whose ids another one in the file already holds — a second
+    import, which restarts at 0 — goes to another file. Returns how many files went. For the parent once a step is done, before anything derives from its paths
     (a twin named after a shard's file would be left behind).
 
     Crash-safe in order: the big file is complete before a row points at it, and the small
@@ -149,22 +150,29 @@ def compact(project_db, generation_id: int) -> int:
         rows = list(session.exec(select(CatalogShard).where(
             CatalogShard.generation_id == int(generation_id), CatalogShard.base_id == None,  # noqa: E711 - SQL
         )).all())
-    groups: dict[tuple[Any, str], list[tuple[int, int, Any]]] = {}
+    groups: dict[str, list[tuple[int, int, Any]]] = {}
     for row in rows:
         path = Path(str(row.path))
         if not path.is_file():
             continue  # ponytail: left as it is; a missing file is the reader's error to raise
         header = json.loads(pq.read_metadata(path).metadata[METADATA_KEY])
-        groups.setdefault((row.scope, str(path.parent)), []).append(
-            (int(header["base_id"]), int(header["slot_count"]), row))
+        groups.setdefault(str(path.parent), []).append((int(header["base_id"]), int(header["slot_count"]), row))
     moved: dict[int, tuple[str, dict[str, int]]] = {}
-    for (_scope, folder), members in groups.items():
-        members.sort(key=lambda item: item[0])
+    for folder, members in groups.items():
+        # Ties by scope: two imports both start at id 0, and each should keep to its own file.
+        members.sort(key=lambda item: (item[0], str(item[2].scope)))
         files: list[list[tuple[int, int, Any]]] = []
-        for member in members:  # a new file when the id span would pass what one file holds
-            if not files or member[0] + member[1] - files[-1][0][0] > MAX_RECORDS:
+        ends: list[int] = []  # where the ids of each file end so far
+        for member in members:  # first file it fits: past that file's ids, inside its window
+            base, slots = member[0], member[1]
+            at = next((i for i, f in enumerate(files)
+                       if ends[i] <= base and base + slots - f[0][0] <= MAX_RECORDS), None)
+            if at is None:
                 files.append([])
-            files[-1].append(member)
+                ends.append(0)
+                at = len(files) - 1
+            files[at].append(member)
+            ends[at] = base + slots
         for batch in files:
             if len(batch) < 2:
                 continue  # one file already
