@@ -137,20 +137,25 @@ class ShardGeneration(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
 
 
-class CatalogShard(SQLModel, table=True):
-    """One logical shard: ids ``base_id <= id < base_id + slot_count`` of ``path``. Many rows share
-    a file, each its own row group; NULL ids = the whole file. App tables reference ``id``."""
+class CatalogFile(SQLModel, table=True):
+    """One file of a sharded library (or of what a step made of it): the catalog keeps a row per
+    file, never per shard. Its shards are its row groups, listed in the file's own header
+    (`ms_flow.core.data.shard.file_groups`); the counts here are what a view or a progress bar
+    needs without opening it. App tables reference ``id``."""
 
-    __tablename__ = "ms_shards"
-    __table_args__ = (UniqueConstraint("generation_id", "scope", "shard_index"),)
+    __tablename__ = "ms_shard_files"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     generation_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
-    # What the app numbers records within (an import batch): an exclusion is keyed by (scope, id).
-    scope: Optional[int] = Field(default=None, index=True)
-    shard_index: int = Field(default=0, index=True)
+    # What the file is: "library", or what a step made of it ("prepared:ad4", ...).
+    role: str = Field(default="library", index=True)
     path: str = ""
-    base_id: Optional[int] = None
-    slot_count: Optional[int] = None
+    # "writing" while its writer has it open (its counts grow; nothing reads it), then "ready".
+    status: str = Field(default="ready", index=True)
+    n_shards: int = 0
     n_records: int = 0
+    n_active: int = 0  # n_records minus the active exclusions
+    # The scopes (import batches) its shards belong to, comma-separated: what a view names.
+    scopes: str = ""
     error: str = ""
+    created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)

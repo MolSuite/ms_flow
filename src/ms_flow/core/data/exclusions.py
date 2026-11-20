@@ -65,12 +65,21 @@ def exclude(
         entity_kind=KIND, artifact_kind=KIND, path=str(rel), format="parquet", status=ACTIVE,
         producer_job_id=producer_job_id, metadata={"reason": reason, "n": n, "scopes": len(keys)},
     )
+    _refresh(project_db)
     return int(row.id)
+
+
+def _refresh(project_db) -> None:
+    """The catalog's active counts follow the cuts (one footer read per file)."""
+    from ms_flow.core.data.catalog import refresh_active
+
+    refresh_active(project_db)
 
 
 def set_exclusion_active(project_db, artifact_id: int, active: bool) -> None:
     """Undo (or redo) one cut; its file stays, so this is free both ways."""
     _registry(project_db).update_artifact(int(artifact_id), status=ACTIVE if active else INACTIVE)
+    _refresh(project_db)
 
 
 def list_exclusions(project_db) -> list[dict[str, Any]]:

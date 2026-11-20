@@ -13,8 +13,10 @@ under the ``ms_flow.shard`` key of the file metadata. An optional ``source_index
 
 One file may hold many *logical* shards: contiguous id ranges, each closed as its own row group
 (`ShardWriter.end_group`). ``Shard.open(path, ids=(lo, hi))`` reads only the row groups whose
-``id`` statistics overlap the range, so a catalog can address a shard as (file, id range) and a
-library of millions sits in a few big files instead of one small file per shard.
+``id`` statistics overlap the range, so a library of millions sits in a few big files instead of
+one small file per shard. The file lists its shards itself, in the header's ``groups``
+(`file_groups`): ``[base_id, slot_count, record_count, scope]`` each. A catalog keeps one row
+per *file*, never one per shard; what is inside is read from here.
 
 What the container guarantees:
 
@@ -50,6 +52,7 @@ __all__ = [
     "Shard",
     "ShardWriter",
     "get_serializer",
+    "file_groups",
     "merge_shards",
     "register",
 ]
@@ -190,6 +193,7 @@ class ShardWriter:
         codec: int = Codec.NONE,
         metadata: dict[str, Any] | None = None,
         source_index: bool = False,
+        scope: int | None = None,
     ) -> None:
         if codec != Codec.NONE:
             raise ValueError("shards only write codec=Codec.NONE; Parquet compresses the column")
@@ -208,6 +212,10 @@ class ShardWriter:
         self.codec = codec
         self.metadata = dict(metadata or {})
         self._with_source = bool(source_index)
+        self.scope = scope  # of the groups closed without one: whatever the app numbers records in
+        self._groups: list[list[Any]] = []  # [base_id, slot_count, record_count, scope]: the shards
+        self._group_first: int | None = None  # the first id of the shard being filled
+        self._group_count = 0
         self._ids: list[int] = []  # the row group being filled
         self._records: list[bytes] = []
         self._sources: list[int] = []
@@ -239,15 +247,30 @@ class ShardWriter:
             self._sources.append(int(source_index))
         self._ids.append(id_)
         self._records.append(bytes(data))
+        if self._group_first is None:
+            self._group_first = id_
+        self._group_count += 1
         self._last, self._count, self._buffered = id_, self._count + 1, self._buffered + len(data)
         if self._buffered >= _ROW_GROUP_BYTES:
             self._flush()
 
-    def end_group(self) -> None:
-        """Close the row group being filled. A caller packing several logical shards into one
-        file calls this at each shard's end, so reading one shard back touches only its own."""
+    def end_group(self, *, scope: int | None = None, base_id: int | None = None,
+                  slot_count: int | None = None) -> None:
+        """Close the shard being filled: its own row group, and an entry in the header's
+        ``groups``. Its ids are ``[base_id, base_id + slot_count)``, by default from its first
+        id to its last; pass them to keep the range of the shard it came from, holes and all (a
+        prepared twin whose last molecule failed, or that failed whole, still covers its parent's
+        range). ``scope`` defaults to the writer's."""
         if self._ids:
             self._flush()
+        if base_id is None and self._group_first is None:
+            return  # nothing added and no range to claim: no shard
+        # By default a shard starts at its first id; the first one at the writer's base_id, so a
+        # file written as one shard keeps the holes before its first record, as its header does.
+        lo = int(base_id) if base_id is not None else self.base_id if not self._groups else int(self._group_first)
+        hi = lo + int(slot_count) if slot_count is not None else int(self._last) + 1
+        self._groups.append([lo, hi - lo, self._group_count, self.scope if scope is None else scope])
+        self._group_first, self._group_count = None, 0
 
     def _flush(self) -> None:
         """The waiting records as one row group; the first call opens the ``.tmp``."""
@@ -294,6 +317,8 @@ class ShardWriter:
     def close(self) -> None:
         if self._closed:
             return
+        if self._group_first is not None:
+            self.end_group()  # what was added since the last end_group is a shard too
         self._flush()  # the last row group (and the file itself, when nothing has gone yet)
         # Trailing empty slots are not information: nothing distinguishes "id never came"
         # from "id past the end".
@@ -309,6 +334,7 @@ class ShardWriter:
             "serializer": self.serializer,
             "codec": self.codec,
             "metadata": self.metadata,
+            "groups": self._groups,
         }
         try:
             self._writer.add_key_value_metadata({METADATA_KEY: json.dumps(header).encode("utf-8")})
@@ -389,6 +415,17 @@ def _footer(path: Path) -> tuple[Any, list[tuple[int, int]]]:
         _FOOTERS.clear()
     _FOOTERS[path] = (key, meta, spans)
     return meta, spans
+
+
+def file_groups(path: str | Path) -> list[tuple[int, int, int, int | None]]:
+    """The shards of a file, ``(base_id, slot_count, record_count, scope)`` each, from its
+    header alone (footer cached). A file written before groups is one shard."""
+    meta, _spans = _footer(Path(path))
+    header = json.loads((meta.metadata or {})[METADATA_KEY].decode("utf-8"))
+    groups = header.get("groups")
+    if groups is None:
+        return [(int(header["base_id"]), int(header["slot_count"]), int(header["record_count"]), None)]
+    return [(int(g[0]), int(g[1]), int(g[2]), None if g[3] is None else int(g[3])) for g in groups]
 
 
 class Shard:
@@ -520,40 +557,45 @@ class Shard:
         )
 
 
-def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: dict[str, Any] | None = None) -> list[dict[str, int]]:
-    """Many shards into one file, each its own row group: ``sources`` are ``(path, ids)`` in
-    id order (``ids=None`` = the whole file), ``dest`` may be one of them. Returns each source's
-    ``base_id``, ``slot_count`` and ``record_count``, which is what its catalog row becomes.
+def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Many files' shards into one file: ``sources`` are ``(path, ids)`` in id order (``ids=None``
+    = every shard of the file, a range = its shards inside it), ``dest`` may be one of them. Each
+    shard keeps its ids, range and scope, as its own row group and ``groups`` entry. Returns the
+    shards written, ``base_id``/``slot_count``/``record_count``/``scope`` each.
 
     What a worker writes per task (a shard, a prepared twin) is adopted into a big file by the
-    parent once the job is done; the file count is what a library of millions pays for.
-    Atomic like any `ShardWriter`: ``dest`` is replaced only once everything is written.
+    parent once the job is done, and the few shards left to run travel to another host as a
+    mini file with the parent's ids. Atomic like any `ShardWriter`.
     ponytail: records only — a source with a ``source_index`` column is refused, not merged
     without it (nothing merges those today: the import already writes big files).
     """
     import pyarrow.parquet as pq
 
-    ranges: list[dict[str, int]] = []
+    written: list[dict[str, Any]] = []
     writer: ShardWriter | None = None
     try:
         for path, ids in sources:
             path = Path(path)
             if "source_index" in pq.read_schema(path).names:
                 raise ValueError(f"{path}: merging a shard with a source_index column is not supported")
-            with Shard.open(path, ids=None if ids is None else (int(ids[0]), int(ids[1]))) as shard:
-                if writer is None:
-                    writer = ShardWriter(dest, dataset_id=shard.dataset_id, shard_id=0, base_id=shard.base_id,
-                                         kind=shard.kind, serializer=shard.serializer, slot_count=MAX_RECORDS,
-                                         metadata={**shard.metadata, **dict(metadata or {})})
-                for record in shard:
-                    writer.add(record.id, record.view())
-                writer.end_group()
-                ranges.append({"base_id": shard.base_id, "slot_count": shard.slot_count,
-                               "record_count": len(shard)})
+            lo, hi = (0, 1 << 64) if ids is None else (int(ids[0]), int(ids[1]))
+            for base, slots, _count, scope in file_groups(path):
+                if base + slots <= lo or base >= hi:
+                    continue
+                with Shard.open(path, ids=(base, base + slots)) as shard:
+                    if writer is None:
+                        writer = ShardWriter(dest, dataset_id=shard.dataset_id, shard_id=0, base_id=base,
+                                             kind=shard.kind, serializer=shard.serializer, slot_count=MAX_RECORDS,
+                                             metadata={**shard.metadata, **dict(metadata or {})})
+                    for record in shard:
+                        writer.add(record.id, record.view())
+                    writer.end_group(scope=scope, base_id=base, slot_count=slots)
+                    written.append({"base_id": base, "slot_count": slots, "record_count": len(shard),
+                                    "scope": scope})
     except BaseException:
         if writer is not None:
             writer._discard()
         raise
     if writer is not None:
         writer.close()
-    return ranges
+    return written
