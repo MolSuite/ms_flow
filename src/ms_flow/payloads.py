@@ -184,8 +184,19 @@ _codecs = threading.local()  # zstd (de)compressors are not thread-safe: one set
 def _zstd():
     try:
         import zstandard
-    except ImportError:  # pragma: no cover - a declared dependency
-        raise RuntimeError("zstd payloads need the zstandard package: pip install zstandard") from None
+    except ModuleNotFoundError as exc:
+        if exc.name != "zstandard":
+            raise RuntimeError(f"zstd payloads need the zstandard package, which cannot load: {exc}") from exc
+        raise RuntimeError("zstd payloads need the zstandard package: pip install zstandard") from exc
+    except ImportError as exc:
+        # Installed but not loadable. A zstandard built against a shared libzstd refuses a
+        # different libzstd already loaded in the process (Qt from the PySide6 wheels loads the
+        # system one); the PyPI wheel carries its own zstd and does not care.
+        hint = ""
+        if "versions mismatch" in str(exc):
+            hint = (" (another library loaded a different libzstd first; the PyPI wheel carries its"
+                    " own: pip install --force-reinstall --no-deps zstandard)")
+        raise RuntimeError(f"zstd payloads need the zstandard package, which cannot load: {exc}{hint}") from exc
     return zstandard
 
 

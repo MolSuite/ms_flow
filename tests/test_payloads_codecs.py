@@ -2,6 +2,7 @@
 import pickle
 import random
 import sqlite3
+import sys
 from contextlib import closing
 from pathlib import Path
 
@@ -117,3 +118,56 @@ def test_a_job_compresses_with_the_series_dictionary_where_its_tasks_run(project
         vol, off, length = conn.execute('SELECT volume_id, "offset", length FROM ms_payloads WHERE id = ?', (rows[0][1],)).fetchone()
     frame = project.payloads.path(vol).read_bytes()[off + payloads.NEEDLE: off + payloads.NEEDLE + length]
     assert zstandard.get_frame_parameters(frame).dict_id == 1  # compressed with the dictionary, far away
+
+
+def _zstandard_fails(monkeypatch, error):
+    """`import zstandard` raises `error`, as where the package is missing or cannot load."""
+    import builtins
+    import threading
+
+    from ms_flow import payloads
+
+    real_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "zstandard":
+            raise error
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "zstandard", raising=False)
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    monkeypatch.setattr(payloads, "_codecs", threading.local())  # no (de)compressor made before
+
+
+def test_a_missing_zstandard_says_what_to_install(project, monkeypatch):
+    (pid,) = put(project, [Payload(molecule(1))])
+    _zstandard_fails(monkeypatch, ModuleNotFoundError("No module named 'zstandard'", name="zstandard"))
+    reader = ProjectStore.open_at(project.db_path)
+    try:
+        with pytest.raises(RuntimeError, match="pip install zstandard$"):
+            reader.payloads.get(pid)
+    finally:
+        reader.dispose()
+
+
+def test_a_zstandard_that_cannot_load_says_why(project, monkeypatch):
+    """Installed but not loadable: the reason is in the message, not "pip install zstandard"."""
+    (pid,) = put(project, [Payload(molecule(1))])
+    mismatch = ImportError("zstd C API versions mismatch; Python bindings were not compiled/linked against "
+                           "expected zstd version (10408 returned by the lib, 10507 hardcoded in zstd headers, "
+                           "10506 hardcoded in the cext)")
+    _zstandard_fails(monkeypatch, mismatch)
+    reader = ProjectStore.open_at(project.db_path)
+    try:
+        with pytest.raises(RuntimeError, match="cannot load: zstd C API versions mismatch") as caught:
+            reader.payloads.get(pid)
+    finally:
+        reader.dispose()
+    assert "another library loaded a different libzstd first" in str(caught.value)
+    assert "--force-reinstall --no-deps zstandard" in str(caught.value)
+    assert caught.value.__cause__ is mismatch
+    with pytest.raises(RuntimeError, match="cannot load: undefined symbol") as caught:
+        _zstandard_fails(monkeypatch, ImportError("undefined symbol: ZSTD_foo"))
+        from ms_flow.payloads import _compress
+        _compress("zstd", b"x", None)
+    assert "libzstd" not in str(caught.value)
