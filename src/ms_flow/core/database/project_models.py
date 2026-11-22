@@ -124,13 +124,13 @@ class PayloadDictionary(SQLModel, table=True):
 
 
 class ShardGeneration(SQLModel, table=True):
-    """One rewrite of the sharded library (see `ms_flow.core.data.catalog`). Only one is active."""
+    """One rewrite of the sharded dataset (see `ms_flow.core.data.catalog`). Only one is active."""
 
     __tablename__ = "ms_shard_generations"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     parent_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
-    step: str = ""  # what produced it: "import", or the step that rewrote the library
+    step: str = ""  # what produced it: "import", or the step that rewrote the dataset
     folder: str = ""
     job_id: str = ""
     is_active: bool = Field(default=False, index=True)
@@ -138,7 +138,7 @@ class ShardGeneration(SQLModel, table=True):
 
 
 class CatalogFile(SQLModel, table=True):
-    """One file of a sharded library (or of what a step made of it): the catalog keeps a row per
+    """One file of a sharded dataset (or of what a step made of it): the catalog keeps a row per
     file, never per shard. Its shards are its row groups, listed in the file's own header
     (`ms_flow.core.data.shard.file_groups`); the counts here are what a view or a progress bar
     needs without opening it. App tables reference ``id``."""
@@ -147,15 +147,18 @@ class CatalogFile(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     generation_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
-    # What the file is: "library", or what a step made of it ("prepared:ad4", ...).
-    role: str = Field(default="library", index=True)
+    # What the file is: "source" (the dataset itself), or what a step made of it (a role the app names).
+    role: str = Field(default="source", index=True)
     path: str = ""
     # "writing" while its writer has it open (its counts grow; nothing reads it), then "ready".
     status: str = Field(default="ready", index=True)
     n_shards: int = 0
     n_records: int = 0
     n_active: int = 0  # n_records minus the active exclusions
-    # The scopes (import batches) its shards belong to, comma-separated: what a view names.
+    # The scopes (the batches that wrote them) its shards belong to, comma-separated: what a view names.
     scopes: str = ""
+    # Where the file is: "" here, else the host that wrote it and keeps it (a step that ran there
+    # left its output there; only its name and counts came back).
+    location: str = Field(default="", index=True)
     error: str = ""
     created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)

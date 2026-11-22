@@ -9,9 +9,9 @@ result; it takes `params` too when it names it.
 from ms_flow import task
 
 
-@task(cpu=1, retries=1, label="mol-{id}")
-def weigh(molecule: dict, params) -> dict:
-    return {"molecule_id": molecule["id"], "atoms": len(molecule["smiles"]) * params["scale"]}
+@task(cpu=1, retries=1, label="spc-{id}")
+def weigh(specimen: dict, params) -> dict:
+    return {"specimen_id": specimen["id"], "mass": len(specimen["slug"]) * params["scale"]}
 ```
 
 | Argument | What it is |
@@ -31,9 +31,9 @@ from ms_flow import job, table_sink
 from ms_flow.query import QuerySpec, Rows
 
 
-@job(task=weigh, output=table_sink("weights", columns=("molecule_id", "atoms")))
+@job(task=weigh, output=table_sink("weights", columns=("specimen_id", "mass")))
 def weigh_all(params, project):
-    return Rows(project, QuerySpec(table="molecules", fields=("id", "smiles")))
+    return Rows(project, QuerySpec(table="specimens", fields=("id", "slug")))
 ```
 
 The source is a generator, or anything read one element at a time. `Rows`
@@ -191,7 +191,7 @@ only; a campaign is still the same campaign (its identity does not change). A
 job that is not a campaign has to go to a journal (`ms.submit` always does):
 
 ```python
-ms.submit(screen, params, executor="hpc", resources={"cpus": 32, "time": "12:00:00"})
+ms.submit(sweep, params, executor="hpc", resources={"cpus": 32, "time": "12:00:00"})
 ```
 
 ## The engine without a project

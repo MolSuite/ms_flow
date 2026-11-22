@@ -72,7 +72,7 @@ class DataBridge:
         """Where one input file lands in the cluster's working directory.
 
         Content-addressed and shared by every chunk of every job: an input is immutable by
-        definition, so copying the receptor once per chunk is the same file transferred a
+        definition, so copying a shared input once per chunk is the same file transferred a
         thousand times. Per-chunk scratch stays per-chunk — this is only the inbound side.
 
         ponytail: the key is (path, mtime, size), not a content hash, so staging never reads

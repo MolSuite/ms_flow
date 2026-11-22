@@ -38,7 +38,7 @@ class _Collect:
 
 
 @campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
-def screen(params, project):
+def sweep(params, project):
     said = Path(os.environ["CAMPAIGN_FILE"])
     return [Stage("vs", square, [{"n": n, "f": File(said), "out": Dir(said.parent / "work"), "_cpu_required": 1}
                                  for n in range(params.n)])]

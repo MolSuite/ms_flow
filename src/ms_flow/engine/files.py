@@ -22,6 +22,14 @@ class Dir(str):
     __slots__ = ()
 
 
+class KeptDir(Dir):
+    """A `Dir` of the project's folder that a campaign makes in the project's folder there, so it
+    stays on that host for every later campaign of the project, not only for the one that made it.
+    Elsewhere it is a `Dir`."""
+
+    __slots__ = ()
+
+
 def swap(value, change, kinds=(File, Dir)):
     """`value` with `change(mark)` in the place of each mark in it, inside dicts, lists and tuples.
 

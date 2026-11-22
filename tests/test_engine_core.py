@@ -55,7 +55,7 @@ def _half_then_held(payload):
 
 
 def _waits_for_a_program(payload):
-    """What a docking task does: starts a program, tells of it and waits for it."""
+    """What a coupling task does: starts a program, tells of it and waits for it."""
     program = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({payload['s']})"])
     launched(program)
     report(0.5)
@@ -255,8 +255,8 @@ def test_an_executor_with_a_total_gets_only_the_tasks_it_has_room_for():
 
 
 def test_a_cpu_job_runs_beside_a_gpu_job_on_what_the_gpu_job_leaves():
-    """Two Ray nodes, one GPU each: a GPU docking held every CPU in waiting tasks, and a CPU
-    docking sent after it waited for all of them. It runs now on the CPUs the GPU job leaves."""
+    """Two Ray nodes, one GPU each: a GPU coupling held every CPU in waiting tasks, and a CPU
+    coupling sent after it waited for all of them. It runs now on the CPUs the GPU job leaves."""
     costed, lock = _Costed(), threading.Lock()
     costed.total = (4, 1, 0)
     running, both = {"gpu": 0, "cpu": 0}, []
@@ -281,12 +281,12 @@ def test_a_cpu_job_runs_beside_a_gpu_job_on_what_the_gpu_job_leaves():
     assert any(seen["gpu"] and seen["cpu"] == 3 for seen in both)  # side by side, on all that is left
 
 def test_content_key_is_the_same_in_another_process():
-    payload = {"ligand": "CCO", "receptor": ["1abc", 7], "box": (1.5, 2.0)}
+    payload = {"guest": "CCO", "anchor": ["1abc", 7], "box": (1.5, 2.0)}
     code = f"from ms_flow.engine import content_key; print(content_key({payload!r}).hex())"
     other = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
     assert other.stdout.strip() == content_key(payload).hex() and len(content_key(payload)) == 16
-    assert content_key({"ligand": "CCN"}) != content_key({"ligand": "CCO"})
+    assert content_key({"guest": "CCN"}) != content_key({"guest": "CCO"})
     assert content_key(threading.Lock()) != content_key(threading.Lock())  # unknown content: never equal
 
 
@@ -796,7 +796,7 @@ def test_the_same_jobs_on_ray(tmp_path):
 def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
     gate = threading.Event()
 
-    def names(label, payloads=({"engine": "vina", "pairs": [{"receptor": 1, "ligand": 2}]},)):
+    def names(label, payloads=({"engine": "solver", "pairs": [{"anchor": 1, "guest": 2}]},)):
         job_id = engine.submit("thread", lambda payload: gate.wait(30), list(payloads), label=label)
         deadline = time.monotonic() + 30
         while not (tasks := engine.tasks(job_id)):
@@ -807,7 +807,7 @@ def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
     with Engine(cpus=2, mem_mb=0) as engine:
         engine.register("thread", ThreadExecutor(8))
         try:
-            assert names("{engine}-R{pairs[0][receptor]}-L{pairs[0][ligand]}") == ["vina-R1-L2"]  # a template
+            assert names("{engine}-R{pairs[0][anchor]}-L{pairs[0][guest]}") == ["solver-R1-L2"]  # a template
             assert names(lambda payload: f"{len(payload['pairs'])} pairs") == ["1 pairs"]  # or a function
             assert names("chunk {}", [7]) == ["chunk 7"]  # a payload that is not a dict fills the template whole
             assert names("{nothing}") == names(None)  # one that does not fit: the short repr, as without it

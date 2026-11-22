@@ -223,7 +223,7 @@ def ran_on(*modules: str) -> dict:
         except Exception:  # not installed as a distribution (a script, a source tree)
             return ""
 
-    # ponytail: the distribution named as the top module (ms_flow, amdockvs...); one named
+    # ponytail: the distribution named as the top module (ms_flow, an app...); one named
     # otherwise (sklearn of scikit-learn) reads as "". packages_distributions() takes ~1 s.
     packages = {top: of(top) for top in {module.partition(".")[0] for module in modules} if top}
     return {"host": socket.gethostname(), "python": platform.python_version(), "platform": platform.platform(),
@@ -559,7 +559,7 @@ class Engine:
         an executor that keeps a worker for each task and can spare it (the process pool) runs it
         on a thread of one process it keeps for all of them, so no worker holds memory for it.
         `label` is what a chunk goes by in `tasks` and in a failure, in place of a short repr of
-        its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
+        its payload: a template the payload fills (`"eval-T{target}-I{item}"`, the keys of a
         dict payload) or a function `(payload)` that returns the text. It runs here, never in a
         worker, and only for a chunk that is shown.
         `journal` names an attached journal; without it nothing about the job reaches the disk.

@@ -210,7 +210,7 @@ def db_pages(
     """The same rows as `db_stream`, but in keyset pages.
 
     Each page is its own short read (`WHERE key > last ORDER BY key LIMIT n`) instead of a single
-    cursor held open for the whole feed. Feeding a million-ligand screen takes hours, and a read
+    cursor held open for the whole feed. Feeding a million-item job takes hours, and a read
     snapshot held open that long prevents SQLite from checkpointing the WAL: `project.db-wal`
     grows without bound while the job itself writes its results.
 

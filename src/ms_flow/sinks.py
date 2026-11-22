@@ -192,4 +192,15 @@ def file_sink(
     )
 
 
-__all__ = ["file_sink", "graph_sink", "table_sink"]
+def catalog_sink() -> DbOutputSpec:
+    """Register the files a task wrote in the shard catalog as its chunk arrives: the task
+    returns ``catalog.file_row(path, role=..., generation_id=...)`` for each (published by atomic
+    rename first). A chunk delivered twice inserts once. Compact at the job's end
+    (``catalog.compact(generation_id, role=)`` in ``finalize``); `catalog.sweep` at its start
+    deletes what a crash published but never registered."""
+    from ms_flow.core.database.project_models import CatalogFile
+
+    return table_sink(model=CatalogFile)
+
+
+__all__ = ["catalog_sink", "file_sink", "graph_sink", "table_sink"]

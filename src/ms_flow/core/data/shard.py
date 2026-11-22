@@ -1,6 +1,6 @@
 """Shards: a compact, reliable, indexed container for many small byte records.
 
-The problem it solves is *file count*, not file format. A screening library or a stage of a
+The problem it solves is *file count*, not file format. A dataset or a stage of a
 pipeline produces millions of tiny payloads; as one file each they exhaust inodes, copy at
 metadata speed and cannot be moved anywhere as a unit. A shard packs a contiguous range of
 them into one Parquet file that can be checksummed, shipped to a cluster, read back record by
@@ -13,16 +13,20 @@ under the ``ms_flow.shard`` key of the file metadata. An optional ``source_index
 
 One file may hold many *logical* shards: contiguous id ranges, each closed as its own row group
 (`ShardWriter.end_group`). ``Shard.open(path, ids=(lo, hi))`` reads only the row groups whose
-``id`` statistics overlap the range, so a library of millions sits in a few big files instead of
+``id`` statistics overlap the range, so a dataset of millions sits in a few big files instead of
 one small file per shard. The file lists its shards itself, in the header's ``groups``
-(`file_groups`): ``[base_id, slot_count, record_count, scope]`` each. A catalog keeps one row
-per *file*, never one per shard; what is inside is read from here.
+(`file_groups`): ``[base_id, slot_count, record_count, scope, origin, n_dropped]`` each. A
+catalog keeps one row per *file*, never one per shard; what is inside is read from here.
+
+A *derived* shard (what a step made of a source shard, same ids) names the shard it came from in
+``origin``, and counts in ``n_dropped`` the ids it could not produce (`ShardWriter.drop`); the
+ids and reasons go in a ``<file>.dropped.parquet`` beside the file (`dropped_path`).
 
 What the container guarantees:
 
 * **Indexed access.** A record is addressed by its logical id (``base_id .. base_id +
-  slot_count - 1``), not by its position. Ids may be missing — a filtered-out molecule, a
-  failed preparation — and the shard records that instead of silently renumbering.
+  slot_count - 1``), not by its position. Ids may be missing — a filtered-out record, a
+  failed transformation — and the shard records that instead of silently renumbering.
 * **Reliability.** The writer commits with ``os.replace()`` onto the final path only after
   everything is fsynced, so a crash leaves a ``.tmp`` and never a half-written shard. Every
   data page carries a CRC that `Shard.open` checks, so a damaged shard fails to open instead of
@@ -41,7 +45,7 @@ import os
 import uuid
 from bisect import bisect_left
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NamedTuple
 
 __all__ = [
     "Codec",
@@ -52,8 +56,11 @@ __all__ = [
     "Shard",
     "ShardWriter",
     "get_serializer",
+    "Group",
+    "dropped_path",
     "file_groups",
     "merge_shards",
+    "read_dropped",
     "register",
 ]
 
@@ -72,9 +79,6 @@ class PayloadKind:
     """What a record *represents*. Opaque to the core — meaning lives in the caller."""
 
     GENERIC_BYTES = 0
-    PDBQT = 3
-    SDF = 4
-    SMILES = 7
 
 
 class Serializer:
@@ -105,8 +109,8 @@ def register(
 ) -> None:
     """Bind a serializer id to a (dumps, loads) pair. Last registration for an id wins.
 
-    This is the extension point: a caller that stores, say, RDKit binary molecules registers
-    its own id here instead of this module growing a dependency on RDKit.
+    This is the extension point: a caller that stores its own binary objects registers its own
+    id here instead of this module growing a dependency on whatever produces them.
     """
     _SERIALIZERS[int(serializer_id)] = (dumps_fn, loads_fn)
 
@@ -139,6 +143,53 @@ def _uuid(dataset_id: uuid.UUID | str | bytes | None) -> uuid.UUID:
             raise ValueError(f"dataset_id bytes must be exactly 16 bytes, got {len(dataset_id)}")
         return uuid.UUID(bytes=bytes(dataset_id))
     return uuid.UUID(str(dataset_id))
+
+
+class Group(NamedTuple):
+    """One shard of a file, as its header lists it."""
+
+    base_id: int
+    slot_count: int
+    n_records: int
+    scope: int | None
+    origin: int | None = None  # the shard a derived one was made from
+    n_dropped: int = 0
+
+
+def dropped_path(path: str | Path) -> Path:
+    """Where the ids a file's shards dropped are explained: ``x.parquet`` -> ``x.dropped.parquet``."""
+    path = Path(path)
+    return path.with_name(f"{path.stem}.dropped{path.suffix}")
+
+
+def _tmp(path: Path) -> Path:
+    return path.with_name(path.name + ".tmp")
+
+
+def _write_dropped(path: Path, rows: list[tuple[int, str]]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    tmp = _tmp(path)
+    table = pa.table({"id": pa.array([r[0] for r in rows], type=pa.uint64()),
+                      "reason": pa.array([r[1] for r in rows], type=pa.string())})
+    with open(tmp, "wb") as handle:
+        pq.write_table(table, handle, compression="zstd")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def read_dropped(path: str | Path, ids: tuple[int, int] | None = None) -> list[tuple[int, str]]:
+    """``(id, reason)`` of what a file's shards dropped, those in ``[lo, hi)`` only with ``ids``."""
+    import pyarrow.parquet as pq
+
+    side = dropped_path(path)
+    if not side.is_file():
+        return []
+    table = pq.read_table(side)
+    rows = zip(table.column("id").to_pylist(), table.column("reason").to_pylist())
+    return [(int(i), str(r)) for i, r in rows if ids is None or ids[0] <= i < ids[1]]
 
 
 def _check_uint(name: str, value: int, bits: int) -> int:
@@ -213,9 +264,11 @@ class ShardWriter:
         self.metadata = dict(metadata or {})
         self._with_source = bool(source_index)
         self.scope = scope  # of the groups closed without one: whatever the app numbers records in
-        self._groups: list[list[Any]] = []  # [base_id, slot_count, record_count, scope]: the shards
-        self._group_first: int | None = None  # the first id of the shard being filled
+        self._groups: list[list[Any]] = []  # the shards, as `Group`s are written in the header
+        self._group_first: int | None = None  # the first id (added or dropped) of the shard being filled
         self._group_count = 0
+        self._group_dropped = 0
+        self._dropped: list[tuple[int, str]] = []  # (id, reason): the dropped sidecar
         self._ids: list[int] = []  # the row group being filled
         self._records: list[bytes] = []
         self._sources: list[int] = []
@@ -254,13 +307,30 @@ class ShardWriter:
         if self._buffered >= _ROW_GROUP_BYTES:
             self._flush()
 
+    def drop(self, id_: int, reason: str = "") -> None:
+        """An id of the shard being filled that has no record (a transformation that failed for
+        it): a hole the header counts and the dropped sidecar explains. Same order as `add`."""
+        if self._closed:
+            raise ValueError(f"{self.path}: shard already closed")
+        id_ = int(id_)
+        if id_ < self.base_id or id_ >= self.base_id + self.slot_count:
+            raise ValueError(f"id {id_} out of range [{self.base_id}, {self.base_id + self.slot_count})")
+        if self._last is not None and id_ <= self._last:
+            raise ValueError(f"ids must be strictly increasing: {id_} after {self._last}")
+        if self._group_first is None:
+            self._group_first = id_
+        self._last = id_
+        self._group_dropped += 1
+        self._dropped.append((id_, str(reason or "")))
+
     def end_group(self, *, scope: int | None = None, base_id: int | None = None,
-                  slot_count: int | None = None) -> None:
+                  slot_count: int | None = None, origin: int | None = None) -> None:
         """Close the shard being filled: its own row group, and an entry in the header's
         ``groups``. Its ids are ``[base_id, base_id + slot_count)``, by default from its first
         id to its last; pass them to keep the range of the shard it came from, holes and all (a
-        prepared twin whose last molecule failed, or that failed whole, still covers its parent's
-        range). ``scope`` defaults to the writer's."""
+        derived shard whose last record was dropped, or that was dropped whole, still covers its
+        origin's range). ``scope`` defaults to the writer's; ``origin``: the shard it was made
+        from, for a derived one."""
         if self._ids:
             self._flush()
         if base_id is None and self._group_first is None:
@@ -269,8 +339,9 @@ class ShardWriter:
         # file written as one shard keeps the holes before its first record, as its header does.
         lo = int(base_id) if base_id is not None else self.base_id if not self._groups else int(self._group_first)
         hi = lo + int(slot_count) if slot_count is not None else int(self._last) + 1
-        self._groups.append([lo, hi - lo, self._group_count, self.scope if scope is None else scope])
-        self._group_first, self._group_count = None, 0
+        self._groups.append([lo, hi - lo, self._group_count, self.scope if scope is None else scope,
+                             None if origin is None else int(origin), self._group_dropped])
+        self._group_first, self._group_count, self._group_dropped = None, 0, 0
 
     def _flush(self) -> None:
         """The waiting records as one row group; the first call opens the ``.tmp``."""
@@ -304,7 +375,7 @@ class ShardWriter:
     def _discard(self) -> None:
         """Drop what was written: the ``.tmp`` goes, ``path`` is never touched."""
         self._closed = True
-        self._ids, self._records, self._sources = [], [], []
+        self._ids, self._records, self._sources, self._dropped = [], [], [], []
         for closing in (self._writer, self._file):
             try:
                 if closing is not None:
@@ -313,6 +384,7 @@ class ShardWriter:
                 pass
         self._writer = self._file = None
         self._tmp_path.unlink(missing_ok=True)
+        _tmp(dropped_path(self.path)).unlink(missing_ok=True)
 
     def close(self) -> None:
         if self._closed:
@@ -337,6 +409,8 @@ class ShardWriter:
             "groups": self._groups,
         }
         try:
+            if self._dropped:  # before the file: a ready file never lacks its sidecar
+                _write_dropped(dropped_path(self.path), self._dropped)
             self._writer.add_key_value_metadata({METADATA_KEY: json.dumps(header).encode("utf-8")})
             self._writer.close()
             self._file.flush()
@@ -348,6 +422,8 @@ class ShardWriter:
         self._closed = True
         self._writer = self._file = None
         os.replace(self._tmp_path, self.path)
+        if not self._dropped:
+            dropped_path(self.path).unlink(missing_ok=True)  # a rewrite of a path that had drops
         _fsync_dir(self.path.parent)
 
     def __enter__(self) -> "ShardWriter":
@@ -420,10 +496,9 @@ def _footer(path: Path) -> tuple[Any, list[tuple[int, int]], dict | None]:
     return meta, spans, header
 
 
-def file_groups(path: str | Path) -> list[tuple[int, int, int, int | None]]:
-    """The shards of a file, ``(base_id, slot_count, record_count, scope)`` each, from its
-    header alone (footer cached, and the list with it: callers must not mutate it). A file
-    written before groups is one shard."""
+def file_groups(path: str | Path) -> list[Group]:
+    """The shards of a file, a `Group` each, from its header alone (footer cached, and the list
+    with it: callers must not mutate it). A file written before groups is one shard."""
     path = Path(path)
     _meta, _spans, header = _footer(path)
     if header is None:
@@ -433,9 +508,11 @@ def file_groups(path: str | Path) -> list[tuple[int, int, int, int | None]]:
         return cached[1]
     groups = header.get("groups")
     if groups is None:
-        result = [(int(header["base_id"]), int(header["slot_count"]), int(header["record_count"]), None)]
+        result = [Group(int(header["base_id"]), int(header["slot_count"]), int(header["record_count"]), None)]
     else:
-        result = [(int(g[0]), int(g[1]), int(g[2]), None if g[3] is None else int(g[3])) for g in groups]
+        result = [Group(int(g[0]), int(g[1]), int(g[2]), None if g[3] is None else int(g[3]),
+                        None if len(g) < 5 or g[4] is None else int(g[4]), int(g[5]) if len(g) > 5 else 0)
+                  for g in groups]
     if len(_GROUPS) >= 256:
         _GROUPS.clear()
     _GROUPS[path] = (header, result)
@@ -443,7 +520,7 @@ def file_groups(path: str | Path) -> list[tuple[int, int, int, int | None]]:
 
 
 # path -> (the cached header it was built from, its groups): valid while that header is.
-_GROUPS: dict[Path, tuple[dict, list[tuple[int, int, int, int | None]]]] = {}
+_GROUPS: dict[Path, tuple[dict, list[Group]]] = {}
 
 
 class Shard:
@@ -501,7 +578,7 @@ class Shard:
             with open(path, "rb") as fh:  # a missing file raises here, as itself
                 if fh.read(len(_LEGACY_MAGIC)) == _LEGACY_MAGIC:
                     raise ValueError(
-                        f"{path}: a .mshard container from an older version; re-import the library"
+                        f"{path}: a .mshard container from an older version; write it again"
                     ) from None
             raise ValueError(f"{path}: unreadable shard ({exc})") from exc
         # The writer adds the header on close, so it lives in the file's key-value metadata.
@@ -572,13 +649,15 @@ class Shard:
         )
 
 
-def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: dict[str, Any] | None = None,
+                 skip: frozenset[tuple[str, int]] | set[tuple[str, int]] = frozenset()) -> list[dict[str, Any]]:
     """Many files' shards into one file: ``sources`` are ``(path, ids)`` in id order (``ids=None``
-    = every shard of the file, a range = its shards inside it), ``dest`` may be one of them. Each
-    shard keeps its ids, range and scope, as its own row group and ``groups`` entry. Returns the
-    shards written, ``base_id``/``slot_count``/``record_count``/``scope`` each.
+    = every shard of the file, a range = its shards inside it), ``dest`` may be one of them;
+    ``skip``: ``(str(path), group index)`` pairs left out. Each shard keeps its ids, range,
+    scope, origin and dropped ids, as its own row group and ``groups`` entry. Returns the shards
+    written, ``base_id``/``slot_count``/``record_count``/``scope``/``origin``/``n_dropped`` each.
 
-    What a worker writes per task (a shard, a prepared twin) is adopted into a big file by the
+    What a worker writes per task (a shard, a derived shard) is adopted into a big file by the
     parent once the job is done, and the few shards left to run travel to another host as a
     mini file with the parent's ids. Atomic like any `ShardWriter`.
     ponytail: records only — a source with a ``source_index`` column is refused, not merged
@@ -594,19 +673,24 @@ def merge_shards(sources: list[tuple[Any, Any]], dest: str | Path, *, metadata: 
             if "source_index" in pq.read_schema(path).names:
                 raise ValueError(f"{path}: merging a shard with a source_index column is not supported")
             lo, hi = (0, 1 << 64) if ids is None else (int(ids[0]), int(ids[1]))
-            for base, slots, _count, scope in file_groups(path):
-                if base + slots <= lo or base >= hi:
+            dropped = read_dropped(path)
+            for index, (base, slots, _count, scope, origin, _n_dropped) in enumerate(file_groups(path)):
+                if base + slots <= lo or base >= hi or (str(path), index) in skip:
                     continue
                 with Shard.open(path, ids=(base, base + slots)) as shard:
                     if writer is None:
                         writer = ShardWriter(dest, dataset_id=shard.dataset_id, shard_id=0, base_id=base,
                                              kind=shard.kind, serializer=shard.serializer, slot_count=MAX_RECORDS,
                                              metadata={**shard.metadata, **dict(metadata or {})})
+                    holes = [row for row in dropped if base <= row[0] < base + slots]
                     for record in shard:
                         writer.add(record.id, record.view())
-                    writer.end_group(scope=scope, base_id=base, slot_count=slots)
+                    # The holes go in as they were: by id, not through `drop`'s order check.
+                    writer._dropped.extend(holes)
+                    writer._group_dropped += len(holes)
+                    writer.end_group(scope=scope, base_id=base, slot_count=slots, origin=origin)
                     written.append({"base_id": base, "slot_count": slots, "record_count": len(shard),
-                                    "scope": scope})
+                                    "scope": scope, "origin": origin, "n_dropped": len(holes)})
     except BaseException:
         if writer is not None:
             writer._discard()

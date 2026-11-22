@@ -23,13 +23,13 @@ def _write(path, ids, *, base_id=0, slot_count=4096, **kw):
         dataset_id=uuid.UUID(int=7),
         shard_id=0,
         base_id=base_id,
-        kind=PayloadKind.SDF,
+        kind=PayloadKind.GENERIC_BYTES,
         serializer=Serializer.UTF8,
         slot_count=slot_count,
         **kw,
     ) as writer:
         for id_ in ids:
-            writer.add(id_, f"mol-{id_}".encode())
+            writer.add(id_, f"spc-{id_}".encode())
     return path
 
 
@@ -39,7 +39,7 @@ def test_holes_keep_the_ids_they_belong_to(tmp_path):
     with shard:
         assert len(shard) == 3
         assert [record.id for record in shard] == [100, 102, 105]
-        assert shard[102].load() == "mol-102"
+        assert shard[102].load() == "spc-102"
         assert 101 not in shard and 999 not in shard
         with pytest.raises(KeyError):
             shard[101]
@@ -109,9 +109,9 @@ def test_a_failed_write_leaves_no_shard_behind(tmp_path):
 
 def test_metadata_and_dataset_id_travel_with_the_file(tmp_path):
     dataset = uuid.UUID(int=7)
-    path = _write(tmp_path / "h.parquet", range(3), metadata={"source": "lib.sdf"})
+    path = _write(tmp_path / "h.parquet", range(3), metadata={"source": "lib.csv"})
     with Shard.open(path, dataset_id=dataset) as shard:
-        assert shard.metadata == {"source": "lib.sdf"} and shard.dataset_id == dataset
+        assert shard.metadata == {"source": "lib.csv"} and shard.dataset_id == dataset
     with pytest.raises(ValueError, match="dataset_id mismatch"):
         Shard.open(path, dataset_id=uuid.UUID(int=8))
 
@@ -119,15 +119,15 @@ def test_metadata_and_dataset_id_travel_with_the_file(tmp_path):
 def test_a_shard_is_plain_parquet(tmp_path):
     """What makes it worth it: any Parquet reader sees ids and text, no container code."""
     table = pq.read_table(_write(tmp_path / "i.parquet", [3, 5], base_id=3, slot_count=4))
-    assert table.to_pydict() == {"id": [3, 5], "record": ["mol-3", "mol-5"]}
+    assert table.to_pydict() == {"id": [3, 5], "record": ["spc-3", "spc-5"]}
     with Shard.open(tmp_path / "i.parquet") as shard:
-        assert [bytes(view) for view in shard.iter_views()] == [b"mol-3", b"mol-5"]
+        assert [bytes(view) for view in shard.iter_views()] == [b"spc-3", b"spc-5"]
 
 
-def test_a_legacy_mshard_says_to_reimport(tmp_path):
+def test_a_legacy_mshard_says_to_write_it_again(tmp_path):
     path = tmp_path / "old.mshard"
     path.write_bytes(b"MSHARD" + bytes(100))
-    with pytest.raises(ValueError, match="re-import"):
+    with pytest.raises(ValueError, match="write it again"):
         Shard.open(path)
 
 
@@ -150,12 +150,12 @@ def test_a_big_shard_streams_one_row_group_at_a_time(tmp_path, monkeypatch):
     with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=0,
                      serializer=Serializer.UTF8, slot_count=MAX_RECORDS) as writer:
         for id_ in range(0, 2000, 2):
-            writer.add(id_, f"mol-{id_}".encode())
+            writer.add(id_, f"spc-{id_}".encode())
         assert writer._tmp_path.stat().st_size > 0 and len(writer._ids) < 200
     assert pq.ParquetFile(path).num_row_groups > 5
     with Shard.open(path) as shard:
         assert shard.record_count == 1000 and shard.slot_count == 1999
-        assert shard[1998].load() == "mol-1998" and 1997 not in shard
+        assert shard[1998].load() == "spc-1998" and 1997 not in shard
 
 
 def test_a_shard_written_in_one_go_still_opens(tmp_path):
@@ -189,11 +189,11 @@ def test_an_empty_shard_is_a_valid_file(tmp_path):
 def test_one_file_many_shards_each_read_by_its_id_range(tmp_path):
     """A big file of logical shards: each is a row group, read alone by its id range."""
     path = tmp_path / "vol.parquet"
-    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=PayloadKind.SMILES,
+    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=0, kind=PayloadKind.GENERIC_BYTES,
                      serializer=Serializer.UTF8, slot_count=1000, source_index=True) as writer:
         for id_ in range(1000):
             if id_ != 305:  # a hole inside the second shard
-                writer.add(id_, f"mol-{id_}".encode(), source_index=10 * id_)
+                writer.add(id_, f"spc-{id_}".encode(), source_index=10 * id_)
             if id_ % 256 == 255:
                 writer.end_group()
     meta = pq.read_metadata(path)
@@ -203,7 +203,7 @@ def test_one_file_many_shards_each_read_by_its_id_range(tmp_path):
     with Shard.open(path, ids=(256, 512)) as shard:
         assert (shard.base_id, shard.slot_count, shard.record_count) == (256, 256, 255)
         assert [r.id for r in shard][:2] == [256, 257] and 305 not in shard
-        assert shard[511].load() == "mol-511" and 512 not in shard
+        assert shard[511].load() == "spc-511" and 512 not in shard
     with Shard.open(path, ids=(250, 260)) as shard:  # straddles two row groups
         assert [r.id for r in shard] == list(range(250, 260))
     with Shard.open(path) as shard:  # the whole file still opens as one shard
@@ -225,20 +225,20 @@ def test_merge_shards_adopts_files_into_one_even_over_a_source(tmp_path):
     from ms_flow.core.data.shard import merge_shards
 
     big = tmp_path / "big.parquet"
-    with ShardWriter(big, dataset_id=uuid.UUID(int=7), shard_id=0, base_id=0, kind=PayloadKind.SDF,
+    with ShardWriter(big, dataset_id=uuid.UUID(int=7), shard_id=0, base_id=0, kind=PayloadKind.GENERIC_BYTES,
                      serializer=Serializer.UTF8, slot_count=MAX_RECORDS) as writer:
         for lo in (0, 10):
             for id_ in (lo, lo + 1):
-                writer.add(id_, f"mol-{id_}".encode())
+                writer.add(id_, f"spc-{id_}".encode())
             writer.end_group()
     late = _write(tmp_path / "late.parquet", [21], base_id=20, slot_count=5)
     # A redone shard (late) joins the shards that were already merged, into the same file.
     ranges = merge_shards([(big, (0, 10)), (big, (10, 20)), (late, None)], big, metadata={"merged": True})
     # Each shard keeps the range it was written with (the late one from its file's base_id).
-    assert ranges == [{"base_id": 0, "slot_count": 2, "record_count": 2, "scope": None},
-                      {"base_id": 10, "slot_count": 2, "record_count": 2, "scope": None},
-                      {"base_id": 20, "slot_count": 2, "record_count": 1, "scope": None}]
+    assert ranges == [{"base_id": 0, "slot_count": 2, "record_count": 2, "scope": None, "origin": None, "n_dropped": 0},
+                      {"base_id": 10, "slot_count": 2, "record_count": 2, "scope": None, "origin": None, "n_dropped": 0},
+                      {"base_id": 20, "slot_count": 2, "record_count": 1, "scope": None, "origin": None, "n_dropped": 0}]
     assert pq.ParquetFile(big).num_row_groups == 3
     with Shard.open(big, ids=(20, 22)) as shard:
-        assert [r.load() for r in shard] == ["mol-21"] and shard.metadata["merged"] is True
+        assert [r.load() for r in shard] == ["spc-21"] and shard.metadata["merged"] is True
 

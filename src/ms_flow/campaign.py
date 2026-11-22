@@ -1,12 +1,12 @@
 """Campaigns: jobs whose stages all run on a cluster, from the first element to the last result.
 
-    @campaign(output=table_sink("docking_results"), volatile=("run_id",))
-    def screen(params, project):
-        return [Stage("vs", dock, shards_of(project)),
-                Stage("top", dock, From("vs", partial(best, n=params.top)), deliver="none"),
-                Stage("off", dock, From("top", against_off_targets))]
+    @campaign(output=table_sink("results"), volatile=("run_id",))
+    def sweep(params, project):
+        return [Stage("all", evaluate, shards_of(project)),
+                Stage("top", evaluate, From("all", partial(best, n=params.top)), deliver="none"),
+                Stage("more", evaluate, From("top", against_other_targets))]
 
-    workspace.submit(screen, params, executor="hpc")      # an executor of kind `queue`
+    workspace.submit(sweep, params, executor="hpc")      # an executor of kind `queue`
 
 A stage runs its task over its source: what the source function gives for the first, and what
 `From(stage, fn, args)` makes there of an earlier stage for the others (`fn` gets what that
@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ms_flow import locations
-from ms_flow.engine.files import Dir, File, swap
+from ms_flow.engine.files import Dir, File, KeptDir, swap
 from ms_flow.engine.flow import job, task
 from ms_env import HostError
 from ms_flow.remote import RemoteExecutor, _untar, read_usage, unreachable
@@ -222,6 +222,9 @@ class Campaign:
             carried, made, known, self._shas = {}, {}, dict(stages[0].digests or {}), {}
 
             def carry(mark):
+                kept = isinstance(mark, KeptDir) and self._store and locations.inside(project, mark)
+                if kept:  # in the project's folder there: later campaigns find it where it was left
+                    return KeptDir(self._store + kept)
                 if isinstance(mark, Dir):  # made there, under the campaign's directory, and left there
                     return Dir(made.setdefault(mark, f"out/{len(made)}"))
                 if mark not in carried:

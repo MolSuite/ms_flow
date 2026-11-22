@@ -1,22 +1,22 @@
-"""Where the bytes of each molecule should live: SQLite blobs or append-only volumes (V0 of docs/08-plan-volumenes.md).
+"""Where the bytes of each specimen should live: SQLite blobs or append-only volumes (V0 of docs/08-plan-volumenes.md).
 
     python -m benchmarks.refactor_optimization.bench_volumes --mode serial   --n 700000 --label baseline --data-dir /mnt/x
     python -m benchmarks.refactor_optimization.bench_volumes --mode parallel --n 700000 --label baseline --data-dir /mnt/x
-    python -m benchmarks.refactor_optimization.bench_volumes --mode serial --quick --label try   # 3000 molecules, checks the bytes
+    python -m benchmarks.refactor_optimization.bench_volumes --mode serial --quick --label try   # 3000 specimens, checks the bytes
 
 Each run adds its variants to `results/volumes_<label>.json` under `serial/<variant>` or `parallel/<variant>`, so a
 serial and a parallel run of the same label end up in one file. Each variant is measured on its own copy of the data,
 deleted when it ends unless `--keep`. A variant that does not fit in the free disk (plus 1.5 GB) is refused.
 
-Payloads are synthetic with the sizes of AMDockVS: original 2 KB, prepared 3 KB, PDBQT 2.5 KB and a 20 KB pose
-for 20 % of the molecules, about 13 KB per molecule. The index is one SQLite row per molecule; the variants differ in
+Payloads are synthetic with the sizes of DemoApp: original 2 KB, prepared 3 KB, TSV 2.5 KB and a 20 KB layout
+for 20 % of the specimens, about 13 KB per specimen. The index is one SQLite row per specimen; the variants differ in
 where the payloads go. Numbers are bounded by the disk, so compare variants on the same disk.
 
-serial: one writer, 1000 molecules per commit (the `bench2.py` of 2026-10-15)
+serial: one writer, 1000 specimens per commit (the `bench2.py` of 2026-10-15)
   HT  volumes, no fsync: the same durability as RT
   H   volumes, fsync of the volume before each commit
   RT  SQLite blobs (Ringtail-like), tuned: synchronous=OFF
-  PS  ms_flow.payloads.PayloadStore in a real project.db: put + molecule rows + commit per 1000 molecules,
+  PS  ms_flow.payloads.PayloadStore in a real project.db: put + specimen rows + commit per 1000 specimens,
       fdatasync of the touched volumes per commit (D3). Import only (V1-9); its reads are V3
   PSN PS with the fdatasync skipped: PS - PSN is what the group fsync costs
 parallel: `--workers` loky processes produce the payloads and one parent writes (the `bench3.py` of 2026-10-15)
@@ -30,11 +30,11 @@ parallel: `--workers` loky processes produce the payloads and one parent writes 
 
   PJZ PJ with zstd payloads, compressed in the workers (V5)
   PJD PJ with zstd and a dictionary per series, trained first on `--sample`'s train.pkl (V5)
-  PM  PJZ in volumes of 64 MB, then, cold: check(full), the app deletes half the molecules,
+  PM  PJZ in volumes of 64 MB, then, cold: check(full), the app deletes half the specimens,
       release, and compact (V4-10)
 
-`--sample DIR` replaces the synthetic payloads with real ones: DIR/bench.pkl is `{"sdf": [...], "pdbqt": [...],
-"pose": [...]}` (original and current are SDF), cycled over the molecules; DIR/train.pkl, the same shape and
+`--sample DIR` replaces the synthetic payloads with real ones: DIR/bench.pkl is `{"csv": [...], "tsv": [...],
+"layout": [...]}` (original and current are CSV), cycled over the specimens; DIR/train.pkl, the same shape and
 disjoint, trains PJD's dictionaries. Without it the payloads are random hex and compress about 1.8x.
 
 `durable_s` is `import_s` plus the `sync` right after it: the time until the import is on the disk. Variants that never
@@ -47,7 +47,7 @@ on every file of the variant (no sudo) and run on a new reader; pool and loky wo
 MB the device read meanwhile, from /proc/diskstats: the proof that the cache was cold (null when the device is not
 listed, e.g. tmpfs or overlay).
 
-`--quick` verifies, for every variant, that 200 random molecules read back byte-identical to what generation produced.
+`--quick` verifies, for every variant, that 200 random specimens read back byte-identical to what generation produced.
 Its numbers are not comparable with a full run.
 """
 from __future__ import annotations
@@ -70,17 +70,17 @@ from loky import get_reusable_executor
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 
-KINDS = {"original": (1, 2000), "current": (2, 3000), "pdbqt": (3, 2500), "pose": (4, 20000)}
-SHARD = 1000  # molecules per commit, serial
-CHUNK = 1000  # molecules per task, parallel
+KINDS = {"original": (1, 2000), "current": (2, 3000), "tsv": (3, 2500), "layout": (4, 20000)}
+SHARD = 1000  # specimens per commit, serial
+CHUNK = 1000  # specimens per task, parallel
 VOL_MAX = 256 << 20
 FLUSH_EVERY = 16  # results per index commit in the parallel import, as ms_flow output_flush_every
-DOCKED_FRACTION = 0.2
+COUPLED_FRACTION = 0.2
 SPARE = 1_500_000_000  # bytes that must stay free after a variant
 VARIANTS = {"serial": ("HT", "H", "RT", "PS", "PSN"), "parallel": ("VP", "VC", "RT", "PJ", "PJZ", "PJD", "PM")}
 JOB_CODECS = {"PJ": "none", "PJZ": "zstd", "PJD": "zstd-dict", "PM": "zstd"}
-PM_VOLUME_MB = 64  # so that 100k molecules fill sealed volumes, the only ones compact touches
-SAMPLE_KIND = {"original": "sdf", "current": "sdf", "pdbqt": "pdbqt", "pose": "pose"}
+PM_VOLUME_MB = 64  # so that 100k specimens fill sealed volumes, the only ones compact touches
+SAMPLE_KIND = {"original": "csv", "current": "csv", "tsv": "tsv", "layout": "layout"}
 # The payloads come from this pool; seeded, so every process (a loky worker, a test) produces the same bytes.
 _POOL = random.Random(0).randbytes(32768).hex().encode()
 
@@ -109,12 +109,12 @@ def key(i, kind):
     return i * 16 + KINDS[kind][0]
 
 
-def docked_hash(i):  # parallel: 20 % of the ids, the same answer in every process
+def coupled_hash(i):  # parallel: 20 % of the ids, the same answer in every process
     return (i * 2654435761) % 100 < 20
 
 
-def kinds_for(i, is_docked):
-    return ["original", "current", "pdbqt"] + (["pose"] if is_docked(i) else [])
+def kinds_for(i, is_coupled):
+    return ["original", "current", "tsv"] + (["layout"] if is_coupled(i) else [])
 
 
 def vol_path(root, vol):
@@ -169,33 +169,33 @@ def connect(path, incremental=False):
     return con
 
 
-def import_serial(variant, root, n, docked):
+def import_serial(variant, root, n, coupled):
     con = connect(root / "project.db", incremental=variant == "RT")
     if variant in ("HT", "RT"):
         con.execute("PRAGMA synchronous=OFF")
         con.execute("PRAGMA cache_size=-262144")
-    con.execute("CREATE TABLE molecules(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL,"
-                " original_path TEXT, current_path TEXT, pdbqt_path TEXT, pose_path TEXT)")
-    con.execute("CREATE INDEX ix_score ON molecules(score)")
-    if variant == "RT":  # key = mol_id*16 + kind -> one rowid lookup
+    con.execute("CREATE TABLE specimens(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL,"
+                " original_path TEXT, current_path TEXT, tsv_path TEXT, layout_path TEXT)")
+    con.execute("CREATE INDEX ix_score ON specimens(score)")
+    if variant == "RT":  # key = spc_id*16 + kind -> one rowid lookup
         con.execute("CREATE TABLE blobs(key INTEGER PRIMARY KEY, data BLOB)")
     else:
         con.execute("CREATE TABLE refs(key INTEGER PRIMARY KEY, vol INTEGER, off INTEGER, len INTEGER)")
         con.execute("CREATE INDEX ix_refs_vol ON refs(vol, off)")
-    is_docked = docked.__contains__
+    is_coupled = coupled.__contains__
     vol = None if variant == "RT" else VolumeWriter(root, sync=variant == "H")
     rng = random.Random(1)
     t = time.perf_counter()
     for start in range(0, n, SHARD):
         ids = range(start, min(n, start + SHARD))
         rows = [(i, rng.uniform(150, 700), rng.uniform(-2, 7), rng.uniform(-12, -3), None, None, None, None) for i in ids]
-        con.executemany("INSERT INTO molecules VALUES (?,?,?,?,?,?,?,?)", rows)
+        con.executemany("INSERT INTO specimens VALUES (?,?,?,?,?,?,?,?)", rows)
         if variant == "RT":
             con.executemany("INSERT INTO blobs VALUES (?,?)",
-                            [(key(i, k), payload(i, k)) for i in ids for k in kinds_for(i, is_docked)])
+                            [(key(i, k), payload(i, k)) for i in ids for k in kinds_for(i, is_coupled)])
         else:
             con.executemany("INSERT INTO refs VALUES (?,?,?,?)",
-                            [(key(i, k), *vol.append(payload(i, k))) for i in ids for k in kinds_for(i, is_docked)])
+                            [(key(i, k), *vol.append(payload(i, k))) for i in ids for k in kinds_for(i, is_coupled)])
             vol.flush()
         con.commit()
     con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -214,8 +214,8 @@ def produce(start, stop, mode, root):
         vol_id = start // CHUNK
         seg = Volume(vol_path(root, vol_id))
     for i in range(start, stop):
-        rows.append((i, rng.uniform(150, 700), rng.uniform(-2, 7), rng.uniform(-12, -3) if docked_hash(i) else None))
-        for k in kinds_for(i, docked_hash):
+        rows.append((i, rng.uniform(150, 700), rng.uniform(-2, 7), rng.uniform(-12, -3) if coupled_hash(i) else None))
+        for k in kinds_for(i, coupled_hash):
             data = payload(i, k)
             if mode == "VC":
                 out.append((key(i, k), vol_id, *seg.append(data)))
@@ -239,8 +239,8 @@ class ParentWriter:
         self.con.execute("PRAGMA journal_mode=WAL")
         self.con.execute("PRAGMA synchronous=OFF")
         self.con.execute("PRAGMA cache_size=-262144")
-        self.con.execute("CREATE TABLE molecules(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL)")
-        self.con.execute("CREATE INDEX ix_score ON molecules(score)")
+        self.con.execute("CREATE TABLE specimens(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL)")
+        self.con.execute("CREATE INDEX ix_score ON specimens(score)")
         if variant == "RT":
             self.con.execute("CREATE TABLE blobs(key INTEGER PRIMARY KEY, data BLOB)")
         else:
@@ -251,7 +251,7 @@ class ParentWriter:
 
     def write(self, rows, out):
         c = self.con
-        c.executemany("INSERT INTO molecules VALUES (?,?,?,?)", rows)
+        c.executemany("INSERT INTO specimens VALUES (?,?,?,?)", rows)
         if self.v == "RT":
             c.executemany("INSERT INTO blobs VALUES (?,?)", out)
         elif self.v == "VP":
@@ -310,35 +310,35 @@ def import_parallel(variant, root, n, workers):
 # --- Reader -------------------------------------------------------------------------
 
 def store_project(root):
-    """PS/PSN/PJ: a real project.db whose `molecules` table references `ms_payloads`, as an app declares it."""
+    """PS/PSN/PJ: a real project.db whose `specimens` table references `ms_payloads`, as an app declares it."""
     from ms_flow.core.database import ProjectStore
 
     project = ProjectStore.open_at(root / "project.db")
     with project.engine.begin() as c:
-        c.exec_driver_sql("CREATE TABLE molecules(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL, "
+        c.exec_driver_sql("CREATE TABLE specimens(id INTEGER PRIMARY KEY, mw REAL, logp REAL, score REAL, "
                           + ", ".join(f"{k}_payload_id INTEGER REFERENCES ms_payloads(id)" for k in KINDS) + ")")
-        c.exec_driver_sql("CREATE INDEX ix_score ON molecules(score)")
+        c.exec_driver_sql("CREATE INDEX ix_score ON specimens(score)")
         for k in KINDS:
-            c.exec_driver_sql(f"CREATE INDEX ix_{k} ON molecules({k}_payload_id)")
+            c.exec_driver_sql(f"CREATE INDEX ix_{k} ON specimens({k}_payload_id)")
     return project
 
 
-def verify_store(project, store, n, is_docked):
-    """--quick: 200 random molecules have exactly the payloads they should, byte-identical."""
+def verify_store(project, store, n, is_coupled):
+    """--quick: 200 random specimens have exactly the payloads they should, byte-identical."""
     mols = random.Random(4).sample(range(n), min(200, n))
     with project.engine.connect() as c:
         refs = {r[0]: r[1:] for r in c.exec_driver_sql("SELECT id, " + ", ".join(f"{k}_payload_id" for k in KINDS)
-                                                         + " FROM molecules")}
+                                                         + " FROM specimens")}
     assert len(refs) == n
     for i in mols:
         for k, pid in zip(KINDS, refs[i]):
-            assert (pid is not None) == (k in kinds_for(i, is_docked))
+            assert (pid is not None) == (k in kinds_for(i, is_coupled))
             assert pid is None or store.get(pid) == payload(i, k), (i, k)
     return len(mols)
 
 
 def store_rows(start, stop, config=None):
-    """PJ, in a worker: the rows of one chunk, each with its `Payload`s, as an AMDockVS task would return them.
+    """PJ, in a worker: the rows of one chunk, each with its `Payload`s, as an DemoApp task would return them.
     `config`: the sample directory, the codec and the dictionary of each series (PJZ, PJD)."""
     from ms_flow.payloads import Payload
 
@@ -350,11 +350,11 @@ def store_rows(start, stop, config=None):
     rows = []
     for i in range(start, stop):
         row = {"id": i, "mw": rng.uniform(150, 700), "logp": rng.uniform(-2, 7),
-               "score": rng.uniform(-12, -3) if docked_hash(i) else None}
+               "score": rng.uniform(-12, -3) if coupled_hash(i) else None}
         for k in KINDS:
             row[f"{k}_payload_id"] = None
-        for k in kinds_for(i, docked_hash):
-            series = "poses" if k == "pose" else "ligands"
+        for k in kinds_for(i, coupled_hash):
+            series = "layouts" if k == "layout" else "guests"
             row[f"{k}_payload_id"] = Payload(payload(i, k), kind=k, series=series, codec=codec, dictionary=dicts.get(series))
         rows.append(row)
     return rows
@@ -376,12 +376,12 @@ def read_all_job(root, n, dev):
         return seconds
 
     def source(project):
-        rows = Rows(project, QuerySpec(table="molecules"))
+        rows = Rows(project, QuerySpec(table="specimens"))
         return sum(1 for row in with_payloads(project, rows, {"current_payload_id": "current"}) if row["current"])
 
     def export(project):
         with project.engine.connect() as c:
-            ids = [r[0] for r in c.exec_driver_sql("SELECT current_payload_id FROM molecules")]
+            ids = [r[0] for r in c.exec_driver_sql("SELECT current_payload_id FROM specimens")]
         return sum(1 for _, data in project.payloads.iter_bytes(ids) if data)
 
     res = {}
@@ -391,7 +391,7 @@ def read_all_job(root, n, dev):
 
 
 def maintain_job(root, dev):
-    """PM, cold: check(full), then the app deletes every other molecule, releases their payloads and
+    """PM, cold: check(full), then the app deletes every other specimen, releases their payloads and
     compacts. MB/s of compact is of live needles read (and written as they are: no dictionary)."""
     from ms_flow.core.database import ProjectStore
     from ms_flow.payloads import PayloadStore
@@ -407,7 +407,7 @@ def maintain_job(root, dev):
 
     def delete_half(project, store):
         with project.engine.begin() as c:
-            gone = c.exec_driver_sql("DELETE FROM molecules WHERE id % 2 = 0 RETURNING "
+            gone = c.exec_driver_sql("DELETE FROM specimens WHERE id % 2 = 0 RETURNING "
                                      + ", ".join(f"{k}_payload_id" for k in KINDS)).fetchall()
         return store.release(pid for row in gone for pid in row if pid is not None)
 
@@ -435,7 +435,7 @@ def train_dictionaries(project, sample):
     with open(Path(sample) / "train.pkl", "rb") as f:
         train = pickle.load(f)
     dicts = {}
-    for series, kinds in (("ligands", ("sdf", "pdbqt")), ("poses", ("pose",))):
+    for series, kinds in (("guests", ("csv", "tsv")), ("layouts", ("layout",))):
         with project.get_session() as session:
             project.payloads.put(session, [Payload(r, series=series) for k in kinds for r in train[k]])
             session.commit()
@@ -457,7 +457,7 @@ def measure_job(root, n, workers, quick, dev=None, codec="none", sample=None, ma
               "dicts": train_dictionaries(project, sample) if codec == "zstd-dict" else {}}
     with project.engine.connect() as c:  # the training payloads stay out of raw_mb/stored_mb
         first = c.exec_driver_sql("SELECT coalesce(max(id), 0) FROM ms_payloads").scalar() + 1
-    output = table_sink("molecules", columns=("id", "mw", "logp", "score", *(f"{k}_payload_id" for k in KINDS)))
+    output = table_sink("specimens", columns=("id", "mw", "logp", "score", *(f"{k}_payload_id" for k in KINDS)))
     chunks = job(task=store_chunk, output=output)(
         lambda params, project: [(i, min(i + CHUNK, n), config) for i in range(0, n, CHUNK)])
     volume_size = payloads.VOLUME_SIZE
@@ -483,7 +483,7 @@ def measure_job(root, n, workers, quick, dev=None, codec="none", sample=None, ma
                                       (first,)).scalar()
         res["raw_mb"], res["stored_mb"], res["train_mb"] = round(raw / 1e6), round(stored / 1e6), round(train / 1e6, 1)
         if quick:
-            res["verified_ids"] = verify_store(project, project.payloads, n, docked_hash)
+            res["verified_ids"] = verify_store(project, project.payloads, n, coupled_hash)
     finally:
         payloads.VOLUME_SIZE = volume_size
         project.dispose()
@@ -497,21 +497,21 @@ def measure_store(variant, root, n, quick):
     """PS/PSN: the import through PayloadStore, the way a job's writer will do it."""
     from ms_flow import payloads
 
-    docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
+    coupled = set(random.Random(2).sample(range(n), int(n * COUPLED_FRACTION)))
     project = store_project(root)
     real_sync = payloads._datasync
     if variant == "PSN":
         payloads._datasync = lambda fd: None
     store = payloads.PayloadStore(project)
     rng = random.Random(1)
-    insert = f"INSERT INTO molecules VALUES (?,?,?,?,{','.join('?' * len(KINDS))})"
+    insert = f"INSERT INTO specimens VALUES (?,?,?,?,{','.join('?' * len(KINDS))})"
     try:
         t = time.perf_counter()
         for start in range(0, n, SHARD):
             ids = range(start, min(n, start + SHARD))
-            wanted = [(i, k) for i in ids for k in kinds_for(i, docked.__contains__)]
+            wanted = [(i, k) for i in ids for k in kinds_for(i, coupled.__contains__)]
             got = dict(zip(wanted, store.put(session := project.get_session(), [
-                payloads.Payload(payload(i, k), kind=k, series="poses" if k == "pose" else "ligands") for i, k in wanted])))
+                payloads.Payload(payload(i, k), kind=k, series="layouts" if k == "layout" else "guests") for i, k in wanted])))
             rows = [(i, rng.uniform(150, 700), rng.uniform(-2, 7), rng.uniform(-12, -3), *(got.get((i, k)) for k in KINDS))
                     for i in ids]
             session.connection().connection.dbapi_connection.executemany(insert, rows)
@@ -522,7 +522,7 @@ def measure_store(variant, root, n, quick):
         res = {"n": n, "import_s": time.perf_counter() - t}
         res["durable_s"] = res["import_s"] + timed_sync()
         if quick:
-            res["verified_ids"] = verify_store(project, store, n, docked.__contains__)
+            res["verified_ids"] = verify_store(project, store, n, coupled.__contains__)
     finally:
         store.close()
         payloads._datasync = real_sync
@@ -551,8 +551,8 @@ class Reader:
             return self.con.execute("SELECT data FROM blobs WHERE key=?", (k,)).fetchone()[0]
         return self._pread(*self.con.execute("SELECT vol, off, len FROM refs WHERE key=?", (k,)).fetchone())
 
-    def read(self, mol_id, kind):
-        return self.get(key(mol_id, kind))
+    def read(self, spc_id, kind):
+        return self.get(key(spc_id, kind))
 
     def get_many(self, keys):
         """A batch for a worker: volumes read in (vol, off) order."""
@@ -582,7 +582,7 @@ def _init(variant, root):  # serial pool initializer
     _R = Reader(variant, root)
 
 
-def _read_many(keys):  # serial pool task: (molecule, kind) pairs
+def _read_many(keys):  # serial pool task: (specimen, kind) pairs
     return sum(len(_R.read(m, k)) for m, k in keys)
 
 
@@ -618,15 +618,15 @@ def percentiles(lat):
     return lat[len(lat) // 2], lat[len(lat) * 99 // 100]  # p50 and p99 (indexes 1000 and 1980 of 2000)
 
 
-def verify(read, n, is_docked, updated=frozenset()):
-    """Quick self-check: 200 random molecules read back byte-identical to what generation produced."""
+def verify(read, n, is_coupled, updated=frozenset()):
+    """Quick self-check: 200 random specimens read back byte-identical to what generation produced."""
     ids = random.Random(7).sample(range(n), min(200, n))
     for i in ids:
-        for kind in kinds_for(i, is_docked):
+        for kind in kinds_for(i, is_coupled):
             want = payload(i, kind) + (b"v2" if kind == "current" and i in updated else b"")
             got = read(i, kind)
             if got != want:
-                raise AssertionError(f"molecule {i} {kind}: read back {len(got)} bytes that differ from the {len(want)} written")
+                raise AssertionError(f"specimen {i} {kind}: read back {len(got)} bytes that differ from the {len(want)} written")
     return len(ids)
 
 
@@ -675,15 +675,15 @@ def cold(root, variant, dev, fn, fresh=True):
 
 # --- Reads, shared by the warm and the cold runs ------------------------------------
 
-TOP = "SELECT id FROM molecules WHERE mw < 450 AND logp < 4 ORDER BY score LIMIT 1000"
+TOP = "SELECT id FROM specimens WHERE mw < 450 AND logp < 4 ORDER BY score LIMIT 1000"
 
 
-def latency(r, mols, is_docked):
-    """p50 and p99 (us) of reading all the payloads of one molecule, over `mols`."""
+def latency(r, mols, is_coupled):
+    """p50 and p99 (us) of reading all the payloads of one specimen, over `mols`."""
     lat = []
     for m in mols:
         t = time.perf_counter()
-        [r.read(m, k) for k in kinds_for(m, is_docked)]
+        [r.read(m, k) for k in kinds_for(m, is_coupled)]
         lat.append((time.perf_counter() - t) * 1e6)
     return percentiles(lat)
 
@@ -696,28 +696,28 @@ def sql_s(query):
     return lambda r: timed(lambda: r.con.execute(query).fetchall())[0]
 
 
-def serial_reads(n, top, docked):
+def serial_reads(n, top, coupled):
     """The serial reads after the top query, as (metric, fn(reader) -> seconds): warm they share one reader,
     cold each gets its own."""
-    docked_top = [i for i in top if i in docked]
+    coupled_top = [i for i in top if i in coupled]
     return [
         ("read_top1000_current_s", lambda r: timed(lambda: [r.read(i, "current") for i in top])[0]),
-        ("read_top_poses_s", lambda r: timed(lambda: [r.read(i, "pose") for i in docked_top])[0]),
+        ("read_top_layouts_s", lambda r: timed(lambda: [r.read(i, "layout") for i in coupled_top])[0]),
         ("stream_all_current_s", lambda r: timed(lambda: sum(len(r.read(i, "current")) for i in range(n)))[0]),
         # ordering / filtering on the index (no payloads touched)
-        ("sort_unindexed_logp_top1000_s", sql_s("SELECT id FROM molecules WHERE mw < 500 ORDER BY logp DESC LIMIT 1000")),
-        ("count_filter_s", sql_s("SELECT count(*) FROM molecules WHERE mw BETWEEN 300 AND 400 AND logp < 3")),
-        ("page_by_score_offset_s", sql_s("SELECT id FROM molecules WHERE score IS NOT NULL ORDER BY score"
+        ("sort_unindexed_logp_top1000_s", sql_s("SELECT id FROM specimens WHERE mw < 500 ORDER BY logp DESC LIMIT 1000")),
+        ("count_filter_s", sql_s("SELECT count(*) FROM specimens WHERE mw BETWEEN 300 AND 400 AND logp < 3")),
+        ("page_by_score_offset_s", sql_s("SELECT id FROM specimens WHERE score IS NOT NULL ORDER BY score"
                                          " LIMIT 200 OFFSET %d" % (n // 10))),
     ]
 
 
-def open_and_get_mol_x(variant, root, n, is_docked):
-    """Access molecule X: a fresh reader and the first molecule. Returns (ms, the reader, which the caller closes)."""
+def open_and_get_spc_x(variant, root, n, is_coupled):
+    """Access specimen X: a fresh reader and the first specimen. Returns (ms, the reader, which the caller closes)."""
     t = time.perf_counter()
     r = Reader(variant, root)
     x = n // 2
-    [r.read(x, k) for k in kinds_for(x, is_docked)]
+    [r.read(x, k) for k in kinds_for(x, is_coupled)]
     return (time.perf_counter() - t) * 1e3, r
 
 
@@ -757,11 +757,11 @@ def loky_read(variant, root, keys, workers):  # parallel: the workers start here
 # --- Modes --------------------------------------------------------------------------
 
 def measure_serial(variant, root, n, quick, dev=None):
-    docked = set(random.Random(2).sample(range(n), int(n * DOCKED_FRACTION)))
-    is_docked = docked.__contains__
+    coupled = set(random.Random(2).sample(range(n), int(n * COUPLED_FRACTION)))
+    is_coupled = coupled.__contains__
     res = {"n": n}
 
-    res["import_s"] = import_serial(variant, root, n, docked)
+    res["import_s"] = import_serial(variant, root, n, coupled)
     res["durable_s"] = res["import_s"] + timed_sync()
     res["files"] = sum(len(files) for _, _, files in os.walk(root))
     res["size_mb"] = round(dir_size(root) / 1e6)
@@ -771,14 +771,14 @@ def measure_serial(variant, root, n, quick, dev=None):
     try:
         reader = Reader(variant, root)
         res["query_top1000_s"], top = query_top(reader)
-        reads = serial_reads(n, top, docked)
+        reads = serial_reads(n, top, coupled)
         for name, fn in reads:
             res[name] = fn(reader)
-        res["open_and_get_mol_x_ms"], r2 = open_and_get_mol_x(variant, root, n, is_docked)
+        res["open_and_get_spc_x_ms"], r2 = open_and_get_spc_x(variant, root, n, is_coupled)
         mols = random.Random(5).sample(range(n), min(2000, n))
-        res["get_mol_p50_us"], res["get_mol_p99_us"] = latency(r2, mols, is_docked)
+        res["get_spc_p50_us"], res["get_spc_p99_us"] = latency(r2, mols, is_coupled)
         rng = random.Random(3)
-        keys = [(m, rng.choice(["original", "current", "pdbqt"])) for m in (rng.randrange(n) for _ in range(80_000))]
+        keys = [(m, rng.choice(["original", "current", "tsv"])) for m in (rng.randrange(n) for _ in range(80_000))]
         chunks = [keys[i::8] for i in range(8)]
         res["parallel_8x10k_random_s"] = serial_pool(variant, root, chunks)
 
@@ -807,16 +807,16 @@ def measure_serial(variant, root, n, quick, dev=None):
             res[name + "_cold"], mb = cold(root, variant, dev, fn)
             if name == "stream_all_current_s":
                 res["stream_all_current_cold_disk_mb"] = mb
-        (res["open_and_get_mol_x_ms_cold"], rx), _ = cold(root, variant, dev, lambda _: open_and_get_mol_x(variant, root, n, is_docked), fresh=False)
+        (res["open_and_get_spc_x_ms_cold"], rx), _ = cold(root, variant, dev, lambda _: open_and_get_spc_x(variant, root, n, is_coupled), fresh=False)
         rx.close()
-        (res["get_mol_p50_us_cold"], res["get_mol_p99_us_cold"]), _ = cold(root, variant, dev, lambda r: latency(r, mols, is_docked))
+        (res["get_spc_p50_us_cold"], res["get_spc_p99_us_cold"]), _ = cold(root, variant, dev, lambda r: latency(r, mols, is_coupled))
         res["parallel_8x10k_random_s_cold"], res["parallel_8x10k_random_cold_disk_mb"] = cold(
             root, variant, dev, lambda _: serial_pool(variant, root, chunks), fresh=False)
 
         if quick:  # after the mutation: it covers both the imported and the re-prepared bytes
             check = Reader(variant, root)
             try:
-                res["verified_ids"] = verify(check.read, n, is_docked, set(upd))
+                res["verified_ids"] = verify(check.read, n, is_coupled, set(upd))
             finally:
                 check.close()
     finally:
@@ -837,20 +837,20 @@ def measure_parallel(variant, root, n, workers, quick, dev=None):
     mols = random.Random(5).sample(range(n), min(2000, n))
     r = Reader(variant, root)
     try:
-        p50, p99 = latency(r, mols, docked_hash)
-        res["get_mol_p50_us"], res["get_mol_p99_us"] = round(p50, 1), round(p99, 1)
+        p50, p99 = latency(r, mols, coupled_hash)
+        res["get_spc_p50_us"], res["get_spc_p99_us"] = round(p50, 1), round(p99, 1)
         res["top1000_batch_s"] = top_batch(r)
         res["stream_all_current_s"] = stream_batches(r, n)
         rng = random.Random(3)
-        keys = [key(rng.randrange(n), rng.choice(["original", "current", "pdbqt"])) for _ in range(20_000 * workers)]
+        keys = [key(rng.randrange(n), rng.choice(["original", "current", "tsv"])) for _ in range(20_000 * workers)]
         random_read = f"parallel_{workers}x20k_random"
         res[random_read + "_s"] = loky_read(variant, root, keys, workers)
     finally:
         r.close()
 
     # the same reads with nothing cached: each one evicts the files and reads through a new reader
-    (p50, p99), _ = cold(root, variant, dev, lambda r: latency(r, mols, docked_hash))
-    res["get_mol_p50_us_cold"], res["get_mol_p99_us_cold"] = round(p50, 1), round(p99, 1)
+    (p50, p99), _ = cold(root, variant, dev, lambda r: latency(r, mols, coupled_hash))
+    res["get_spc_p50_us_cold"], res["get_spc_p99_us_cold"] = round(p50, 1), round(p99, 1)
     res["top1000_batch_s_cold"], _ = cold(root, variant, dev, top_batch)
     res["stream_all_current_s_cold"], res["stream_all_current_cold_disk_mb"] = cold(root, variant, dev, lambda r: stream_batches(r, n))
     res[random_read + "_s_cold"], res[random_read + "_cold_disk_mb"] = cold(
@@ -859,7 +859,7 @@ def measure_parallel(variant, root, n, workers, quick, dev=None):
     if quick:
         check = Reader(variant, root)
         try:
-            res["verified_ids"] = verify(check.read, n, docked_hash)
+            res["verified_ids"] = verify(check.read, n, coupled_hash)
         finally:
             check.close()
     return res
@@ -904,9 +904,9 @@ def diskstats_name(disk):
     return None
 
 
-def mean_molecule_bytes():
-    """Payload bytes per molecule, from the generator itself, plus about 100 bytes of index rows."""
-    return sum(len(payload(i, k)) for i in range(2000) for k in kinds_for(i, docked_hash)) / 2000 + 100
+def mean_specimen_bytes():
+    """Payload bytes per specimen, from the generator itself, plus about 100 bytes of index rows."""
+    return sum(len(payload(i, k)) for i in range(2000) for k in kinds_for(i, coupled_hash)) / 2000 + 100
 
 
 def save(out, meta, mode, variant, res):
@@ -924,7 +924,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mode", choices=sorted(VARIANTS), required=True)
     ap.add_argument("--label", required=True, help="name of this run, e.g. 'baseline'")
-    ap.add_argument("--n", type=int, help="molecules (default 100000, or 3000 with --quick)")
+    ap.add_argument("--n", type=int, help="specimens (default 100000, or 3000 with --quick)")
     ap.add_argument("--variants", help=f"comma list (serial: {','.join(VARIANTS['serial'])}; parallel: {','.join(VARIANTS['parallel'])})")
     ap.add_argument("--workers", type=int, default=14, help="parallel mode: loky processes")
     ap.add_argument("--data-dir", type=Path, default=_REPO / ".bench_runs" / "refactor_optimization" / "volumes",
@@ -932,10 +932,10 @@ def main(argv=None):
     ap.add_argument("--results-dir", type=Path, default=_HERE / "results")
     ap.add_argument("--sample", type=Path, help="directory with bench.pkl and train.pkl of real payloads (see above)")
     ap.add_argument("--keep", action="store_true", help="do not delete the data of each variant")
-    ap.add_argument("--quick", action="store_true", help="small n, and check 200 molecules read back identical; not comparable")
+    ap.add_argument("--quick", action="store_true", help="small n, and check 200 specimens read back identical; not comparable")
     args = ap.parse_args(argv)
 
-    # PJZ/PJD/PM only on request: the codecs want --sample, the synthetic pool is not chemistry
+    # PJZ/PJD/PM only on request: the codecs want --sample, the synthetic pool is not statistics
     variants = args.variants.split(",") if args.variants else [v for v in VARIANTS[args.mode]
                                                                if v not in ("PJZ", "PJD", "PM")]
     if bad := [v for v in variants if v not in VARIANTS[args.mode]]:
@@ -956,7 +956,7 @@ def main(argv=None):
     dev = diskstats_name(meta["disk"])
 
     for variant in variants:
-        need = int(n * mean_molecule_bytes() * (1.3 if variant == "RT" else 1.0))  # SQLite blobs weigh ~1.3x volumes
+        need = int(n * mean_specimen_bytes() * (1.3 if variant == "RT" else 1.0))  # SQLite blobs weigh ~1.3x volumes
         free = shutil.disk_usage(data_dir).free
         if free < need + SPARE:
             raise SystemExit(f"{args.mode}/{variant} needs about {need / 1e9:.1f} GB and only {free / 1e9:.1f} GB are free in "

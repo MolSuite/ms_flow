@@ -24,8 +24,8 @@ def test_project_store_is_public_api_not_backend_subclass():
     assert [base.__name__ for base in ProjectStore.__bases__] == ["object"]
 
 
-class _TestMolecule(SQLModel, table=True):
-    __tablename__ = "test_project_store_molecules"
+class _TestSpecimen(SQLModel, table=True):
+    __tablename__ = "test_project_store_specimens"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
@@ -55,31 +55,31 @@ def test_project_store_crud_and_filters(tmp_path):
     project_db.connect(project_dir)
     store = ProjectStore(project_db)
 
-    first = store.insert(_TestMolecule(name="mol-a", selected=True, score=1.5))
+    first = store.insert(_TestSpecimen(name="spc-a", selected=True, score=1.5))
     assert first.id is not None
 
     store.insert_batch(
         [
-            _TestMolecule(name="mol-b", selected=False, score=2.5),
-            _TestMolecule(name="mol-c", selected=False, score=3.5),
+            _TestSpecimen(name="spc-b", selected=False, score=2.5),
+            _TestSpecimen(name="spc-c", selected=False, score=3.5),
         ]
     )
 
-    all_rows = store.select(_TestMolecule, order=("id",))
-    assert [row.name for row in all_rows] == ["mol-a", "mol-b", "mol-c"]
-    assert store.count(_TestMolecule) == 3
+    all_rows = store.select(_TestSpecimen, order=("id",))
+    assert [row.name for row in all_rows] == ["spc-a", "spc-b", "spc-c"]
+    assert store.count(_TestSpecimen) == 3
 
-    selected_rows = store.select(_TestMolecule, filters={"selected": True})
+    selected_rows = store.select(_TestSpecimen, filters={"selected": True})
     assert len(selected_rows) == 1
-    assert selected_rows[0].name == "mol-a"
+    assert selected_rows[0].name == "spc-a"
 
-    first_high_score = store.first(_TestMolecule, filters={"score__gt": 2.0}, order=("score",))
+    first_high_score = store.first(_TestSpecimen, filters={"score__gt": 2.0}, order=("score",))
     assert first_high_score is not None
-    assert first_high_score.name == "mol-b"
+    assert first_high_score.name == "spc-b"
 
-    deleted = store.delete(_TestMolecule, filters={"selected": False})
+    deleted = store.delete(_TestSpecimen, filters={"selected": False})
     assert deleted == 2
-    assert store.count(_TestMolecule) == 1
+    assert store.count(_TestSpecimen) == 1
 
 
 def test_project_store_high_level_filters_rows_and_keyset(tmp_path):
@@ -90,36 +90,36 @@ def test_project_store_high_level_filters_rows_and_keyset(tmp_path):
 
     store.insert_batch(
         [
-            _TestMolecule(name="mol-a", selected=True, score=1.0),
-            _TestMolecule(name="mol-b", selected=True, score=3.0),
-            _TestMolecule(name="mol-c", selected=False, score=2.0),
-            _TestMolecule(name="mol-d", selected=True, score=4.0),
+            _TestSpecimen(name="spc-a", selected=True, score=1.0),
+            _TestSpecimen(name="spc-b", selected=True, score=3.0),
+            _TestSpecimen(name="spc-c", selected=False, score=2.0),
+            _TestSpecimen(name="spc-d", selected=True, score=4.0),
         ]
     )
 
     top_selected = store.select_rows(
-        _TestMolecule,
+        _TestSpecimen,
         fields=("id", "name", "score"),
         filters={"selected": True, "score__gt": 1.5},
         order=("-score",),
         limit=2,
     )
-    assert [row["name"] for row in top_selected] == ["mol-d", "mol-b"]
+    assert [row["name"] for row in top_selected] == ["spc-d", "spc-b"]
     assert all("selected" not in row for row in top_selected)
 
     streamed = list(
         store.stream_rows(
-            _TestMolecule,
+            _TestSpecimen,
             fields=("id", "name"),
             filters={"selected": True},
             order=("id",),
             yield_per=2,
         )
     )
-    assert [row["name"] for row in streamed] == ["mol-a", "mol-b", "mol-d"]
+    assert [row["name"] for row in streamed] == ["spc-a", "spc-b", "spc-d"]
 
     page1, cursor = store.page_after(
-        _TestMolecule,
+        _TestSpecimen,
         cursor_field="id",
         after=None,
         limit=2,
@@ -128,7 +128,7 @@ def test_project_store_high_level_filters_rows_and_keyset(tmp_path):
     assert cursor is not None
 
     page2, cursor2 = store.page_after(
-        _TestMolecule,
+        _TestSpecimen,
         cursor_field="id",
         after=cursor,
         limit=10,
@@ -138,21 +138,21 @@ def test_project_store_high_level_filters_rows_and_keyset(tmp_path):
 
     keyset_rows = list(
         store.stream_keyset(
-            _TestMolecule,
+            _TestSpecimen,
             cursor_field="id",
             batch_size=2,
             fields=("id", "name"),
         )
     )
-    assert [row["name"] for row in keyset_rows] == ["mol-a", "mol-b", "mol-c", "mol-d"]
+    assert [row["name"] for row in keyset_rows] == ["spc-a", "spc-b", "spc-c", "spc-d"]
 
     updated = store.update_rows(
-        _TestMolecule,
-        filters={"name__in": ["mol-a", "mol-c"]},
+        _TestSpecimen,
+        filters={"name__in": ["spc-a", "spc-c"]},
         values={"selected": False},
     )
     assert updated == 2
-    assert store.count(_TestMolecule, filters={"selected": True}) == 2
+    assert store.count(_TestSpecimen, filters={"selected": True}) == 2
 
 
 def test_project_store_ops_caches_graph_model_resolution(tmp_path, monkeypatch):
@@ -336,7 +336,7 @@ def test_insert_graph_leaf_serializes_json_columns(tmp_path):
                 "parents": [{"$ref": "p1", "name": "parent-1"}],
                 "children": [
                     {"$ref": "c1", "parent_ref": "p1", "name": "with-dict",
-                     "extra": {"component_class": "ligand", "selector": "JXM:A:1"}},
+                     "extra": {"component_class": "guest", "selector": "JXM:A:1"}},
                     {"$ref": "c2", "parent_ref": "p1", "name": "with-none", "extra": None},
                 ],
             },
@@ -354,7 +354,7 @@ def test_insert_graph_leaf_serializes_json_columns(tmp_path):
     # dict was serialized to JSON text (not bound raw); None -> JSON 'null', exactly
     # what Core's JSON bind processor does (so the leaf path matches the RETURNING
     # path and reads back as None via the ORM json result processor).
-    assert by_name["with-dict"] == '{"component_class": "ligand", "selector": "JXM:A:1"}'
+    assert by_name["with-dict"] == '{"component_class": "guest", "selector": "JXM:A:1"}'
     assert by_name["with-none"] == "null"
 
 
@@ -434,11 +434,11 @@ def test_project_store_ops_caches_graph_table_reflection(tmp_path, monkeypatch):
 def test_deferred_indexes_drop_for_a_big_insert_and_come_back(tmp_path):
     store = ProjectStore()
     store.connect(tmp_path / "project")
-    table = _TestMolecule.__tablename__
+    table = _TestSpecimen.__tablename__
     indexes = {"ix_t_name": "(name)", "ix_t_selected": "(id) WHERE selected=1"}
     store.ensure_indexes(table, indexes)
     assert store.indexes_ready(table, indexes)
-    store.insert_batch([_TestMolecule(name=f"m{i}") for i in range(10)])
+    store.insert_batch([_TestSpecimen(name=f"m{i}") for i in range(10)])
 
     assert not store.defer_indexes(table, indexes, incoming=9)  # small insert into a bigger table
     assert store.indexes_ready(table, indexes)

@@ -80,17 +80,17 @@ def test_hosts_and_executors_are_kept_by_name(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     kept = SettingsManager()
     assert list(kept.settings.hosts) == list(kept.settings.executors) == ["local"]  # this machine, always
-    kept.save_host("laptop", address="192.168.1.2", cpus=-2, tools={"vina": "/opt/vina"})
-    kept.save_host("pc1", address="192.168.1.3", install=["unidock"])
+    kept.save_host("laptop", address="192.168.1.2", cpus=-2, tools={"solver": "/opt/solver"})
+    kept.save_host("pc1", address="192.168.1.3", install=["gpusolver"])
     kept.save_host("local", cpus=-2)
     kept.save_executor("lab", kind="ray", hosts=["local", "pc1"])
     kept.save_executor("hpc", kind="queue", hosts=["laptop"], max_jobs=20)
 
     again = SettingsManager().settings  # as another session reads them
-    assert again.hosts["laptop"].tools == {"vina": "/opt/vina"} and again.hosts["local"].cpus == -2
+    assert again.hosts["laptop"].tools == {"solver": "/opt/solver"} and again.hosts["local"].cpus == -2
     assert again.executors["lab"].hosts == ["local", "pc1"] and again.executors["hpc"].max_jobs == 20
     assert again.executors["local"].kind == "loky"
-    assert again.hosts["pc1"].install == ["unidock"] and again.hosts["laptop"].install is None  # None: each one
+    assert again.hosts["pc1"].install == ["gpusolver"] and again.hosts["laptop"].install is None  # None: each one
 
     for wrong, why in (
         (lambda: kept.save_host("pc2", adress="192.168.1.4"), "has no adress"),
@@ -365,9 +365,9 @@ def test_a_site_script_is_read_into_the_fields_of_a_queue_and_written_back():
     from ms_flow.site_script import RESOURCES, directives, read
 
     said = read("""#!/bin/bash
-#SBATCH --job-name=dock
+#SBATCH --job-name=couple
 #SBATCH -p gpu
-#SBATCH --account=chem123   # our group
+#SBATCH --account=lab123   # our group
 #SBATCH -N 2
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task 16
@@ -381,21 +381,21 @@ module load gcc/12 cuda/12.2
 ml python
 source ~/venv/bin/activate
 cd $SLURM_SUBMIT_DIR
-srun python dock.py
+srun python couple.py
 """)
     assert {field: said[field] for field in RESOURCES} == {
-        "partition": "gpu", "account": "chem123", "nodes": 2, "cpus": 16, "gpus": 2, "memory_gb": 62, "time": "2-00:00:00"}
+        "partition": "gpu", "account": "lab123", "nodes": 2, "cpus": 16, "gpus": 2, "memory_gb": 62, "time": "2-00:00:00"}
     assert said["modules"] == ["purge", "load gcc/12 cuda/12.2", "load python"]
-    assert said["setup"] == "#SBATCH --job-name=dock\nsource ~/venv/bin/activate"
+    assert said["setup"] == "#SBATCH --job-name=couple\nsource ~/venv/bin/activate"
     # what ms_flow sets itself, and what runs the site's program
     assert said["dropped"] == ["#SBATCH --ntasks-per-node=4", "#SBATCH --output=out_%j.log", "cd $SLURM_SUBMIT_DIR",
-                               "srun python dock.py"]
+                               "srun python couple.py"]
     assert read("#SBATCH --gres=gpu:a100:2")["setup"] == "#SBATCH --gres=gpu:a100:2"  # of a type: as the site wrote it
     written = directives("slurm", **{field: said[field] for field in (*RESOURCES, "modules", "setup")})
     assert written.splitlines() == [
-        "#SBATCH --partition=gpu", "#SBATCH --account=chem123", "#SBATCH --nodes=2", "#SBATCH --ntasks-per-node=1",
+        "#SBATCH --partition=gpu", "#SBATCH --account=lab123", "#SBATCH --nodes=2", "#SBATCH --ntasks-per-node=1",
         "#SBATCH --cpus-per-task=16", "#SBATCH --gres=gpu:2", "#SBATCH --mem=62G", "#SBATCH --time=2-00:00:00",
-        "#SBATCH --job-name=dock", "module purge", "module load gcc/12 cuda/12.2", "module load python",
+        "#SBATCH --job-name=couple", "module purge", "module load gcc/12 cuda/12.2", "module load python",
         "source ~/venv/bin/activate"]
     assert read(written)["setup"] == said["setup"]  # read back, the same
 

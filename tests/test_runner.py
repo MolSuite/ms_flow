@@ -87,10 +87,10 @@ def test_what_travels_is_data_and_names_and_what_is_not_is_refused(tmp_path):
 
 
 def test_parts_of_one_group_come_back_parts_of_one_group():
-    group = PayloadGroup(kind="sdf")
-    rows = unplain(json.loads(json.dumps(plain([{"pose": group.add(b"one")}, {"pose": group.add(b"two")}], "rows"))))
-    (whole, sizes), = {id(row["pose"].group): row["pose"].group.packed() for row in rows}.values()
-    assert [row["pose"].index for row in rows] == [0, 1] and sizes == [3, 3] and whole.raw_length == 6
+    group = PayloadGroup(kind="csv")
+    rows = unplain(json.loads(json.dumps(plain([{"layout": group.add(b"one")}, {"layout": group.add(b"two")}], "rows"))))
+    (whole, sizes), = {id(row["layout"].group): row["layout"].group.packed() for row in rows}.values()
+    assert [row["layout"].index for row in rows] == [0, 1] and sizes == [3, 3] and whole.raw_length == 6
     assert unplain(json.loads(json.dumps(plain({7: "a", None: [1]}, "keys")))) == {7: "a", None: [1]}
 
 

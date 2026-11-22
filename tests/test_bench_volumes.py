@@ -8,10 +8,10 @@ import pytest
 from benchmarks.refactor_optimization import bench_volumes
 
 
-SERIAL_READS = ["query_top1000_s", "read_top1000_current_s", "read_top_poses_s", "stream_all_current_s",
+SERIAL_READS = ["query_top1000_s", "read_top1000_current_s", "read_top_layouts_s", "stream_all_current_s",
                 "sort_unindexed_logp_top1000_s", "count_filter_s", "page_by_score_offset_s",
-                "open_and_get_mol_x_ms", "get_mol_p50_us", "get_mol_p99_us", "parallel_8x10k_random_s"]
-PARALLEL_READS = ["get_mol_p50_us", "get_mol_p99_us", "top1000_batch_s", "stream_all_current_s", "parallel_2x20k_random_s"]
+                "open_and_get_spc_x_ms", "get_spc_p50_us", "get_spc_p99_us", "parallel_8x10k_random_s"]
+PARALLEL_READS = ["get_spc_p50_us", "get_spc_p99_us", "top1000_batch_s", "stream_all_current_s", "parallel_2x20k_random_s"]
 
 
 def check_cold(res, reads, random_read):
@@ -40,10 +40,10 @@ def test_serial_variants_read_back_what_was_written(tmp_path):
     for res in record["variants"].values():
         assert res["verified_ids"] == 200 and res["durable_s"] >= res["import_s"] > 0
     for name in ("serial/PS", "serial/PSN"):  # import only; their reads are V3
-        assert record["variants"].pop(name)["files"] == 3  # project.db, a "ligands" and a "poses" volume
+        assert record["variants"].pop(name)["files"] == 3  # project.db, a "guests" and a "layouts" volume
     for res in record["variants"].values():
         check_cold(res, SERIAL_READS, "parallel_8x10k_random")
-        assert res["import_s"] > 0 and res["update_5000_s"] > 0 and res["get_mol_p99_us"] >= res["get_mol_p50_us"]
+        assert res["import_s"] > 0 and res["update_5000_s"] > 0 and res["get_spc_p99_us"] >= res["get_spc_p50_us"]
     assert record["variants"]["serial/RT"]["files"] == 1  # blobs live in project.db
     assert record["variants"]["serial/HT"]["files"] == 2  # project.db and one volume
 
@@ -68,7 +68,7 @@ def test_parallel_variants_join_the_serial_run_of_the_same_label(tmp_path):
     for name in ("stream_all_current", "export_all_current"):
         disk_mb = job[name + "_cold_disk_mb"]
         assert job[name + "_s_cold"] > 0 and (disk_mb is None or disk_mb > 0), name
-    assert job["files"] == 3  # project.db, a "ligands" and a "poses" volume
+    assert job["files"] == 3  # project.db, a "guests" and a "layouts" volume
 
 
 @pytest.mark.slow
@@ -80,7 +80,7 @@ def test_codec_variants_store_a_sample_compressed(tmp_path):
     fake = lambda kind, n, seed: [f"{kind} {seed + i}\n".encode() + b"".join(
         f"  {(seed + i) * j % 97:4d}.{j:04d}  C  0  0\n".encode() for j in range(40)) for i in range(n)]
     for name, seed in (("bench.pkl", 0), ("train.pkl", 10_000)):  # disjoint, as V5-1's sample
-        (sample / name).write_bytes(pickle.dumps({k: fake(k, 300, seed) for k in ("sdf", "pdbqt", "pose")}))
+        (sample / name).write_bytes(pickle.dumps({k: fake(k, 300, seed) for k in ("csv", "tsv", "layout")}))
     record = run(tmp_path, "parallel", "--workers", "2", "--variants", "PJ,PJZ,PJD", "--sample", str(sample))
     assert record["sample"] == str(sample)
     pj, pjz, pjd = (record["variants"][f"parallel/{k}"] for k in ("PJ", "PJZ", "PJD"))

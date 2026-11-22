@@ -115,7 +115,7 @@ def lab_engine(tmp, ex):
 
 def run(params, tmp, ex=None, seconds=600, during=None, **options):
     with lab_engine(tmp, ex or far()) as engine:
-        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j", **options)
+        job = Flow(engine, None).submit(lab_tasks.sweep, params, executor="far", journal="j", **options)
         if during:
             threading.Thread(target=during, args=(engine, job), daemon=True).start()
         return engine.wait(job, seconds)
@@ -244,7 +244,7 @@ def test_a_file_spoiled_there_is_sent_again(request, said):
 
     ex.remote.fault(SUBMIT, 1, gone)
     with lab_engine(said, ex) as engine:
-        Flow(engine, None).submit(lab_tasks.screen, p, executor="far", journal="j")
+        Flow(engine, None).submit(lab_tasks.sweep, p, executor="far", journal="j")
         until(lambda: ex.remote.down_until, 120)
     lab(f"for f in {FAR}/c*-*/files/*/said.txt; do echo garbage > $f; done")
     assert run(p, said).status == "completed"
@@ -254,7 +254,7 @@ def test_a_file_spoiled_there_is_sent_again(request, said):
 def test_a_campaign_closed_mid_run_is_taken_up_again(request, said):
     p = params(request, n=20)
     with lab_engine(said, far()) as engine:
-        Flow(engine, None).submit(lab_tasks.screen, p, executor="far", journal="j")
+        Flow(engine, None).submit(lab_tasks.sweep, p, executor="far", journal="j")
         until(lambda: len(lab_tasks.GOT) >= 3)
     time.sleep(10)
     assert run(p, said).status == "completed"
@@ -307,12 +307,12 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(request, said, monke
         flow = Flow(engine, project)
         there = locations.root(ex, project)
         ex.remote.fault(f"mkdir -p {there}", 10 ** 9)  # never fails: counts the sendings to the project's folder
-        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert engine.wait(flow.submit(lab_tasks.sweep, params(request), executor="far"), 600).status == "completed"
         assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
         assert getattr(ex, "_no_rsync", False) == (lab("command -v rsync || :") == "")
         assert lab(f"cat {there}/said.txt") == "from here"
         sendings = ex.remote.rules[0][3]  # 2 without rsync there: the try, and tar
-        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert engine.wait(flow.submit(lab_tasks.sweep, params(request), executor="far"), 600).status == "completed"
         assert ex.remote.rules[0][3] == sendings  # another campaign found it there
         lab(f"rm {there}/said.txt")
         assert locations.reconcile(project, ex) == ["said.txt"]

@@ -21,14 +21,14 @@ def test_cuts_add_up_and_undo(tmp_path):
     db = _project(tmp_path)
     try:
         first = exclude(db, {1: [5, 3, 3], 2: [7]}, reason="filter")
-        second = exclude(db, {1: [4]}, reason="qsar")
+        second = exclude(db, {1: [4]}, reason="model")
         assert exclude(db, {1: []}) is None
         out = active_exclusions(db)
         assert out.in_range(1, 0, 10).tolist() == [3, 4, 5] and out.in_range(2, 0, 10).tolist() == [7]
         set_exclusion_active(db, first, False)
         assert active_exclusions(db).in_range(1, 0, 10).tolist() == [4]
         assert [(c["id"], c["active"], c["reason"]) for c in list_exclusions(db)] == [
-            (second, True, "qsar"), (first, False, "filter")]
+            (second, True, "model"), (first, False, "filter")]
     finally:
         db.disconnect()
 
@@ -56,7 +56,7 @@ def test_narrow_reads_the_range_of_a_file_per_shard_from_its_footer(tmp_path):
     db = _project(tmp_path)
     path = tmp_path / "s.parquet"
     with ShardWriter(path, dataset_id=uuid.UUID(int=1), shard_id=0, base_id=10, slot_count=3,
-                     kind=PayloadKind.SDF, serializer=Serializer.UTF8) as writer:
+                     kind=PayloadKind.GENERIC_BYTES, serializer=Serializer.UTF8) as writer:
         for i in (10, 11, 12):
             writer.add(i, b"x")
     try:
@@ -70,7 +70,7 @@ def test_narrow_reads_the_range_of_a_file_per_shard_from_its_footer(tmp_path):
 def test_open_reads_only_the_record_ids_asked(tmp_path):
     path = tmp_path / "s.parquet"
     with ShardWriter(path, dataset_id=uuid.UUID(int=1), shard_id=0, base_id=0, slot_count=8,
-                     kind=PayloadKind.SDF, serializer=Serializer.UTF8) as writer:
+                     kind=PayloadKind.GENERIC_BYTES, serializer=Serializer.UTF8) as writer:
         for i in range(8):
             writer.add(i, f"m{i}".encode())
             if i == 3:

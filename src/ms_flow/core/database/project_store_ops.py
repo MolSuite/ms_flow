@@ -334,7 +334,7 @@ class _ProjectStoreSqliteOps:
     ) -> None:
         """Close the "backwards" FKs with one UPDATE per relation, once both sides have ids.
 
-        A parent pointing at a child (molecules.active_binding_site_id -> binding_sites.id) does not
+        A parent pointing at a child (items.active_variant_id -> variants.id) does not
         fit the topological order: the child needs the parent's id for its own FK. Rather than asking
         the caller to invent a stable index to point at the row, everything is inserted and then
         fixed up, inside the same transaction.

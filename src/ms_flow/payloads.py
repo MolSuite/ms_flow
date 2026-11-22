@@ -1,6 +1,6 @@
 """Per-entity payloads in append-only volumes.
 
-The bytes of each entity (an SDF, a PDBQT, a pose) live in `volumes/<id:09d>.vol`
+The bytes of each entity (a document, an image, a result) live in `volumes/<id:09d>.vol`
 next to `project.db`; a row of `ms_payloads` says where. Apps keep only
 `<role>_payload_id INTEGER REFERENCES ms_payloads(id)`: moving bytes rewrites
 `ms_payloads` and never an app table, and ms_flow never needs the app schema.
@@ -12,7 +12,7 @@ the bytes. A volume has one writer and only grows; a sealed volume never changes
 Each payload says its codec (`none`, `zlib`, `zstd`), so volumes mix them. A
 `Payload` compresses itself when it is pickled, i.e. in the worker that made it:
 the writer only appends bytes. A `PayloadGroup` stores several payloads as one needle, which
-compresses them better (the poses of one docking, about half); each part keeps its own row and
+compresses them better (the outputs of one task, about half); each part keeps its own row and
 id, with its place in the needle's raw bytes (`part_offset`, `part_length`). A zstd frame names its dictionary (`dicts/<id>.zdict`,
 trained per series with `PayloadStore.train_dictionary`), so reading needs no table.
 
@@ -127,7 +127,7 @@ class PayloadGroup:
     """Payloads stored together as one compressed needle; each part keeps its own id.
 
     Reading a part decompresses the whole needle, so a group holds what is read together (the
-    poses of one docking). `add` returns the `PayloadPart` a row carries; the sink stores the
+    outputs of one task). `add` returns the `PayloadPart` a row carries; the sink stores the
     group once. Pickling compresses the parts as one, in the worker, like a `Payload`.
     """
 
@@ -515,7 +515,7 @@ class PayloadStore:
         return found
 
     def kinds(self, ids: Iterable[int]) -> dict[int, str]:
-        """The `kind` each payload was stored with (a format: `sdf`, `pdbqt`...), by id; unknown ids are left out."""
+        """The `kind` each payload was stored with (a format: `csv`, `json`...), by id; unknown ids are left out."""
         ids = list(dict.fromkeys(int(i) for i in ids))
         found = {}
         with self.engine.connect() as conn:
@@ -533,8 +533,8 @@ class PayloadStore:
 
     def materialize(self, payload_id: int, directory: str | os.PathLike, suffix: str | None = None):
         """The payload as the file `<directory>/<id><suffix>`, written once: what a job hands its
-        tasks as a `File` (a receptor), which executors without the disk carry once per job.
-        Without `suffix`, the payload's kind is the extension (`.pdbqt`)."""
+        tasks as a `File` (a shared input), which executors without the disk carry once per job.
+        Without `suffix`, the payload's kind is the extension (`.json`)."""
         from ms_flow.engine.files import File
 
         if suffix is None:
@@ -618,7 +618,7 @@ class PayloadStore:
 
     def train_dictionary(self, series: str, samples: int = DICT_SAMPLES, size: int = DICT_SIZE):
         """Train a zstd dictionary on `samples` payloads spread over `series` (the head of a
-        library is not like the rest of it) and make it the series' current one: a `File`."""
+        dataset is not like the rest of it) and make it the series' current one: a `File`."""
         import random
 
         from ms_flow.engine.files import File
@@ -734,7 +734,7 @@ class PayloadStore:
         delete the old ones. Needles are recompressed with the series' current dictionary.
 
         `order_by` is SQL that gives payload ids in the order wanted next to each other on disk
-        (`SELECT current_payload_id FROM molecules ORDER BY score`); the rest keep theirs.
+        (`SELECT current_payload_id FROM items ORDER BY score`); the rest keep theirs.
         Never touches an active volume, so it can run next to writers and readers (I6, I7).
         """
         small = VOLUME_SIZE // 4 if small is None else small
@@ -959,7 +959,7 @@ def with_payloads(project: Any, rows: Iterable[dict], fields: dict[str, str], wi
                   kinds: bool = False):
     """A job's source whose rows carry the bytes of their payloads, so a task gets bytes and never a path.
 
-    `fields` maps an id column to the key that gets its bytes (`{"current_payload_id": "ligand"}`;
+    `fields` maps an id column to the key that gets its bytes (`{"current_payload_id": "item"}`;
     a NULL id gives `None`). Rows are read `window` at a time in (volume, offset) order, so at most
     that many hold bytes here, and the engine reads only its window ahead (I8). What `rows` knows
     (`open`, `remaining`, `reads` of `ms_flow.query.Rows`) passes through. With `kinds`, each key

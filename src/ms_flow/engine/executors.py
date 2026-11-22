@@ -811,7 +811,7 @@ def _call_whole(fn, payloads):
 
 
 def _peak_mb() -> int:
-    """High-water mark of this worker plus its largest subprocess (the docking binary)."""
+    """High-water mark of this worker plus its largest subprocess (an external binary)."""
     if resource is None:
         return 0
     peak = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

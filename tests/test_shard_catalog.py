@@ -17,7 +17,7 @@ def _project(tmp_path):
 def _file(path, groups, *, step=""):
     """A file of shards: ``groups`` = [(scope, base_id, ids...)]."""
     first = min(base for _scope, base, *_ids in groups)
-    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=first, kind=PayloadKind.SDF,
+    with ShardWriter(path, dataset_id=None, shard_id=0, base_id=first, kind=PayloadKind.GENERIC_BYTES,
                      serializer=Serializer.UTF8, slot_count=1 << 20, metadata={"step": step}) as writer:
         for scope, base, *ids in groups:
             for id_ in ids:
@@ -49,7 +49,7 @@ def test_one_row_per_file_its_shards_read_from_it_pinned_and_narrowed(tmp_path):
         with Shard.open(picked["path"], ids=(8, 12)) as shard:
             assert [r.load() for r in shard] == [f"r7.{i}" for i in range(8, 12)]
 
-        # A rewrite is invisible until activated, then it is the library.
+        # A rewrite is invisible until activated, then it is the dataset.
         second = catalog.create_generation(db, step="filter")
         catalog.add_file(db, _file(tmp_path / "f.parquet", [(7, 20, 20, 21)]), generation_id=second)
         assert catalog.count(db, whole=True) == 3
@@ -146,10 +146,10 @@ def test_a_generation_the_app_still_references_is_kept_and_on_drop_clears_the_re
 def test_compact_merges_a_generations_files_scopes_together_ids_never(tmp_path):
     db = _project(tmp_path)
     try:
-        gen = catalog.create_generation(db, step="chem")
+        gen = catalog.create_generation(db, step="stats")
         paths = []
         for scope, base in ((1, 0), (1, 4), (2, 0), (3, 8)):
-            paths.append(_file(tmp_path / f"s{scope}_{base}.parquet", [(scope, base, base, base + 2)], step="chem"))
+            paths.append(_file(tmp_path / f"s{scope}_{base}.parquet", [(scope, base, base, base + 2)], step="stats"))
         for path in reversed(paths):  # file order is not id order
             catalog.add_file(db, path, generation_id=gen)
 
@@ -162,7 +162,53 @@ def test_compact_merges_a_generations_files_scopes_together_ids_never(tmp_path):
             (1, 0, 4, 2), (1, 4, 4, 2), (2, 0, 4, 2), (3, 8, 4, 2)]
         assert got[0]["path"] == got[1]["path"] == got[3]["path"] and not paths[0].exists()
         with Shard.open(got[1]["path"], ids=(4, 8)) as shard:
-            assert [r.load() for r in shard] == ["r1.4", "r1.6"] and shard.metadata["step"] == "chem"
+            assert [r.load() for r in shard] == ["r1.4", "r1.6"] and shard.metadata["step"] == "stats"
         assert catalog.compact(db, gen) == 0
+    finally:
+        db.disconnect()
+
+
+def test_a_file_of_another_host_is_listed_but_not_read_until_it_is_adopted(tmp_path):
+    """What a step wrote there and left there: its row says the host, so nothing here opens it;
+    brought back, it is local, with the counts its header says."""
+    db = _project(tmp_path)
+    try:
+        generation = catalog.create_generation(db, step="import")
+        catalog.activate_generation(db, generation)
+        here = _file(tmp_path / "here.parquet", [(1, 0, 0, 1, 2, 3)])
+        catalog.add_file(db, here, generation_id=generation)
+        there = catalog.add_file(db, "/scratch/their.parquet", generation_id=generation,
+                                 location="user@cluster:/scratch",
+                                 counts={"n_shards": 2, "n_records": 8, "n_active": 8, "scopes": "1"})
+
+        assert catalog.count(db) == 1 and catalog.record_count(db) == 4  # only what is here
+        listed = {row["id"]: row["location"] for row in catalog.files(db)}
+        assert listed == {1: "", there: "user@cluster:/scratch"}  # a view lists both
+        assert catalog.count(db, catalog.shard_spec(location="user@cluster:/scratch")) == 2
+
+        # Registered again (the step found its file already made there): the same row, once.
+        assert catalog.add_file(db, "/scratch/their.parquet", generation_id=generation,
+                                location="user@cluster:/scratch", counts={"n_shards": 2}, once=True) == there
+        assert len(list(catalog.files(db))) == 2
+
+        brought = _file(tmp_path / "theirs.parquet", [(1, 8, 8, 9, 10, 11)])
+        assert catalog.adopt(db, there, brought, checksum="0" * 64) is False  # not what arrived
+        assert catalog.adopt(db, there, brought) is True
+        assert catalog.count(db) == 2 and catalog.record_count(db) == 8
+    finally:
+        db.disconnect()
+
+
+def test_the_roles_of_a_generation_name_what_a_view_can_show(tmp_path):
+    db = _project(tmp_path)
+    try:
+        generation = catalog.create_generation(db, step="import")
+        catalog.activate_generation(db, generation)
+        catalog.add_file(db, _file(tmp_path / "a.parquet", [(1, 0, 0, 1)]), generation_id=generation)
+        catalog.add_file(db, _file(tmp_path / "b.parquet", [(1, 0, 0, 1)]), generation_id=generation,
+                         role="derived:second")
+        catalog.add_file(db, _file(tmp_path / "c.parquet", [(1, 0, 0, 1)]), generation_id=generation,
+                         role="derived:first")
+        assert catalog.roles(db) == ["source", "derived:first", "derived:second"]
     finally:
         db.disconnect()

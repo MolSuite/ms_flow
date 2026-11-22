@@ -11,12 +11,12 @@ from ms_flow.core.project.resources import ProjectResourceSpec
 def _install_manifest_module(module_name: str):
     module = types.ModuleType(module_name)
     module.manifest = AppManifest(
-        app_id="testdock",
-        scope_id="docking",
-        name="Test Dock",
+        app_id="testcouple",
+        scope_id="coupling",
+        name="Test Couple",
         version="0.1.0",
-        entry_module="testdock.app",
-        package_name="testdock",
+        entry_module="testcouple.app",
+        package_name="testcouple",
     )
     sys.modules[module_name] = module
     return module
@@ -32,10 +32,10 @@ def test_app_registry_discovers_manifest_module():
         sys.modules.pop(module_name, None)
 
     assert len(loaded) == 1
-    manifest = registry.get("testdock")
+    manifest = registry.get("testcouple")
     assert manifest is not None
-    assert manifest.scope_id == "docking"
-    assert manifest.entry_module == "testdock.app"
+    assert manifest.scope_id == "coupling"
+    assert manifest.entry_module == "testcouple.app"
 
 def test_app_registry_resolves_project_by_app_id():
     module_name = "tests_fake_manifest_module_resolve"
@@ -46,11 +46,11 @@ def test_app_registry_resolves_project_by_app_id():
     finally:
         sys.modules.pop(module_name, None)
 
-    project = Project(name="dock", path="/tmp/dock", app_id="testdock", scope="docking")
+    project = Project(name="couple", path="/tmp/couple", app_id="testcouple", scope="coupling")
     manifest = registry.resolve_for_project(project)
 
     assert manifest is not None
-    assert manifest.app_id == "testdock"
+    assert manifest.app_id == "testcouple"
 
 
 def test_app_registry_normalizes_project_resources():
@@ -58,22 +58,22 @@ def test_app_registry_normalizes_project_resources():
 
     manifest = registry.register(
         AppManifest(
-            app_id="testdock",
-            scope_id="docking",
-            name="Test Dock",
+            app_id="testcouple",
+            scope_id="coupling",
+            name="Test Couple",
             version="0.1.0",
-            entry_module="testdock.app",
-            package_name="testdock",
+            entry_module="testcouple.app",
+            package_name="testcouple",
             project_resources=(
-                {"key": "ligands", "relative_path": "data/ligands", "description": "Ligand files"},
-                ProjectResourceSpec(key="results", relative_path="results/docking"),
+                {"key": "guests", "relative_path": "data/guests", "description": "Guest files"},
+                ProjectResourceSpec(key="results", relative_path="results/coupling"),
             ),
         )
     )
 
-    assert tuple(spec.key for spec in manifest.project_resources) == ("ligands", "results")
-    assert manifest.project_resources[0].relative_path == "data/ligands"
-    assert manifest.project_resources[0].description == "Ligand files"
+    assert tuple(spec.key for spec in manifest.project_resources) == ("guests", "results")
+    assert manifest.project_resources[0].relative_path == "data/guests"
+    assert manifest.project_resources[0].description == "Guest files"
 
 
 def test_app_registry_normalizes_app_settings():
@@ -81,9 +81,9 @@ def test_app_registry_normalizes_app_settings():
 
     manifest = registry.register(
         AppManifest(
-            app_id="testdock",
-            scope_id="docking",
-            name="Test Dock",
+            app_id="testcouple",
+            scope_id="coupling",
+            name="Test Couple",
             version="0.1.0",
             settings=(
                 {
@@ -110,7 +110,7 @@ def test_app_registry_normalizes_app_settings():
 
 def test_app_registry_discovers_manifest_file_and_records_source_root(tmp_path):
     source_root = tmp_path / "src"
-    package_dir = source_root / "dockapp"
+    package_dir = source_root / "coupleapp"
     package_dir.mkdir(parents=True)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "manifest.py").write_text(
@@ -118,12 +118,12 @@ def test_app_registry_discovers_manifest_file_and_records_source_root(tmp_path):
             [
                 "from ms_flow.core.apps import AppManifest",
                 "manifest = AppManifest(",
-                "    app_id='dockapp',",
-                "    scope_id='docking',",
-                "    name='Dock App',",
+                "    app_id='coupleapp',",
+                "    scope_id='coupling',",
+                "    name='Couple App',",
                 "    version='0.1.0',",
-                "    entry_module='dockapp.app',",
-                "    package_name='dockapp',",
+                "    entry_module='coupleapp.app',",
+                "    package_name='coupleapp',",
                 ")",
             ]
         )
@@ -135,15 +135,15 @@ def test_app_registry_discovers_manifest_file_and_records_source_root(tmp_path):
     loaded = registry.discover_manifest_files([package_dir / "manifest.py"])
 
     assert len(loaded) == 1
-    manifest = registry.get("dockapp")
+    manifest = registry.get("coupleapp")
     assert manifest is not None
     assert manifest.source_root == source_root.resolve()
 
 
 def test_app_registry_discovers_workspace_apps_from_sibling_sources(tmp_path):
     workspace_root = tmp_path / "workspace"
-    source_root = workspace_root / "DockApp" / "src"
-    package_dir = source_root / "dockapp"
+    source_root = workspace_root / "CoupleApp" / "src"
+    package_dir = source_root / "coupleapp"
     package_dir.mkdir(parents=True)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "manifest.py").write_text(
@@ -151,12 +151,12 @@ def test_app_registry_discovers_workspace_apps_from_sibling_sources(tmp_path):
             [
                 "from ms_flow.core.apps import AppManifest",
                 "manifest = AppManifest(",
-                "    app_id='dockapp',",
-                "    scope_id='docking',",
-                "    name='Dock App',",
+                "    app_id='coupleapp',",
+                "    scope_id='coupling',",
+                "    name='Couple App',",
                 "    version='0.1.0',",
-                "    entry_module='dockapp.app',",
-                "    package_name='dockapp',",
+                "    entry_module='coupleapp.app',",
+                "    package_name='coupleapp',",
                 ")",
             ]
         )
@@ -168,6 +168,6 @@ def test_app_registry_discovers_workspace_apps_from_sibling_sources(tmp_path):
     loaded = registry.discover_workspace_apps(workspace_root)
 
     assert len(loaded) == 1
-    manifest = registry.get("dockapp")
+    manifest = registry.get("coupleapp")
     assert manifest is not None
     assert manifest.source_root == source_root.resolve()

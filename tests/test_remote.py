@@ -81,11 +81,11 @@ def test_a_canceled_job_leaves_the_queue_and_nothing_behind(tmp_path):
 
 
 def test_a_file_an_element_names_goes_with_the_job_once(tmp_path):
-    (tmp_path / "receptor.txt").write_text("here")
+    (tmp_path / "anchor.txt").write_text("here")
     got, far = [], _far(tmp_path, shared=False)
     with Engine(cpus=2) as engine:
         engine.register("far", far)
-        job = engine.submit("far", workers.read, [{"path": File(tmp_path / "receptor.txt"), "n": i} for i in range(6)],
+        job = engine.submit("far", workers.read, [{"path": File(tmp_path / "anchor.txt"), "n": i} for i in range(6)],
                             on_results=got.extend)
         assert engine.wait(job, 120).status == "completed"
     seen = {result["path"] for key, result in got}
@@ -94,13 +94,13 @@ def test_a_file_an_element_names_goes_with_the_job_once(tmp_path):
 
 
 def test_what_a_result_names_in_a_dir_comes_back_to_it(tmp_path):
-    got, poses = [], tmp_path / "poses"
+    got, layouts = [], tmp_path / "layouts"
     with Engine(cpus=2) as engine:
         engine.register("far", _far(tmp_path, shared=False, elements_per_job=4))
-        job = engine.submit("far", workers.leave, [{"out": Dir(poses), "n": i} for i in range(7)], on_results=got.extend)
+        job = engine.submit("far", workers.leave, [{"out": Dir(layouts), "n": i} for i in range(7)], on_results=got.extend)
         assert engine.wait(job, 120).status == "completed"
-    assert sorted(result["made"] for key, result in got) == [str(poses / f"{i}.txt") for i in range(7)]
-    assert [(poses / f"{i}.txt").read_text() for i in range(7)] == [str(i) for i in range(7)]
+    assert sorted(result["made"] for key, result in got) == [str(layouts / f"{i}.txt") for i in range(7)]
+    assert [(layouts / f"{i}.txt").read_text() for i in range(7)] == [str(i) for i in range(7)]
     assert list((tmp_path / "far").iterdir()) == []
 
 

@@ -25,17 +25,17 @@ def test_master_db_project_model_includes_app_id(tmp_path):
     with master_db.get_session() as session:
         session.add(
             Project(
-                name="dock-project",
-                path=str(tmp_path / "dock-project"),
-                app_id="amdockvs",
-                scope="docking",
+                name="couple-project",
+                path=str(tmp_path / "couple-project"),
+                app_id="demoapp",
+                scope="coupling",
             )
         )
         session.commit()
         row = session.exec(select(Project)).first()
 
     assert row is not None
-    assert row.app_id == "amdockvs"
+    assert row.app_id == "demoapp"
 
 
 def test_master_and_project_keep_their_tables_apart(tmp_path):

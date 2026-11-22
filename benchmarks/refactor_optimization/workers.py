@@ -57,26 +57,26 @@ def flaky(payload: dict) -> dict:
 
 
 def structure(payload: int) -> dict:
-    """A row with the bytes of a molecule, the way a task hands them to a sink (`tests/test_payloads_jobs.py`)."""
+    """A row with the bytes of a specimen, the way a task hands them to a sink (`tests/test_payloads_jobs.py`)."""
     from ms_flow.payloads import Payload
 
-    data = f"molecule {payload}\n".encode() * (payload % 7 + 1)
-    return {"n": payload, "structure_payload_id": Payload(data, kind="sdf", series="ligands")}
+    data = f"specimen {payload}\n".encode() * (payload % 7 + 1)
+    return {"n": payload, "structure_payload_id": Payload(data, kind="csv", series="guests")}
 
 
 def uses_payloads(element: dict) -> dict:
-    """What a task got from `with_payloads` and a materialized receptor, as a row (`tests/test_payloads_read.py`)."""
+    """What a task got from `with_payloads` and a materialized anchor, as a row (`tests/test_payloads_read.py`)."""
     import zlib
 
-    with open(element["receptor"]) as file:
+    with open(element["anchor"]) as file:
         text = file.read()
     return {"n": element["n"], "got_bytes": int(type(element["structure"]) is bytes), "crc": zlib.crc32(element["structure"]),
-            "receptor_path": str(element["receptor"]), "receptor_text": text}
+            "anchor_path": str(element["anchor"]), "anchor_text": text}
 
 
 
 def store_chunk(bounds):
-    """`bench_volumes` PJ: the molecules `[start, stop)` as rows with their `Payload`s."""
+    """`bench_volumes` PJ: the specimens `[start, stop)` as rows with their `Payload`s."""
     from benchmarks.refactor_optimization import bench_volumes
 
     return bench_volumes.store_rows(*bounds)  # (start, stop, config)
@@ -87,4 +87,4 @@ def packs_with_dictionary(element: dict) -> dict:
     from ms_flow.payloads import Payload
 
     data = element["data"]
-    return {"n": element["n"], "structure_payload_id": Payload(data, series="ligands", dictionary=element["dictionary"])}
+    return {"n": element["n"], "structure_payload_id": Payload(data, series="guests", dictionary=element["dictionary"])}

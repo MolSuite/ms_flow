@@ -1,11 +1,11 @@
-"""Records left out of a sharded library without rewriting it.
+"""Records left out of a sharded dataset without rewriting it.
 
 A Parquet shard is immutable (its footer holds byte offsets), so a cut is a sidecar: the ids it
 removes, one file per cut, registered as a `project_artifacts` row. What is out is the union of
 the active cuts; undoing one flips its status. The idea of Iceberg v2 position deletes and Delta
 deletion vectors, without the dependency.
 
-An id is unique inside its *scope*: whatever the app numbers records within (an import batch).
+An id is unique inside its *scope*: whatever the app numbers records within (one import, one upload...).
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ class Exclusions:
     def __init__(self, by_scope: Mapping[int, Any] | None = None, *, cuts: Iterable[int] = ()):
         self.by_scope = dict(by_scope or {})
         # Which cuts are in it: the identity of this state, for a caller that keys work by it
-        # (a docking receipt must not count as "the whole shard" if a cut hid part of it).
+        # (a step's receipt must not count as "the whole shard" if a cut hid part of it).
         self.key = ".".join(str(int(cut)) for cut in sorted(cuts))
 
     def __bool__(self) -> bool:
