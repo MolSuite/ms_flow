@@ -328,6 +328,7 @@ class RemoteExecutor:
             python = shlex.quote(f"{env}/bin/python")
             # after the setup: a queue reads its directives (`#SBATCH ...`) only above the first command
             setup = f'{setup}\nexport PATH={shlex.quote(env + "/bin")}:"$PATH"'
+        self._standard_slurm = scheduler == "slurm" and template == TEMPLATES["slurm"]
         self._script = (scheduler, template.replace("@python@", python).replace("@runner@", runner), setup)
         self.asks, self._asked = dict(asks or {}), {}
         self.script = self.script_for()
@@ -354,6 +355,14 @@ class RemoteExecutor:
             raise ValueError(f"not something a job asks of the queue: {', '.join(sorted(wrong))}")
         scheduler, template, setup = self._script
         return template.replace("@setup@", directives(scheduler, setup=setup, **{**self.asks, **(asks or {})}))
+
+    def node_resources(self, *, resources=None, key=None) -> tuple | None:
+        if not self._standard_slurm:
+            return None  # a site template can launch its own distributed program
+        asks = {**self.asks, **self._asked.get(key, {}), **(resources or {})}
+        memory = asks.get("memory_gb")
+        return ((asks.get("cpus") or None, asks.get("gpus") or None,
+                 memory * 1024 if memory else None),)
 
     # --- What the engine calls: nothing here waits for the other machine ---------------
 
