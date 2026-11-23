@@ -313,6 +313,13 @@ class RayExecutor:
     def bind(self, on_done) -> None:
         self._on_done = on_done
 
+    def node_resources(self, *, resources=None, key=None) -> tuple:
+        return tuple(
+            (have.get("CPU", 0), have.get("GPU", 0), int(have.get("memory", 0) / 2**20))
+            for node in self._ray.nodes() if node["Alive"]
+            if (have := node["Resources"])
+        )
+
     def submit(self, fn, payload, tag, call=None, cost=(1, 0, 0), owner=None):
         run = self._sized.get(cost)
         if run is None:

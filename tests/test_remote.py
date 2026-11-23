@@ -308,3 +308,16 @@ def test_the_nodes_of_a_queue_are_read_from_sinfo_and_qhost():
                      "n2        lx-amd64  16  1  8  16  -  -  -  -  -\n")
     assert [(n["name"], n["state"], n["cpus_used"], n["cpus"], n["mem_used_gb"]) for n in sge] == [
         ("sge", "up", 2, 4, 19.0), ("n2", "down", 0, 16, 0.0)]
+
+
+def test_slurm_task_budget_is_per_node(tmp_path):
+    from ms_flow.remote import TEMPLATES
+
+    with Engine() as engine:
+        remote = RemoteExecutor(workdir=str(tmp_path), scheduler="slurm", template=TEMPLATES["slurm"],
+                                asks={"nodes": 4, "cpus": 4, "memory_gb": 8})
+        engine.register("slurm", remote)
+        assert engine.executor_node_resources("slurm") == ((4, None, 8192),)
+        assert engine.executor_node_resources("slurm", resources={"cpus": 8}) == ((8, None, 8192),)
+        with pytest.raises(ValueError, match="no single node"):
+            engine.submit("slurm", print, [1], cpu=6)
