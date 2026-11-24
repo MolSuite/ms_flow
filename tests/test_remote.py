@@ -104,6 +104,20 @@ def test_what_a_result_names_in_a_dir_comes_back_to_it(tmp_path):
     assert list((tmp_path / "far").iterdir()) == []
 
 
+def test_a_container_goes_and_comes_back_with_its_index(tmp_path):
+    (tmp_path / "in.arrows").write_text("sent")
+    (tmp_path / "in.arrows.index").write_text("its index")
+    got, out = [], tmp_path / "out"
+    with Engine(cpus=2) as engine:
+        engine.register("far", _far(tmp_path, shared=False))
+        job = engine.submit("far", workers.pair, [{"container": File(tmp_path / "in.arrows"), "out": Dir(out), "n": i}
+                                                  for i in range(3)], on_results=got.extend)
+        assert engine.wait(job, 120).status == "completed"
+    assert {result["said"] for key, result in got} == {"sent|its index"}
+    assert sorted(path.name for path in out.iterdir()) == sorted(f"{i}.arrows{end}" for i in range(3) for end in ("", ".index"))
+    assert [(out / f"{i}.arrows.index").read_text() for i in range(3)] == [f"index {i}" for i in range(3)]
+
+
 def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
     with Engine(cpus=2) as engine:
         engine.register("far", RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, poll_s=0.2,

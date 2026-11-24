@@ -18,7 +18,7 @@ def _source(db, folder):
     """Two source files of three 4-id shards each, one active generation."""
     gen = catalog.create_generation(db, step="load")
     for f in range(2):
-        path = folder / f"src{f}.parquet"
+        path = folder / f"src{f}.arrows"
         with ShardWriter(path, dataset_id=None, shard_id=0, base_id=12 * f, kind=0, serializer=Serializer.UTF8,
                          slot_count=1 << 20) as writer:
             for lo in range(12 * f, 12 * f + 12, 4):
@@ -98,10 +98,10 @@ def test_a_done_set_keeps_its_generation_until_forgotten(tmp_path):
         states.mark_done(db, "step", "k", [s["id"] for s in catalog.shards(db)], generation_id=gen)
         for step in ("one", "two", "three"):
             catalog.activate_generation(db, catalog.create_generation(db, step=step))
-        assert (tmp_path / "src0.parquet").exists()
+        assert (tmp_path / "src0.arrows").exists()
         states.forget(db, "step", "k")
         catalog.activate_generation(db, catalog.create_generation(db, step="four"))
-        assert not (tmp_path / "src0.parquet").exists()
+        assert not (tmp_path / "src0.arrows").exists()
     finally:
         db.dispose()
 

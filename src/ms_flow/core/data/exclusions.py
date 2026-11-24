@@ -1,6 +1,6 @@
 """Records left out of a sharded dataset without rewriting it.
 
-A Parquet shard is immutable (its footer holds byte offsets), so a cut is a sidecar: the ids it
+A shard is never rewritten for a cut (its bytes are checksummed), so a cut is a sidecar: the ids it
 removes, one file per cut, registered as a `project_artifacts` row. What is out is the union of
 the active cuts; undoing one flips its status. The idea of Iceberg v2 position deletes and Delta
 deletion vectors, without the dependency.
@@ -70,7 +70,7 @@ def exclude(
 
 
 def _refresh(project_db) -> None:
-    """The catalog's active counts follow the cuts (one footer read per file)."""
+    """The catalog's active counts follow the cuts (one index read per file)."""
     from ms_flow.core.data.catalog import refresh_active
 
     refresh_active(project_db)
@@ -128,8 +128,10 @@ class Exclusions:
         ``record_ids`` (a Top-N) keeps those that are not excluded.
 
         A row's ids are ``base_id <= id < base_id + slot_count``; without them (a file per
-        shard) the file's own header says, read from its footer only.
+        shard) the file's own index says. ``record_ids`` and counts name only ids with a usable
+        record (`shard.usable_ids`): a cut on a hole or a drop changes nothing.
         """
+        import numpy as np
         for row in rows:
             row = dict(row)
             if not self.by_scope or row.get(scope_key) is None or int(row[scope_key]) not in self.by_scope:
@@ -145,24 +147,35 @@ class Exclusions:
                 kept = [int(i) for i in row["record_ids"] if int(i) not in gone]
                 count = len(kept)
             else:
-                # Every slot, not the records: where the holes (a record that failed the import)
-                # are is in the file, and asking for a hole reads as nothing. The count is the
-                # one approximation — a cut naming a hole lowers it by one too many.
-                kept = [i for i in range(lo, hi) if i not in gone]
-                count = max(0, int(row.get(count_key) or 0) - len(out))
+                kept = np.setdiff1d(_usable(row, path_key, count_key), out, assume_unique=True).tolist()
+                count = len(kept)
             if kept and count:
                 row["record_ids"], row[count_key] = kept, count
                 yield row
 
 
+def _usable(row: Mapping[str, Any], path_key: str, count_key: str):
+    """The ids of a row with a usable record: its own shard, or every live shard of its file."""
+    import numpy as np
+
+    from ms_flow.core.data.shard import file_groups, usable_ids
+
+    if row.get("base_id") is not None and row.get("slot_count") is not None:
+        return usable_ids(row.get(path_key) or "", {**row, "n_records": row.get(count_key)})
+    path = Path(str(row[path_key]))
+    parts = [usable_ids(path, g) for g in file_groups(path) if not g.retired]
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.uint64)
+
+
 def _id_range(row: Mapping[str, Any], path_key: str) -> tuple[int, int]:
     if row.get("base_id") is not None and row.get("slot_count") is not None:
         return int(row["base_id"]), int(row["base_id"]) + int(row["slot_count"])
-    from ms_flow.core.data.shard import METADATA_KEY, _footer
+    from ms_flow.core.data.shard import file_groups
 
-    meta, _spans, _header = _footer(Path(str(row[path_key])))
-    header = json.loads((meta.metadata or {})[METADATA_KEY].decode("utf-8"))
-    return int(header["base_id"]), int(header["base_id"]) + int(header["slot_count"])
+    groups = [g for g in file_groups(Path(str(row[path_key]))) if not g.retired]
+    if not groups:
+        return 0, 0
+    return min(g.base_id for g in groups), max(g.base_id + g.slot_count for g in groups)
 
 
 def active_exclusions(project_db) -> Exclusions:

@@ -127,6 +127,7 @@ class ShardGeneration(SQLModel, table=True):
     """One rewrite of the sharded dataset (see `ms_flow.core.data.catalog`). Only one is active."""
 
     __tablename__ = "ms_shard_generations"
+    __table_args__ = {"sqlite_autoincrement": True}  # an id is never given twice: states name it
 
     id: Optional[int] = Field(default=None, primary_key=True)
     parent_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
@@ -134,27 +135,36 @@ class ShardGeneration(SQLModel, table=True):
     folder: str = ""
     job_id: str = ""
     is_active: bool = Field(default=False, index=True)
+    kept: bool = False  # activation never deletes it; deleting it is an explicit action
     created_at: datetime = Field(default_factory=datetime.now, sa_type=DateTime)
 
 
 class CatalogFile(SQLModel, table=True):
     """One file of a sharded dataset (or of what a step made of it): the catalog keeps a row per
-    file, never per shard. Its shards are its row groups, listed in the file's own header
+    file, never per shard. Its shards are listed in the file's own index
     (`ms_flow.core.data.shard.file_groups`); the counts here are what a view or a progress bar
     needs without opening it. App tables reference ``id``."""
 
     __tablename__ = "ms_shard_files"
+    __table_args__ = {"sqlite_autoincrement": True}  # a shard id holds its file id: never reused
 
     id: Optional[int] = Field(default=None, primary_key=True)
     generation_id: Optional[int] = Field(default=None, foreign_key="ms_shard_generations.id", index=True)
     # What the file is: "source" (the dataset itself), or what a step made of it (a role the app names).
     role: str = Field(default="source", index=True)
     path: str = ""
-    # "writing" while its writer has it open (its counts grow; nothing reads it), then "ready".
+    # "writing" while its writer has it open (its counts grow; nothing reads it), then "ready"
+    # (read, appended to), or "sealed" (read, never appended again).
     status: str = Field(default="ready", index=True)
     n_shards: int = 0
     n_records: int = 0
     n_active: int = 0  # n_records minus the active exclusions
+    n_shards_excluded: int = 0
+    # What the index had committed, retired rows included: these only grow. An index below any
+    # of them is stale or foreign, and is refused before an appender cuts its tail.
+    n_rows: int = 0
+    n_retired: int = 0
+    end: int = 0
     # The scopes (the batches that wrote them) its shards belong to, comma-separated: what a view names.
     scopes: str = ""
     # Where the file is: "" here, else the host that wrote it and keeps it (a step that ran there

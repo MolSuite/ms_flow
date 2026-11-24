@@ -409,7 +409,10 @@ def test_data_bridge_uses_injected_project_output_persister_without_sqlite_assum
 
 
 def test_sqlite_backend_project_writes_delegate_to_project_store(tmp_path):
+    from ms_flow.core.database.project_store_ops import _StandaloneProjectSQLiteDB
+
     db_path = tmp_path / "project.db"
+    _StandaloneProjectSQLiteDB(db_path).dispose()  # a project at the current schema, then a table of the app's
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE results (id INTEGER)")

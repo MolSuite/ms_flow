@@ -31,6 +31,7 @@ from pathlib import Path
 from ms_env import Host, HostError
 
 from ms_flow.engine.executors import CANCELED, DONE, ERROR
+from ms_flow.core.data.companions import companions, whole
 from ms_flow.engine.files import Dir, File, swap
 from ms_flow.runner import part_number, read_part, stage
 
@@ -573,6 +574,8 @@ class RemoteExecutor:
                     return Dir(there)
                 if mark not in carried:
                     carried[mark] = f"files/{len(carried)}/{os.path.basename(mark)}"
+                    for companion in companions(mark):  # beside it there (I14)
+                        carried[companion] = f"{carried[mark]}{companion[len(mark):]}"
                 return File(carried[mark])
 
             if not self.shared:
@@ -729,7 +732,7 @@ class RemoteExecutor:
             if not text.startswith(root):
                 return text
             n, _, rest = text[len(root):].partition("/")
-            wanted.add(f"{queued.dir}/out/{n}/{rest}")
+            wanted.update(whole(f"{queued.dir}/out/{n}/{rest}"))  # a container comes with its index
             return os.path.join(queued.dirs[f"out/{n}"], rest)
 
         pairs = [(index, swap(result, here, str)) for index, result in pairs]
@@ -737,13 +740,18 @@ class RemoteExecutor:
             # What a result names and is not there is the task's to explain, not a reason to stop.
             packed = self.remote.run(f"cd {self.workdir} && tar cf - --ignore-failed-read -T - 2>/dev/null || :",
                                      "\n".join(sorted(wanted)).encode())
-            for name, data in _untar(packed).items():
+            files = _untar(packed)
+            # The data first, its index last, each whole or not there: an index never names bytes
+            # that have not arrived.
+            for name in sorted(files, key=lambda name: whole(name)[0] != name):
                 n, _, rest = name[len(queued.dir) + 5:].partition("/")
                 if ".." in rest.split("/"):
                     raise HostError(f"a file that would land outside its directory: {name}")
                 target = Path(queued.dirs[f"out/{n}"], rest)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
+                coming = target.with_name(target.name + ".tmp")
+                coming.write_bytes(files[name])
+                os.replace(coming, target)
         return pairs
 
     def _answer(self, queued: _Queued, index: int, status: str, result, error) -> None:

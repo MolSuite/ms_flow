@@ -48,7 +48,7 @@ def test_forgetting_runs_it_again(tmp_path):
 def test_a_mini_file_of_the_pending_shards_keeps_the_parent_ids(tmp_path):
     """What travels to a host that has most of the dataset done already: the few shards left,
     under the same ids, so its results pair back with the parent with nothing to translate."""
-    parent = tmp_path / "lib.parquet"
+    parent = tmp_path / "lib.arrows"
     with ShardWriter(parent, dataset_id=uuid.UUID(int=1), shard_id=0, base_id=0, slot_count=8,
                      kind=PayloadKind.GENERIC_BYTES, serializer=Serializer.UTF8) as writer:
         for i in range(8):
@@ -56,8 +56,8 @@ def test_a_mini_file_of_the_pending_shards_keeps_the_parent_ids(tmp_path):
             if i % 2:
                 writer.end_group()  # four shards of two records
 
-    mini = tmp_path / "mini.parquet"
-    ranges = merge_shards([(parent, (4, 6)), (parent, (6, 8))], mini)
+    mini = tmp_path / "mini.arrows"
+    ranges = merge_shards([(parent, 2), (parent, 3)], mini)
 
     assert [r["base_id"] for r in ranges] == [4, 6]
     with Shard.open(mini) as shard:
@@ -73,7 +73,7 @@ def test_what_another_host_did_comes_back_as_its_own_file_and_is_unioned(tmp_pat
         mark_done(db, "run", "k", [1, 2], total=6)
         mark_done(other, "run", "k", [3, 4])
         mark_done(other, "run", "k", [5], narrowed_by="cut-1")
-        came = tmp_path / "came.parquet"
+        came = tmp_path / "came.arrows"
         shutil.copyfile(sidecar(other, "run", "k"), came)
 
         assert merge(db, "run", "k", came) == 5

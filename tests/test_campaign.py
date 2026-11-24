@@ -73,6 +73,17 @@ def sweep(params, project):
             Stage("again", negate, From("vs", list), reduce=count, deliver="reduced")]
 
 
+@task()
+def read_pair(element):
+    return {"n": element["n"], "said": Path(element["c"]).read_text() + "|" + Path(element["c"] + ".index").read_text()}
+
+
+@campaign(output=lambda params, project: _Collect())
+def ship_pairs(params, project):
+    return [Stage("vs", read_pair, [{"c": File(path), "n": n, "_cpu_required": 1}
+                                    for n, path in enumerate(os.environ["CAMPAIGN_PAIRS"].split(":"))])]
+
+
 def _far(tmp_path, **options):
     return RemoteExecutor(workdir=str(tmp_path / "far"), python=sys.executable, part_seconds=0.1, runner="--cpus 2",
                           setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}:{_ROOT / 'tests'}:{os.environ.get('PYTHONPATH', '')}",
@@ -312,6 +323,33 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatc
         assert locations.known(project, locations.host_of(far)) == {}
         assert engine.wait(flow.submit(sweep, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
         assert sent.count("in/said.txt") == 2 and (there / "in" / "said.txt").exists()
+
+
+def test_a_campaign_ships_and_returns_both_files(tmp_path, monkeypatch):
+    """A container goes with its index, from the project's folder and from outside it; the host
+    records both, so a later campaign checks both. Results that name a `Dir` there stay there:
+    what comes back from a queue is `RemoteExecutor._bring`'s (test_remote)."""
+    from ms_flow import locations
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    (tmp_path / "p" / "in").mkdir()
+    pairs = [tmp_path / "p" / "in" / "lib.arrows", tmp_path / "outside.arrows"]
+    for n, path in enumerate(pairs):
+        path.write_text(f"data {n}")
+        Path(f"{path}.index").write_text(f"index {n}")
+    monkeypatch.setenv("CAMPAIGN_PAIRS", ":".join(map(str, pairs)))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    with engine:
+        assert engine.wait(Flow(engine, project).submit(ship_pairs, {}, executor="far"), 120).status == "completed"
+    assert sorted((row["n"], row["said"]) for row in GOT) == [(0, "data 0|index 0"), (1, "data 1|index 1")]
+    assert sorted(locations.known(project, locations.host_of(far))) == ["in/lib.arrows", "in/lib.arrows.index"]
+    project.disconnect()
 
 
 def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(tmp_path, monkeypatch):

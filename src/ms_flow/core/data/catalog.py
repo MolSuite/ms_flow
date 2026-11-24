@@ -2,7 +2,7 @@
 
 The app writes records and says who is in or out; ms_flow keeps where they are. A row of
 `ms_shard_files` is one *file*, never one shard: 1M records are four rows, not four thousand. The
-shards of a file are its row groups, listed in its own header (`shard.file_groups`), so the
+shards of a file are listed in its own index (`shard.file_groups`), so the
 database grows with the number of files while a read still hands out one row per shard,
 ``(path, [base_id, base_id + slot_count))``, pinned to the active generation and narrowed by the
 active exclusions (`exclusions.py`). A caller never filters either itself.
@@ -34,13 +34,19 @@ from ms_flow.query import QuerySpec, db_pages
 
 TABLE = "ms_shard_files"
 FIELDS = ("id", "generation_id", "role", "path", "status", "n_shards", "n_records", "n_active",
-          "scopes", "location")
+          "scopes", "location", "n_rows", "n_retired", "end")
 SOURCE = "source"  # the dataset itself; a step's outputs carry roles of their own
-WRITING, READY = "writing", "ready"
+WRITING, READY, SEALED = "writing", "ready", "sealed"
+READABLE = (READY, SEALED)  # a read takes these; an append only READY
 GROUP_BITS = 20  # groups of a file: MAX_RECORDS (1 << 20) ids hold at most that many shards
 # Filters that name a shard, not a file: applied to the groups a file lists.
 _SHARD_FILTERS = ("scope", "shard_id")
-_COUNTS = ("n_shards", "n_records", "n_active", "scopes")  # what a file says of itself
+_COUNTS = ("n_shards", "n_records", "n_active", "scopes", "n_rows", "n_retired", "end")  # what a file says of itself
+_COMMITTED = ("n_rows", "n_retired", "end")  # what only grows (I6)
+
+
+class StaleIndex(ValueError):
+    """An index below what the catalog saw committed: stale or foreign. Nothing was cut (I6)."""
 
 
 def shard_id(file_id: int, index: int) -> int:
@@ -74,14 +80,16 @@ def active_generation_id(project_db) -> int | None:
         return int(row) if row is not None else None
 
 
-def create_generation(project_db, *, step: str, folder: str | Path = "", job_id: str = "") -> int:
-    """Open a generation parented to the active one. Not active: nothing reads it yet."""
+def create_generation(project_db, *, step: str, folder: str | Path = "", job_id: str = "",
+                      kept: bool = False) -> int:
+    """Open a generation parented to the active one. Not active: nothing reads it yet. ``kept``:
+    no activation deletes it (D4)."""
     from ms_flow.core.database.project_models import ShardGeneration
 
     parent_id = active_generation_id(project_db)
     with project_db.get_session() as session:
         row = ShardGeneration(parent_id=parent_id, step=str(step or ""), folder=str(folder or ""),
-                              job_id=str(job_id or ""))
+                              job_id=str(job_id or ""), kept=bool(kept))
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -115,6 +123,7 @@ def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None
             row.is_active = row.id == target.id
             session.add(row)
         keep = {int(target.id)} | ({int(target.parent_id)} if target.parent_id is not None else set())
+        keep |= {gen_id for gen_id, row in generations.items() if row.kept}
         doomed = [gen_id for gen_id in generations if gen_id not in keep | named]
         for row in generations.values():
             # Its parent may go: cut the link first, or that delete trips the foreign key.
@@ -148,38 +157,41 @@ def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None
 
 
 def _unlink(path: str | Path) -> None:
-    """A record file and its dropped sidecar."""
-    from ms_flow.core.data.shard import dropped_path
+    """A record file and its companions (I14)."""
+    from ms_flow.core.data.companions import companions
 
     Path(path).unlink(missing_ok=True)
-    dropped_path(path).unlink(missing_ok=True)
+    for companion in companions(path):
+        Path(companion).unlink(missing_ok=True)
 
 
 def file_row(path: str | Path, *, role: str, generation_id: int | None) -> dict[str, Any]:
     """A ready file's catalog row, from its header: what a task returns to `ms_flow.sinks.catalog_sink`
     so the parent registers its file as the chunk arrives (``n_active`` = every record: a
     derived file is read through `derived`, which narrows by its source's exclusions).
-    ``sidecars`` names its dropped sidecar too, so a worker on another disk brings both back;
-    it is no column, the sink leaves it."""
+    ``sidecars`` names its companions too, so a worker on another disk
+    brings them all back; it is no column, the sink leaves it."""
     from datetime import datetime
 
-    from ms_flow.core.data.shard import dropped_path
+    from ms_flow.core.data.companions import companions
 
     counts = _counts(None, path, exclusions=())
-    sidecar = dropped_path(path)
+    beside = companions(path)
     return {"generation_id": generation_id, "role": str(role), "path": str(path), "status": READY,
             "error": "", "created_at": datetime.now(), **counts,
-            "sidecars": [str(sidecar)] if sidecar.is_file() else []}
+            "sidecars": [name for name in beside if Path(name).is_file()]}
 
 
 def sweep(project_db, folder: str | Path) -> int:
     """Delete the files of ``folder`` the catalog does not know: a task's file published but never
     registered (the parent died in between), a writer's ``.tmp``. For a step, at its start, on its
-    own output folder; their shards are simply made again. How many went."""
+    own output folder; their shards are simply made again. The companions of a known file are known,
+    and so is every ``.lock``. How many went."""
     import os
 
     from sqlmodel import select
 
+    from ms_flow.core.data.companions import whole
     from ms_flow.core.database.project_models import CatalogFile
 
     folder = Path(folder)
@@ -191,8 +203,9 @@ def sweep(project_db, folder: str | Path) -> int:
     for path in folder.iterdir():
         if not path.is_file():
             continue
-        main = path.with_name(path.stem[: -len(".dropped")] + path.suffix) if path.stem.endswith(".dropped") else path
-        if path.name.endswith(".tmp") or os.path.abspath(str(main)) not in known:
+        if path.suffix == ".lock":  # a writer's (I1): never a step's to take away
+            continue
+        if path.name.endswith(".tmp") or os.path.abspath(whole(path)[0]) not in known:
             path.unlink(missing_ok=True)
             gone += 1
     return gone
@@ -263,35 +276,106 @@ def finish_file(project_db, file_id: int, path: str | Path | None = None) -> Non
 
 
 def _counts(project_db, path: str | Path, exclusions=None) -> dict[str, Any]:
-    from ms_flow.core.data.shard import file_groups
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX, file_groups
 
-    try:
-        groups = file_groups(path)
-    except KeyError:  # a table file: any Parquet, rows of its own schema, no shards
+    if not str(path).endswith(SUFFIX):  # a table file: any Parquet, rows of its own schema, no shards
         import pyarrow.parquet as pq
 
         rows = pq.ParquetFile(path).metadata.num_rows
         return {"n_shards": 0, "n_records": rows, "n_active": rows, "scopes": ""}
+    info, rows = container.read_index(path)
+    groups = [g for g in file_groups(path) if not g.retired]
     n_records = sum(g.n_records for g in groups)
-    return {"n_shards": len(groups), "n_records": n_records,
-            "n_active": n_records - _excluded(groups, exclusions, project_db),
+    return {"n_shards": len(groups), "n_records": n_records, **_committed(info, rows),
+            "n_active": n_records - _excluded(path, groups, exclusions, project_db),
             "scopes": ",".join(str(s) for s in sorted({g.scope for g in groups if g.scope is not None}))}
 
 
-def _excluded(groups, exclusions, project_db) -> int:
+def _committed(info: dict, rows: list[dict]) -> dict[str, int]:
+    return {"n_rows": len(rows), "n_retired": sum(1 for r in rows if r["retired"]),
+            "end": max([info["head_length"], *(r["offset"] + r["length"] for r in rows)])}
+
+
+def _check(row, now: dict[str, int]) -> None:
+    low = [f"{name} {now[name]} < {getattr(row, name)}" for name in _COMMITTED if now[name] < int(getattr(row, name) or 0)]
+    if low:
+        raise StaleIndex(f"{row.path}: its index is below the catalog ({', '.join(low)}); refused, nothing cut")
+
+
+def recount(project_db, file_id: int) -> dict[str, Any]:
+    """A container's counts again, from its index (I5): what is committed, never lowered (I6)."""
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX
+    from ms_flow.core.database.project_models import CatalogFile
+
+    with project_db.get_session() as session:
+        row = session.get(CatalogFile, int(file_id))
+        if row is None:
+            raise ValueError(f"No catalog file {file_id}.")
+        if str(row.path).endswith(SUFFIX):
+            _check(row, _committed(*container.read_index(row.path)))
+        counts = _counts(project_db, row.path)
+        for name, value in counts.items():
+            setattr(row, name, value)
+        session.add(row)
+        session.commit()
+        return counts
+
+
+def appender(project_db, file_id: int):
+    """The `container.Appender` of a ready, local container, after I6: an index below the catalog
+    is refused before the appender's open cuts anything. Its caller holds the locks (I1)."""
+    from ms_flow.core.data import container
+    from ms_flow.core.database.project_models import CatalogFile
+
+    with project_db.get_session() as session:
+        row = session.get(CatalogFile, int(file_id))
+        if row is None:
+            raise ValueError(f"No catalog file {file_id}.")
+        if row.status != READY or row.location:
+            raise ValueError(f"{row.path}: {row.status}{' on ' + row.location if row.location else ''}, not appended to (I19)")
+        _check(row, _committed(*container.read_index(row.path)))
+        return container.Appender(row.path)
+
+
+def seal(project_db, file_id: int) -> None:
+    """Read from now on, never appended again: what ships is sealed first (I15)."""
+    from ms_flow.core.database.project_models import CatalogFile
+
+    with project_db.get_session() as session:
+        row = session.get(CatalogFile, int(file_id))
+        if row is None or row.status not in READABLE:
+            raise ValueError(f"No ready catalog file {file_id} to seal.")
+        row.status = SEALED
+        session.add(row)
+        session.commit()
+
+
+def _excluded(path, groups, exclusions, project_db) -> int:
+    """How many usable records of ``groups`` the cuts hide: a cut naming a hole or a drop hides none."""
+    import numpy as np
+
+    from ms_flow.core.data.shard import usable_ids
+
     if exclusions is None:
         from ms_flow.core.data.exclusions import active_exclusions
 
         exclusions = active_exclusions(project_db)
     if not exclusions:
         return 0
-    # ponytail: counts the ids cut, holes included — the approximation `Exclusions.narrow` makes.
-    return sum(len(exclusions.in_range(g.scope, g.base_id, g.base_id + g.slot_count))
-               for g in groups if g.scope is not None and g.n_records)
+    total = 0
+    for group in groups:
+        if group.scope is None or not group.n_records:
+            continue
+        cut = exclusions.in_range(group.scope, group.base_id, group.base_id + group.slot_count)
+        if len(cut):
+            total += len(np.intersect1d(cut, usable_ids(path, group), assume_unique=True))
+    return total
 
 
 def refresh_active(project_db) -> None:
-    """``n_active`` of every ready file, after a cut was made or undone: one footer read each."""
+    """``n_active`` of every ready file, after a cut was made or undone: one index read each."""
     from sqlmodel import select
 
     from ms_flow.core.data.exclusions import active_exclusions
@@ -300,12 +384,12 @@ def refresh_active(project_db) -> None:
 
     exclusions = active_exclusions(project_db)
     with project_db.get_session() as session:
-        for row in session.exec(select(CatalogFile).where(CatalogFile.status == READY)).all():
+        for row in session.exec(select(CatalogFile).where(CatalogFile.status.in_(READABLE))).all():
             try:
-                groups = file_groups(row.path)
-            except (OSError, KeyError, ValueError):
+                groups = [g for g in file_groups(row.path) if not g.retired]
+            except (OSError, ValueError):
                 continue  # a file gone missing is the reader's error to raise, not this one's
-            row.n_active = int(row.n_records) - _excluded(groups, exclusions, project_db)
+            row.n_active = int(row.n_records) - _excluded(row.path, groups, exclusions, project_db)
             session.add(row)
         session.commit()
 
@@ -324,10 +408,11 @@ def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
 
     from sqlmodel import select
 
-    from ms_flow.core.data.shard import MAX_RECORDS, file_groups, merge_shards
+    from ms_flow.core.data.shard import MAX_RECORDS, SUFFIX, file_groups, merge_shards
     from ms_flow.core.database.project_models import CatalogFile
 
     with project_db.get_session() as session:
+        # READY, not READABLE: a compaction deletes its inputs, and a sealed container stays as it shipped.
         query = select(CatalogFile).where(CatalogFile.generation_id == int(generation_id),
                                           CatalogFile.status == READY, CatalogFile.location == "")
         if role is not None:
@@ -340,7 +425,7 @@ def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
         if not path.is_file() or not row.n_shards:
             continue  # ponytail: left as it is; a missing file is the reader's error to raise. A
             # table file has no shards: `compact_tables` is its compaction.
-        listed[int(row.id)] = file_groups(path)
+        listed[int(row.id)] = [g for g in file_groups(path) if not g.retired]
         for group in listed[int(row.id)]:
             if group.origin is not None:
                 newest[(str(row.role), group.origin)] = int(row.id)
@@ -351,17 +436,17 @@ def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
         if int(row.id) not in listed:
             continue
         kept = []
-        for index, group in enumerate(listed[int(row.id)]):
+        for group in listed[int(row.id)]:
             if group.origin is not None and newest[(str(row.role), group.origin)] != int(row.id):
-                skip.add((str(row.path), index))
+                skip.add((str(row.path), group.shard))
             else:
-                kept.append(group)
+                kept.append((group.shard, group))
         if not kept:
             if listed[int(row.id)]:
                 empty.append(row)
             continue
-        lo, hi = min(g.base_id for g in kept), max(g.base_id + g.slot_count for g in kept)
-        spans = [(g.base_id, g.base_id + g.slot_count) for g in kept]
+        lo, hi = min(g.base_id for _i, g in kept), max(g.base_id + g.slot_count for _i, g in kept)
+        spans = [(g.base_id, g.base_id + g.slot_count, index) for index, g in kept]
         groups.setdefault((str(Path(str(row.path)).parent), str(row.role)), []).append((lo, hi, row, spans))
     merged: list[tuple[list[Any], Path]] = []
     for (folder, _role), members in groups.items():
@@ -380,10 +465,10 @@ def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
         for members_bin in bins:
             if len(members_bin) < 2 and not any(key[0] == str(members_bin[0][2].path) for key in skip):
                 continue  # one file already, nothing in it redone elsewhere
-            dest = Path(folder) / f"merged_{uuid4().hex[:12]}{Path(str(members_bin[0][2].path)).suffix}"
+            dest = Path(folder) / f"merged_{uuid4().hex[:12]}{SUFFIX}"
             # Shard by shard in id order: a redone shard sits between the ones of an older file.
             parts = sorted((span, str(row.path)) for _lo, _hi, row, spans in members_bin for span in spans)
-            merge_shards([(path, span) for span, path in parts], dest, skip=skip)
+            merge_shards([(path, span[2]) for span, path in parts], dest)
             merged.append(([m[2] for m in members_bin], dest))
     if empty:
         merged.append((empty, None))
@@ -427,7 +512,7 @@ def compact_tables(project_db, role: str, *, unique_by: Iterable[str] = (), stat
     from ms_flow.core.database.project_models import CatalogFile
 
     with project_db.get_session() as session:
-        rows = list(session.exec(select(CatalogFile).where(
+        rows = list(session.exec(select(CatalogFile).where(  # READY: these files are rewritten (see `compact`)
             CatalogFile.role == str(role), CatalogFile.status == READY, CatalogFile.n_shards == 0,
         ).order_by(CatalogFile.id)).all())
     bins: dict[tuple[Any, str], list[Any]] = {}
@@ -495,8 +580,12 @@ def roles(project_db, *, generation_id: int | None = None) -> list[str]:
 def adopt(project_db, file_id: int, path: str | Path, *, checksum: str = "") -> bool:
     """A file of another host, brought here: it is local from now on, with the counts its header
     says. False when ``checksum`` (its sha256 there) is not what arrived, and the row is left
-    alone — never while anything still runs on it."""
-    if checksum and _sha256(path) != str(checksum):
+    alone — never while anything still runs on it. False too when a companion did not arrive (I14).
+    ponytail: ``checksum`` covers the file, not its companions; a sealed index (I15) is read whole
+    with its own crc on the first open."""
+    from ms_flow.core.data.companions import companions
+
+    if checksum and _sha256(path) != str(checksum) or not all(Path(c).is_file() for c in companions(path)):
         return False
     update_file(project_db, int(file_id), path=str(path), location="", status=READY,
                 **_counts(project_db, path))
@@ -532,10 +621,10 @@ def remove(project_db, role: str) -> int:
     return len(rows)
 
 
-def _overlaps(spans: list[tuple[int, int]], members: list) -> bool:
+def _overlaps(spans: list[tuple[int, int, int]], members: list) -> bool:
     """Does any of ``spans`` share an id with the shards of ``members``. ponytail: pairwise, a
     compaction sees tens of files; an interval tree if it ever sees thousands."""
-    return any(lo < b_hi and b_lo < hi for lo, hi in spans for m in members for b_lo, b_hi in m[3])
+    return any(lo < b_hi and b_lo < hi for lo, hi, _n in spans for m in members for b_lo, b_hi, _m in m[3])
 
 
 def _pinned(project_db, spec: QuerySpec | None) -> QuerySpec:
@@ -556,7 +645,7 @@ def _file_query(spec: QuerySpec, *, ready: bool = True) -> tuple[QuerySpec, dict
     """The spec as SQL over the files, and the filters left for the shards inside them."""
     file_filters = {k: v for k, v in spec.filters.items() if k not in _SHARD_FILTERS}
     if ready:  # read: what is closed and here (a file left on another host is listed, never opened)
-        file_filters["status"] = READY
+        file_filters["status__in"] = list(READABLE)
         file_filters.setdefault("location", "")
     return replace(spec, filters=file_filters), {k: v for k, v in spec.filters.items() if k in _SHARD_FILTERS}
 
@@ -580,7 +669,10 @@ def _iter_shards(project_db, spec: QuerySpec | None, page_size: int) -> Iterator
     for row in db_pages(project_db, query, page_size=max(1, int(page_size))):
         if not row["n_shards"]:
             continue  # a table file: rows, no shards
-        for index, group in enumerate(file_groups(row["path"])):
+        for group in file_groups(row["path"]):
+            if group.retired:
+                continue  # out of every read; its number stays taken
+            index = group.shard
             sid = shard_id(row["id"], index)
             if "scope" in wanted and not _matches(group.scope, wanted["scope"]):
                 continue
@@ -593,7 +685,7 @@ def _shard_row(sid: int, row: dict[str, Any], index: int, group) -> dict[str, An
     return {"id": sid, "file_id": int(row["id"]), "generation_id": row["generation_id"], "role": row["role"],
             "path": row["path"], "shard_index": index, "scope": group.scope, "base_id": group.base_id,
             "slot_count": group.slot_count, "n_records": group.n_records, "origin": group.origin,
-            "n_dropped": group.n_dropped}
+            "n_dropped": group.n_dropped, "present": group.present}
 
 
 def get_shard(project_db, value: int) -> dict[str, Any] | None:
@@ -610,7 +702,9 @@ def get_shard(project_db, value: int) -> dict[str, Any] | None:
         row = {"id": int(row.id), "generation_id": row.generation_id, "role": row.role, "path": row.path}
     try:
         group = file_groups(row["path"])[index]
-    except (OSError, IndexError, KeyError):
+    except (OSError, IndexError, ValueError):
+        return None
+    if group.retired:
         return None
     return _shard_row(int(value), row, index, group)
 
@@ -639,7 +733,7 @@ def _sum(project_db, spec: QuerySpec | None, column: str) -> int | None:
         return None
     statement = select(func.coalesce(func.sum(getattr(CatalogFile, column)), 0))
     for key, value in query.filters.items():
-        field = getattr(CatalogFile, key)
+        field = getattr(CatalogFile, key.removesuffix("__in"))
         statement = statement.where(field.in_(list(value)) if isinstance(value, (list, tuple, set)) else field == value)
     with project_db.get_session() as session:
         return int(session.exec(statement).one())
@@ -707,9 +801,9 @@ def has_files(project_db, spec: QuerySpec | None = None) -> bool:
 
 
 __all__ = [
-    "FIELDS", "GROUP_BITS", "READY", "SOURCE", "TABLE", "WRITING", "activate_generation", "active_generation_id", "add_file", "adopt",
+    "FIELDS", "GROUP_BITS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "adopt",
     "compact", "compact_tables", "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
-    "record_count", "refresh_active", "remove", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
+    "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
     "underived",
     "update_file",
 ]

@@ -34,7 +34,9 @@ def test_on_ray_without_a_shared_disk_files_go_once_and_what_results_name_comes_
     from ms_flow.engine import RayExecutor
 
     (tmp_path / "anchor.txt").write_text("here")
-    read, left, layouts = [], [], tmp_path / "layouts"
+    (tmp_path / "in.arrows").write_text("sent")
+    (tmp_path / "in.arrows.index").write_text("its index")
+    read, left, pairs, layouts, out = [], [], [], tmp_path / "layouts", tmp_path / "out"
     with Engine(cpus=1) as engine:
         ray = RayExecutor(num_cpus=2, shared=False)
         engine.register("ray", ray)
@@ -42,9 +44,15 @@ def test_on_ray_without_a_shared_disk_files_go_once_and_what_results_name_comes_
                             on_results=read.extend)
         two = engine.submit("ray", workers.leave, [{"out": Dir(layouts), "n": i} for i in range(7)], batch=3,
                             on_results=left.extend)
-        assert (engine.wait(one, 120).status, engine.wait(two, 120).status) == ("completed", "completed")
+        # a container: its index goes with it, and comes back with it
+        three = engine.submit("ray", workers.pair, [{"container": File(tmp_path / "in.arrows"), "out": Dir(out), "n": i}
+                                                    for i in range(3)], on_results=pairs.extend)
+        assert [engine.wait(job, 120).status for job in (one, two, three)] == ["completed"] * 3
         gc.collect()
         assert not ray._carried, "a file nobody reads any more is not kept in the object store"
+    assert {result["said"] for key, result in pairs} == {"sent|its index"}
+    assert sorted(path.name for path in out.iterdir()) == sorted(f"{i}.arrows{end}" for i in range(3) for end in ("", ".index"))
+    assert not list(out.glob("*.tmp"))
     seen = {result["path"] for key, result in read}
     assert len(read) == 6 and all(result["text"] == "here" for key, result in read)
     assert len(seen) == 1 and not seen.pop().startswith(str(tmp_path)), "one copy, kept by the node"

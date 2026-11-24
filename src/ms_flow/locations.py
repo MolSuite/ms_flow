@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
+from ms_flow.core.data.companions import whole
+
 
 def _engine(project):
     return project.engine if project is not None and getattr(project, "project_dir", None) else None
@@ -56,8 +58,10 @@ def known(project, host: str) -> dict[str, tuple[int, str]]:
 
 
 def record(project, host: str, verified: dict[str, tuple[int, str]]) -> None:
-    """What was just verified on `host`, `{path: (size, sha256)}`."""
+    """What was just verified on `host`, `{path: (size, sha256)}`. A file whose companions were
+    not verified with it is not recorded: half of a container is not a copy (I14)."""
     engine = _engine(project)
+    verified = {path: seen for path, seen in verified.items() if all(name in verified for name in whole(path))}
     if engine is None or not verified:
         return
     now = str(datetime.now())  # as SQLAlchemy writes a DateTime
@@ -70,17 +74,19 @@ def record(project, host: str, verified: dict[str, tuple[int, str]]) -> None:
 
 
 def forget(project, host: str, paths) -> None:
+    """`paths` are not on `host`, and neither are their containers' other files."""
     engine = _engine(project)
     if engine is None:
         return
     with engine.begin() as conn:
-        for path in paths:
+        for path in {name for path in paths for name in whole(path)}:
             conn.exec_driver_sql("DELETE FROM ms_locations WHERE host = ? AND path = ?", (host, path))
 
 
 def reconcile(project, remote) -> list[str]:
     """The files `ms_locations` says are on the host of `remote` that are not there any more, or
-    not with their size: their rows go. One command over there, whatever their number."""
+    not with their size: their rows go, with those of the rest of their container. One command
+    over there, whatever their number."""
     host = host_of(remote)
     recorded = known(project, host)
     if not recorded:
@@ -89,7 +95,8 @@ def reconcile(project, remote) -> list[str]:
     said = remote.remote.run(f"cd {shlex.quote(root(remote, project))} 2>/dev/null || exec cat; "
                              "while read -r s p; do [ \"$(stat -c %s -- \"$p\" 2>/dev/null)\" = \"$s\" ] || "
                              "printf '%s %s\\n' \"$s\" \"$p\"; done", listing).decode()
-    gone = [line.partition(" ")[2] for line in said.splitlines() if line.strip()]
+    gone = {name for line in said.splitlines() if line.strip() for name in whole(line.partition(" ")[2])}
+    gone = sorted(gone & recorded.keys())
     forget(project, host, gone)
     return gone
 

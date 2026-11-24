@@ -21,7 +21,7 @@ def _source(db, folder, n_files=3):
     gen = catalog.create_generation(db, step="load")
     for f in range(n_files):
         base = 8 * f
-        path = folder / f"src{f}.parquet"
+        path = folder / f"src{f}.arrows"
         with ShardWriter(path, dataset_id=None, shard_id=0, base_id=base, kind=0, serializer=Serializer.UTF8,
                          slot_count=1 << 20) as writer:
             for lo in (base, base + 4):
@@ -40,7 +40,7 @@ def upper(element):
     with ShardWriter(out, dataset_id=None, shard_id=0, base_id=element["shards"][0]["base_id"], kind=0,
                      serializer=Serializer.UTF8, slot_count=1 << 20) as writer:
         for shard in element["shards"]:
-            with Shard.open(shard["path"], ids=(shard["base_id"], shard["base_id"] + shard["slot_count"])) as src:
+            with Shard.open(shard["path"], shard=shard["shard_index"]) as src:
                 for record in src:
                     if record.id == 5:
                         writer.drop(5, "no upper case")
@@ -60,7 +60,7 @@ def derive(params, project):
     catalog.sweep(project, params["folder"])
     todo = list(catalog.underived(project, ROLE)) if not params.get("force") else \
         [s for s in catalog.shards(project, whole=True) if s["base_id"] in params["force"]]
-    return [{"shards": todo[i:i + 2], "out": f"{params['folder']}/t{params['run']}_{i}.parquet", "gen": params["gen"]}
+    return [{"shards": todo[i:i + 2], "out": f"{params['folder']}/t{params['run']}_{i}.arrows", "gen": params["gen"]}
             for i in range(0, len(todo), 2)]
 
 
@@ -77,11 +77,11 @@ def test_a_derive_job_registers_per_task_files_compacts_them_and_a_redo_shadows_
         gen = _source(db, tmp_path)
         out = tmp_path / "upper"
         out.mkdir()
-        (out / "orphan.parquet").write_bytes(b"published, never registered")
+        (out / "orphan.arrows").write_bytes(b"published, never registered")
         assert len(list(catalog.underived(db, ROLE))) == 6
         _run(db, {"gen": gen, "folder": str(out), "run": 0})
 
-        assert not (out / "orphan.parquet").exists()  # swept at the job's start
+        assert not (out / "orphan.arrows").exists()  # swept at the job's start
         made = list(catalog.files(db, catalog.shard_spec(role=ROLE)))
         assert len(made) == 1 and made[0]["n_shards"] == 6 and made[0]["n_records"] == 23
         assert list(catalog.underived(db, ROLE)) == []
@@ -89,7 +89,7 @@ def test_a_derive_job_registers_per_task_files_compacts_them_and_a_redo_shadows_
         assert read_dropped(made[0]["path"]) == [(5, "no upper case")]
         derived = list(catalog.derived(db, ROLE))
         assert [d["origin"] for d in derived] == [s["id"] for s in catalog.shards(db)]
-        with Shard.open(derived[0]["path"], ids=(0, 4)) as shard:
+        with Shard.open(derived[0]["path"], shard=derived[0]["shard_index"]) as shard:
             assert [r.load() for r in shard] == ["R0", "R1", "R2", "R3"]
 
         # A forced redo of the shard at 8: its newest copy is the one read, and compaction keeps one.
@@ -97,7 +97,7 @@ def test_a_derive_job_registers_per_task_files_compacts_them_and_a_redo_shadows_
         made = list(catalog.files(db, catalog.shard_spec(role=ROLE)))
         assert len(made) == 1 and made[0]["n_shards"] == 6
         assert sorted(p.name for p in out.iterdir()) == sorted(
-            [Path(made[0]["path"]).name, Path(made[0]["path"]).stem + ".dropped.parquet"])
+            [Path(made[0]["path"]).name, Path(made[0]["path"]).name + ".index"])
         assert len(list(catalog.derived(db, ROLE))) == 6
 
         # The source generation goes: its derived files go with it.

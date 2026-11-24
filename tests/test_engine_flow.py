@@ -164,6 +164,7 @@ def after_the_writer(params, project):
 
 @pytest.fixture
 def project(tmp_path):
+    ProjectStore.open_at(tmp_path / "project.db").dispose()  # the current schema first, then the app's tables
     with closing(sqlite3.connect(tmp_path / "project.db")) as conn, conn:
         conn.execute("CREATE TABLE guests (id INTEGER PRIMARY KEY, slug TEXT)")
         conn.execute("CREATE TABLE coupling_results (id INTEGER PRIMARY KEY, guest_id INT, layout_rank INT)")

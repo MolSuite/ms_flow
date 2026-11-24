@@ -31,6 +31,19 @@ def leave(payload: dict) -> dict:
     return {"made": path}
 
 
+def pair(payload: dict) -> dict:
+    """Reads the container it is given and the index beside it, if any; leaves one in `out`."""
+    said = ""
+    if payload.get("container"):
+        with open(payload["container"]) as data, open(payload["container"] + ".index") as index:
+            said = f"{data.read()}|{index.read()}"
+    made = os.path.join(payload["out"], f"{payload['n']}.arrows")
+    with open(made, "w") as data, open(made + ".index", "w") as index:
+        data.write(f"data {payload['n']}")
+        index.write(f"index {payload['n']}")
+    return {"said": said, "made": made}
+
+
 def half_then_held(payload: dict) -> int:
     """Says it is halfway and stays there until the gate file is there."""
     from ms_flow.engine import report

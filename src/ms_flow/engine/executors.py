@@ -69,6 +69,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 
+from ..core.data.companions import companions, whole
 from .files import Dir, swap
 
 try:
@@ -383,14 +384,15 @@ class RayExecutor:
             if mark not in dirs:
                 dirs.append(str(mark))
             return _Out(dirs.index(mark))
-        at = os.stat(mark)
-        key = (str(mark), at.st_mtime_ns, at.st_size)
+        paths = [str(mark), *companions(mark)]  # a container goes with its index (I14)
+        key = tuple((path, at.st_mtime_ns, at.st_size) for path in paths for at in [os.stat(path)])
         carried = self._carried.get(key)
         if carried is None:
-            with open(mark, "rb") as file:
-                carried = self._carried[key] = _Carried(
-                    os.path.basename(mark), hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(),
-                    self._ray.put(file.read()))
+            refs = []
+            for path in paths:
+                with open(path, "rb") as file:
+                    refs.append((os.path.basename(path), self._ray.put(file.read())))
+            carried = self._carried[key] = _Carried(hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(), refs)
         held.append(carried)
         return carried
 
@@ -417,11 +419,13 @@ class RayExecutor:
                 return os.path.join(dirs[int(n)], rest) if rest else dirs[int(n)]
 
             # ponytail: written on Ray's own thread; a thread of the executor once files get large.
-            for name, data in files.items():
+            # The data first, its index last, each whole or not there (I14).
+            for name in sorted(files, key=lambda name: whole(name)[0] != name):
                 target = here(os.path.join(root, name))
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                with open(target, "wb") as file:
-                    file.write(data)
+                with open(target + ".tmp", "wb") as file:
+                    file.write(files[name])
+                os.replace(target + ".tmp", target)
             value = swap(result, here, str), used
         result, used = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, used)
@@ -724,25 +728,27 @@ def _told(tally, index, call, fn, payload):
 
 
 class _Carried:
-    """A file in Ray's object store."""
+    """A file in Ray's object store, and its companions: `refs` is `[(name, ref)]`, the file first."""
 
-    def __init__(self, name, id, ref):
-        self.name, self.id, self.ref = name, id, ref
+    def __init__(self, id, refs):
+        self.id, self.refs = id, refs
 
     def land(self) -> str:
-        """Its path on this node, which keeps it for the tasks that follow."""
+        """Its path on this node, which keeps it for the tasks that follow. Its companions land
+        beside it, after it: the last one there means all of them are."""
         # ponytail: nothing takes the copies away but whatever cleans the node's temporary
         # directory; a sweep at `shutdown` once a cluster that lives for weeks fills its disks.
-        path = os.path.join(tempfile.gettempdir(), "msflow-files", self.id, self.name)
-        if not os.path.exists(path):
+        folder = os.path.join(tempfile.gettempdir(), "msflow-files", self.id)
+        if not os.path.exists(os.path.join(folder, self.refs[-1][0])):
             import ray
 
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            fd, coming = tempfile.mkstemp(dir=os.path.dirname(path))
-            with os.fdopen(fd, "wb") as file:
-                file.write(ray.get(self.ref))
-            os.replace(coming, path)  # whole or not there: another task of this node may be bringing it too
-        return path
+            os.makedirs(folder, exist_ok=True)
+            for name, ref in self.refs:
+                fd, coming = tempfile.mkstemp(dir=folder)
+                with os.fdopen(fd, "wb") as file:
+                    file.write(ray.get(ref))
+                os.replace(coming, os.path.join(folder, name))  # whole or not there: another task of this node may be bringing it too
+        return os.path.join(folder, self.refs[0][0])
 
 
 class _Out:
@@ -767,9 +773,10 @@ def _apply_far(call, fn, payload):
         def take(text):
             if text.startswith(root + os.sep):
                 inside = [os.path.join(folder, name) for folder, _, names in os.walk(text) for name in names]
+                named = [name for name in whole(text) if os.path.isfile(name)]  # a container, with its index
                 # ponytail: the files go back in memory with the result; a file of the store for
                 # each once a task leaves more than fits there.
-                for path in inside or [text] * os.path.isfile(text):
+                for path in inside or named:
                     with open(path, "rb") as file:
                         files[os.path.relpath(path, root)] = file.read()
             return text

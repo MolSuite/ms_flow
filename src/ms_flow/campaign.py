@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ms_flow import locations
+from ms_flow.core.data.companions import companions
 from ms_flow.engine.files import Dir, File, KeptDir, swap
 from ms_flow.engine.flow import job, task
 from ms_env import HostError
@@ -231,6 +232,9 @@ class Campaign:
                     sha, path = known.get(mark) or _sha256(mark), self._store and locations.inside(project, mark)
                     carried[mark] = self._store + path if path else f"files/{sha}/{os.path.basename(mark)}"
                     self._shas[carried[mark]] = sha
+                    for companion in companions(mark):  # beside it there, as here (I14)
+                        carried[companion] = f"{carried[mark]}{companion[len(mark):]}"
+                        self._shas[carried[companion]] = _sha256(companion)
                 return File(carried[mark])
 
             listed = [{"name": stage.name, "fn": bound(stage.task),

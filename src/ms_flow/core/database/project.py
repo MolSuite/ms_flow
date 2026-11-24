@@ -8,7 +8,7 @@ import threading
 from sqlalchemy import column as sql_column, text as sql_text
 from sqlmodel import SQLModel, func, select as sql_select
 
-from ms_flow.core.database.base import BaseSQLiteDB, create_project_tables
+from ms_flow.core.database.base import BaseSQLiteDB, ProjectTablesDB
 from ms_flow.core.database.project_records import (
     ProjectBulkInsertRequest,
     ProjectBulkInsertResult,
@@ -695,10 +695,7 @@ class ProjectStore:
         return set(names) <= {ix["name"] for ix in inspect(self.engine).get_indexes(table)}
 
 
-class _ProjectSQLiteHandle(BaseSQLiteDB):
-    def _create_tables(self):
-        create_project_tables(self.engine)
-
+class _ProjectSQLiteHandle(ProjectTablesDB):
     def _setup_path_error_message(self) -> str:
         return "No project is connected."
 
