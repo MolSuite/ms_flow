@@ -276,16 +276,15 @@ def finish_file(project_db, file_id: int, path: str | Path | None = None) -> Non
 
 
 def _counts(project_db, path: str | Path, exclusions=None) -> dict[str, Any]:
-    from ms_flow.core.data import container
-    from ms_flow.core.data.shard import SUFFIX, file_groups
+    from ms_flow.core.data.shard import SUFFIX, _index
 
     if not str(path).endswith(SUFFIX):  # a table file: any Parquet, rows of its own schema, no shards
         import pyarrow.parquet as pq
 
         rows = pq.ParquetFile(path).metadata.num_rows
         return {"n_shards": 0, "n_records": rows, "n_active": rows, "scopes": ""}
-    info, rows = container.read_index(path)
-    groups = [g for g in file_groups(path) if not g.retired]
+    info, rows, _header, groups = _index(Path(path))  # one read of the index, cached for `recount`
+    groups = [g for g in groups if not g.retired]
     n_records = sum(g.n_records for g in groups)
     return {"n_shards": len(groups), "n_records": n_records, **_committed(info, rows),
             "n_active": n_records - _excluded(path, groups, exclusions, project_db),
@@ -305,8 +304,7 @@ def _check(row, now: dict[str, int]) -> None:
 
 def recount(project_db, file_id: int) -> dict[str, Any]:
     """A container's counts again, from its index (I5): what is committed, never lowered (I6)."""
-    from ms_flow.core.data import container
-    from ms_flow.core.data.shard import SUFFIX
+    from ms_flow.core.data.shard import SUFFIX, _index
     from ms_flow.core.database.project_models import CatalogFile
 
     with project_db.get_session() as session:
@@ -314,7 +312,7 @@ def recount(project_db, file_id: int) -> dict[str, Any]:
         if row is None:
             raise ValueError(f"No catalog file {file_id}.")
         if str(row.path).endswith(SUFFIX):
-            _check(row, _committed(*container.read_index(row.path)))
+            _check(row, _committed(*_index(Path(row.path))[:2]))
         counts = _counts(project_db, row.path)
         for name, value in counts.items():
             setattr(row, name, value)
@@ -350,6 +348,207 @@ def seal(project_db, file_id: int) -> None:
         row.status = SEALED
         session.add(row)
         session.commit()
+
+
+MAX_SHARDS = 4096  # of one container (I18): its index is rewritten whole per commit, ~10 ms at this size
+MAX_BYTES = 4 << 30  # committed bytes of one container, compressed (I18)
+
+
+def _step(step) -> None:
+    """Where `ContainerWriter.commit_parts` is: a seam for the crash tests, nothing else."""
+
+
+class ContainerWriter:
+    """The one writer of the containers of ``(generation, role)`` in ``folder``: receipts of parts
+    in, shard ids out. A receipt is ``{"part": ..., "path": ..., ...}``: ``part`` names the unit of
+    work and makes the commit idempotent (I10), ``path`` is the part container a worker made; its
+    shards are copied as bytes, never decoded (I12). ``prefix``: the part ids of this submission,
+    the only ones loaded from the indexes. ``on_commit(receipts)``: the caller's states, for every
+    receipt of a group, the ones committed before included; it must be idempotent.
+
+    The lock file is taken at the first commit and kept until `close` (I1), so what this writer read
+    of the indexes stays true between commits. ponytail: one role per writer; the in-process lock
+    over every role of a key comes with the first writer of two roles (M6a).
+    """
+
+    def __init__(self, project_db, folder: str | Path, *, generation_id: int, role: str = SOURCE,
+                 prefix: str = "", on_commit=None):
+        import re
+
+        self.db, self.folder, self.generation_id = project_db, Path(folder), int(generation_id)
+        self.role, self.prefix, self.on_commit = str(role), str(prefix), on_commit
+        self._name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.role)
+        self._lock = self._appender = self._file_id = self._head = None
+        self._done: dict[str, list[int]] = {}
+
+    def __enter__(self) -> "ContainerWriter":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._appender = None
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
+
+    def seal(self) -> None:
+        """Seal the container being appended to (I15): the next part starts another."""
+        if self._lock is None:
+            self._open()
+        if self._appender is not None:
+            seal(self.db, self._file_id)
+            self._appender = None
+
+    def _open(self) -> None:
+        from sqlmodel import select
+
+        from ms_flow.core.data import container
+        from ms_flow.core.data.shard import SUFFIX
+        from ms_flow.core.database.project_models import CatalogFile
+        from ms_flow.engine.journal import own
+
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self._lock = own(self.folder / f"{self._name}.{self.generation_id}.lock")  # Busy names the holder
+        try:
+            _step(2)
+            with self.db.get_session() as session:
+                rows = session.exec(
+                    select(CatalogFile.id, CatalogFile.path, CatalogFile.status, CatalogFile.location)
+                    .where(CatalogFile.generation_id == self.generation_id, CatalogFile.role == self.role)
+                    .order_by(CatalogFile.id)
+                ).all()
+            rows = [row for row in rows if str(row.path).endswith(SUFFIX)]
+            for file_id, path, _status, location in rows:
+                if location:  # ponytail: parts committed on a remote copy are seen when it comes back (M10)
+                    continue
+                for row in container.read_index(path)[1]:
+                    if row["part"] and row["part"].startswith(self.prefix):
+                        self._done.setdefault(row["part"], []).append(shard_id(file_id, row["shard"]))
+            if rows and rows[-1].status == READY and not rows[-1].location:  # I9: only the newest
+                self._file_id = int(rows[-1].id)
+                self._appender = appender(self.db, self._file_id)  # I6 first
+                self._head = self._appender.head
+                recount(self.db, self._file_id)
+        except BaseException:
+            self.close()
+            raise
+
+    def _create(self, head: bytes, app: dict) -> None:
+        """The next container: its file, its empty index, its catalog row, in that order (a crash
+        before the row leaves files `sweep` removes)."""
+        import uuid
+
+        import pyarrow.ipc as ipc
+
+        from ms_flow.core.data import container
+        from ms_flow.core.data.shard import SUFFIX
+
+        path = self.folder / f"{self._name}.{uuid.uuid4().hex[:16]}{SUFFIX}"
+        self._appender = container.Appender.create(path, ipc.read_schema(ipc.read_message(head)), app)
+        _step(5.5)
+        self._file_id = add_file(self.db, path, generation_id=self.generation_id, role=self.role)
+        self._head = self._appender.head
+
+    def _flush(self, batch: list) -> None:
+        """One commit of whole parts into the current container. An unreadable part fails its own
+        receipt and the rest is committed again without it; a failed write poisons the writer."""
+        from ms_flow.core.data import container
+
+        while batch:
+            _step(6)
+            current = [None]
+
+            def shards():
+                for at, (receipt, live) in enumerate(batch):
+                    current[0] = receipt
+                    for row in live:
+                        yield {**row, "part": receipt["part"]}, container._blocks(receipt["path"], row)
+                    if at == 0:
+                        _step(6.5)
+
+            try:
+                ids = iter(self._appender.commit(shards()))
+            except (OSError, ValueError) as error:
+                if self._appender._broken is not None:
+                    raise
+                current[0]["error"] = f"{current[0]['path']}: {error}"
+                batch = [item for item in batch if item[0] is not current[0]]
+                continue
+            for receipt, live in batch:
+                self._done[receipt["part"]] = [shard_id(self._file_id, next(ids)) for _ in live]
+            return
+
+    def commit_parts(self, receipts: Iterable[dict]) -> list[dict]:
+        """Commit a group of receipts; every one comes back with its ``shards`` (committed now or
+        before) or an ``error``. Only then may the engine be told they are done (I11)."""
+        import pyarrow.ipc as ipc
+
+        from ms_flow.core.data import container
+        from ms_flow.core.data.companions import whole
+
+        receipts = [dict(receipt) for receipt in receipts]
+        _step(1)
+        if self._lock is None:
+            self._open()
+        _step(3)
+        fresh, seen = [], set()
+        for receipt in receipts:  # before any part is opened: it may be gone (I10)
+            if receipt["part"] not in self._done and receipt["part"] not in seen:
+                seen.add(receipt["part"])
+                fresh.append(receipt)
+        _step(4)
+        valid = []
+        for receipt in fresh:
+            try:
+                info, rows = container.read_index(receipt["path"])
+                head = container.read_head(receipt["path"], info)
+                if self._head is not None and head != self._head and not ipc.read_schema(ipc.read_message(head)).equals(
+                        ipc.read_schema(ipc.read_message(self._head)), check_metadata=True):
+                    raise ValueError("another schema")
+            except (OSError, ValueError) as error:
+                receipt["error"] = f"{receipt['path']}: {error}"
+                continue
+            self._head = self._head or head
+            valid.append((receipt, [row for row in rows if not row["retired"]], head, info.get("app") or {}))
+        _step(5)
+        batch: list = []
+        for receipt, live, head, app in valid:
+            if self._appender is None:
+                self._create(head, app)
+            if not batch:
+                used, size = len(self._appender.rows), self._appender.end
+            length = sum(row["length"] for row in live)
+            if used and (used + len(live) > MAX_SHARDS or size + length > MAX_BYTES):
+                self._flush(batch)  # I18: a part goes whole into one container
+                batch = []
+                seal(self.db, self._file_id)
+                self._create(head, app)
+                used, size = 0, self._appender.end
+            batch.append((receipt, live))
+            used, size = used + len(live), size + length
+        self._flush(batch)
+        accepted = []
+        for receipt in receipts:
+            if "error" in receipt:
+                continue
+            if receipt["part"] in self._done:
+                receipt["shards"] = list(self._done[receipt["part"]])
+                accepted.append(receipt)
+            else:
+                receipt["error"] = f"{receipt['path']}: not committed, another receipt of its part failed"
+        _step(7)
+        for file_id in sorted({split_shard_id(s)[0] for receipt in accepted for s in receipt["shards"]}):
+            recount(self.db, file_id)  # idempotent: what the index says
+        if self.on_commit is not None:
+            self.on_commit(accepted)
+        _step(8)
+        for receipt in accepted:  # after the commits: a replay no longer needs the part (I11)
+            for name in whole(receipt["path"]):
+                Path(name).unlink(missing_ok=True)
+        _step(9)
+        return receipts
 
 
 def _excluded(path, groups, exclusions, project_db) -> int:
@@ -801,7 +1000,7 @@ def has_files(project_db, spec: QuerySpec | None = None) -> bool:
 
 
 __all__ = [
-    "FIELDS", "GROUP_BITS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "adopt",
+    "ContainerWriter", "FIELDS", "GROUP_BITS", "MAX_BYTES", "MAX_SHARDS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "adopt",
     "compact", "compact_tables", "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
     "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
     "underived",
