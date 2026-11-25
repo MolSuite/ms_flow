@@ -592,7 +592,7 @@ def file_groups(path: str | Path) -> list[Group]:
 
 
 def _ambiguous(groups: list[Group]) -> bool:
-    """Shards whose ids are not in one ascending order across the file (I7)."""
+    """Shards, sorted by base id, whose id ranges overlap (I7)."""
     return any(a.base_id + a.slot_count > b.base_id for a, b in zip(groups, groups[1:]))
 
 
@@ -643,7 +643,7 @@ class Shard:
             chosen = [rows[group.shard]]
             header = {**header, "base_id": group.base_id, "slot_count": group.slot_count}
         else:
-            live = [g for g in groups if not g.retired]
+            live = sorted((g for g in groups if not g.retired), key=lambda g: g.base_id)  # parts land as they arrive
             if _ambiguous(live):
                 raise ValueError(f"{path}: its shards' ids overlap; open one by number")
             chosen = [rows[g.shard] for g in live]

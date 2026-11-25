@@ -146,6 +146,8 @@ def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None
                 continue
             savepoint.commit()
             dropped |= {str(row.path or "") for row in files} | {str(path) for path in extra}
+            # Their writers' lock files too: no writer appends to a generation that went.
+            dropped |= {str(_lock_path(Path(row.path).parent, row.role, gen_id)) for row in files if row.path}
         # A file may be listed twice (a step that kept it): it goes only when no row points at it.
         paths = dropped - set(session.exec(select(CatalogFile.path)).all())
         session.commit()
@@ -165,12 +167,19 @@ def _unlink(path: str | Path) -> None:
         Path(companion).unlink(missing_ok=True)
 
 
-def file_row(path: str | Path, *, role: str, generation_id: int | None) -> dict[str, Any]:
-    """A ready file's catalog row, from its header: what a task returns to `ms_flow.sinks.catalog_sink`
-    so the parent registers its file as the chunk arrives (``n_active`` = every record: a
-    derived file is read through `derived`, which narrows by its source's exclusions).
-    ``sidecars`` names its companions too, so a worker on another disk
-    brings them all back; it is no column, the sink leaves it."""
+def _lock_path(folder: str | Path, role: str, generation_id: int) -> Path:
+    """The lock file of the one `ContainerWriter` of ``(generation, role)`` in ``folder`` (I1)."""
+    import re
+
+    return Path(folder) / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', str(role))}.{int(generation_id)}.lock"
+
+
+def file_row(path: str | Path, *, role: str, generation_id: int | None, part: str | None = None) -> dict[str, Any]:
+    """A ready file's catalog row, from its header (``n_active`` = every record: a derived file is
+    read through `derived`, which narrows by its source's exclusions). ``sidecars`` names its
+    companions too, so a worker on another disk brings them all back; it is no column.
+    With ``part`` it is the receipt a task returns to `ms_flow.sinks.catalog_sink`: the file is a
+    part, its shards are appended to the containers of its role and it goes."""
     from datetime import datetime
 
     from ms_flow.core.data.companions import companions
@@ -179,7 +188,7 @@ def file_row(path: str | Path, *, role: str, generation_id: int | None) -> dict[
     beside = companions(path)
     return {"generation_id": generation_id, "role": str(role), "path": str(path), "status": READY,
             "error": "", "created_at": datetime.now(), **counts,
-            "sidecars": [name for name in beside if Path(name).is_file()]}
+            "sidecars": [name for name in beside if Path(name).is_file()], **({"part": str(part)} if part else {})}
 
 
 def sweep(project_db, folder: str | Path) -> int:
@@ -410,7 +419,7 @@ class ContainerWriter:
         from ms_flow.engine.journal import own
 
         self.folder.mkdir(parents=True, exist_ok=True)
-        self._lock = own(self.folder / f"{self._name}.{self.generation_id}.lock")  # Busy names the holder
+        self._lock = own(_lock_path(self.folder, self.role, self.generation_id))  # Busy names the holder
         try:
             _step(2)
             with self.db.get_session() as session:
@@ -488,7 +497,8 @@ class ContainerWriter:
         from ms_flow.core.data import container
         from ms_flow.core.data.companions import whole
 
-        receipts = [dict(receipt) for receipt in receipts]
+        # A receipt's `error` is what this commit says of it: a task's own note is not one.
+        receipts = [{key: value for key, value in receipt.items() if key != "error"} for receipt in receipts]
         _step(1)
         if self._lock is None:
             self._open()
