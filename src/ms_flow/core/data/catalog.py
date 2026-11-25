@@ -167,11 +167,12 @@ def _unlink(path: str | Path) -> None:
         Path(companion).unlink(missing_ok=True)
 
 
-def _lock_path(folder: str | Path, role: str, generation_id: int) -> Path:
+def _lock_path(folder: str | Path, role: str, generation_id: int | None) -> Path:
     """The lock file of the one `ContainerWriter` of ``(generation, role)`` in ``folder`` (I1)."""
     import re
 
-    return Path(folder) / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', str(role))}.{int(generation_id)}.lock"
+    generation = "none" if generation_id is None else int(generation_id)
+    return Path(folder) / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', str(role))}.{generation}.lock"
 
 
 def file_row(path: str | Path, *, role: str, generation_id: int | None, part: str | None = None) -> dict[str, Any]:
@@ -376,15 +377,16 @@ class ContainerWriter:
     receipt of a group, the ones committed before included; it must be idempotent.
 
     The lock file is taken at the first commit and kept until `close` (I1), so what this writer read
-    of the indexes stays true between commits. ponytail: one role per writer; the in-process lock
-    over every role of a key comes with the first writer of two roles (M6a).
+    of the indexes stays true between commits. Two roles written as one: `PairWriter`.
     """
 
-    def __init__(self, project_db, folder: str | Path, *, generation_id: int, role: str = SOURCE,
+    def __init__(self, project_db, folder: str | Path, *, generation_id: int | None, role: str = SOURCE,
                  prefix: str = "", on_commit=None):
         import re
 
-        self.db, self.folder, self.generation_id = project_db, Path(folder), int(generation_id)
+        # None: files of no generation (an app's own, outside any import)
+        self.db, self.folder = project_db, Path(folder)
+        self.generation_id = None if generation_id is None else int(generation_id)
         self.role, self.prefix, self.on_commit = str(role), str(prefix), on_commit
         self._name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.role)
         self._lock = self._appender = self._file_id = self._head = None
@@ -473,7 +475,8 @@ class ContainerWriter:
                 for at, (receipt, live) in enumerate(batch):
                     current[0] = receipt
                     for row in live:
-                        yield {**row, "part": receipt["part"]}, container._blocks(receipt["path"], row)
+                        yield ({**row, "part": receipt["part"], "meta": _meta(row["meta"], receipt.get("meta"))},
+                               container._blocks(receipt["path"], row))
                     if at == 0:
                         _step(6.5)
 
@@ -489,9 +492,11 @@ class ContainerWriter:
                 self._done[receipt["part"]] = [shard_id(self._file_id, next(ids)) for _ in live]
             return
 
-    def commit_parts(self, receipts: Iterable[dict]) -> list[dict]:
+    def commit_parts(self, receipts: Iterable[dict], *, again: bool = False) -> list[dict]:
         """Commit a group of receipts; every one comes back with its ``shards`` (committed now or
-        before) or an ``error``. Only then may the engine be told they are done (I11)."""
+        before) or an ``error``. Only then may the engine be told they are done (I11). A receipt's
+        ``meta`` is added to its shards' own. ``again``: a part committed before is appended once
+        more (what `PairWriter` asks of its bulk)."""
         import pyarrow.ipc as ipc
 
         from ms_flow.core.data import container
@@ -505,7 +510,7 @@ class ContainerWriter:
         _step(3)
         fresh, seen = [], set()
         for receipt in receipts:  # before any part is opened: it may be gone (I10)
-            if receipt["part"] not in self._done and receipt["part"] not in seen:
+            if (again or receipt["part"] not in self._done) and receipt["part"] not in seen:
                 seen.add(receipt["part"])
                 fresh.append(receipt)
         _step(4)
@@ -558,6 +563,77 @@ class ContainerWriter:
             for name in whole(receipt["path"]):
                 Path(name).unlink(missing_ok=True)
         _step(9)
+        return receipts
+
+
+def _meta(mine: str | None, extra: dict | None) -> str | None:
+    """A shard's ``meta`` with a receipt's added. ponytail: in the index only; the copy beside the
+    data keeps the part's own, so an index rebuilt from the data loses what a commit added."""
+    if not extra:
+        return mine
+    import json
+
+    from ms_flow.core.data.container import META_LIMIT
+
+    text = json.dumps({**json.loads(mine or "{}"), **extra}, separators=(",", ":"))
+    if len(text.encode()) > META_LIMIT:
+        raise ValueError("a shard's meta is for a few facts, not for data")
+    return text
+
+
+class PairWriter:
+    """Two roles of one key written as one (M6a): a task's ``bulk`` part (big, read rarely) and its
+    index part (``path``: what is queried). A receipt is ``{"part", "path", "bulk"}``. The bulk is
+    committed first, the index second, and the index commit is visibility. Idempotent on the index
+    only: a part it has is skipped whole; one it has not gets its bulk appended again, even if an
+    older copy is there (a crash between the two), and its index shards' ``meta["bulk"]`` names the
+    bulk shards of that same attempt, never "the latest of the part".
+
+    Both lock files are taken, bulk then index, at the first commit and held until `close` (I1). A
+    lock file is per open file, so no other writer of either role, in this process or another, comes
+    between the two commits of a receipt. ponytail: no in-process key lock on top, the two are it.
+    """
+
+    def __init__(self, project_db, folder: str | Path, *, generation_id: int | None, roles: tuple[str, str],
+                 prefix: str = "", on_commit=None):
+        bulk, index = roles
+        self.bulk = ContainerWriter(project_db, folder, generation_id=generation_id, role=bulk, prefix=prefix)
+        self.index = ContainerWriter(project_db, folder, generation_id=generation_id, role=index, prefix=prefix,
+                                     on_commit=on_commit)
+
+    def __enter__(self) -> "PairWriter":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.index.close()
+        self.bulk.close()
+
+    def commit_parts(self, receipts: Iterable[dict]) -> list[dict]:
+        """As `ContainerWriter.commit_parts`, for receipts of both parts."""
+        from ms_flow.core.data.companions import whole
+
+        receipts = [{key: value for key, value in receipt.items() if key not in ("error", "meta")}
+                    for receipt in receipts]
+        for writer in (self.bulk, self.index):
+            if writer._lock is None:
+                writer._open()
+        skipped = [receipt for receipt in receipts if receipt["part"] in self.index._done]
+        fresh = [receipt for receipt in receipts if receipt["part"] not in self.index._done]
+        bulk = self.bulk.commit_parts([{"part": r["part"], "path": r["bulk"]} for r in fresh], again=True)
+        _step("between")
+        for receipt, done in zip(fresh, bulk):
+            if "error" in done:
+                receipt["error"] = done["error"]
+            else:
+                receipt["meta"] = {"bulk": done["shards"]}
+        committed = iter(self.index.commit_parts([receipt for receipt in receipts if "error" not in receipt]))
+        receipts = [receipt if "error" in receipt else next(committed) for receipt in receipts]
+        for receipt in skipped:  # its index has it: this attempt's bulk is not needed
+            for name in whole(receipt["bulk"]):
+                Path(name).unlink(missing_ok=True)
         return receipts
 
 

@@ -60,11 +60,14 @@ __all__ = [
     "file_groups",
     "merge_shards",
     "read_dropped",
+    "read_rows",
     "usable_ids",
+    "write_table",
     "register",
 ]
 
 FORMAT = "ms_flow-shard-arrows-v1"
+TABLE_FORMAT = "ms_flow-table-arrows-v1"  # a container of an app's own rows (`write_table`)
 SUFFIX = ".arrows"
 # ponytail: `Shard.open` decodes a whole shard into memory, so the id range stays capped; a
 # reader that maps batches lifts this if shards ever need more.
@@ -572,7 +575,7 @@ def _index(path: Path) -> tuple[dict, list[dict], dict, list[Group]]:
         return hit[1]
     info, rows = container.read_index(path)
     header = info.get("app") or {}
-    if header.get("format") != FORMAT:
+    if header.get("format") not in (FORMAT, TABLE_FORMAT):
         raise ValueError(f"{path}: unsupported shard format {header.get('format')!r}")
     groups = [Group(int(r["base_id"]), int(r["slot_count"]), int(r["n_records"]), r["scope"], r["origin"],
                     int(r["n_dropped"]),
@@ -582,6 +585,43 @@ def _index(path: Path) -> tuple[dict, list[dict], dict, list[Group]]:
         _INDEXES.clear()
     _INDEXES[path] = (key, (info, rows, header, groups))
     return info, rows, header, groups
+
+
+def write_table(path: str | Path, table: Any, *, part: str = "", meta: dict | None = None,
+                origin: int | None = None, base_id: int = 0, slot_count: int | None = None,
+                max_rows: int = 4096) -> Path:
+    """``table`` as a part container of one shard, for a `ContainerWriter` (the worker encodes, the
+    parent copies bytes: I12). Rows of the app's own schema, no scope: they are no dataset's
+    records, so no cut counts on them. ``meta``: a few facts of the part, as JSON."""
+    import json
+
+    from ms_flow.core.data import container
+
+    path = Path(path)
+    tmp = _tmp(path)
+    _unlink_container(tmp)
+    attrs = {"base_id": int(base_id), "slot_count": table.num_rows if slot_count is None else int(slot_count),
+             "n_records": table.num_rows, "origin": origin, "part": str(part),
+             "meta": json.dumps(meta, separators=(",", ":"), default=str) if meta else None}
+    try:
+        appender = container.Appender.create(tmp, table.schema, {"format": TABLE_FORMAT})
+        appender.commit([container.encode(table.schema, table.to_batches(max_chunksize=max_rows), attrs)])
+        container.move(tmp, path)
+    except BaseException:
+        _unlink_container(tmp)
+        raise
+    return path
+
+
+def read_rows(path: str | Path, shards: Any = None, columns: Any = None) -> Any:
+    """The rows of a container's live shards, or of the shard numbers ``shards`` in that order, as
+    one table; checksums checked (I16)."""
+    from ms_flow.core.data import container
+
+    path = Path(path)
+    info, rows, _header, groups = _index(path)
+    numbers = [g.shard for g in groups if not g.retired] if shards is None else [int(s) for s in shards]
+    return container.read_table(path, info, [rows[n] for n in numbers], columns)
 
 
 def file_groups(path: str | Path) -> list[Group]:
