@@ -566,6 +566,53 @@ class ContainerWriter:
         return receipts
 
 
+    def retire(self, shards: Iterable[int]) -> list[int]:
+        """Out of every read: those of ``shards`` (shard ids) in the container being appended to.
+        Those of a sealed container stay (I19). Returns the ones retired."""
+        if self._lock is None:
+            self._open()
+        if self._appender is None:
+            return []
+        mine = sorted({split_shard_id(s)[1] for s in shards if split_shard_id(s)[0] == self._file_id})
+        if mine:
+            self._appender.retire(mine)
+            recount(self.db, self._file_id)
+        return [shard_id(self._file_id, number) for number in mine]
+
+    def retire_covered(self, column: str) -> list[int]:
+        """Retire what newer shards of the same origin cover: a live shard of the container being
+        appended to, each of whose ``column`` values a newer one holds too. A redo hides what it
+        covers and nothing else (a narrowed one keeps the older shard). Returns the ones retired.
+        ponytail: a set of values per origin, only for origins with more than one live shard."""
+        from collections import Counter
+
+        from ms_flow.core.data import container
+
+        if self._lock is None:
+            self._open()
+        if self._appender is None:
+            return []
+        live = [row for row in self._appender.rows if not row["retired"] and row["origin"] is not None]
+        counts = Counter(row["origin"] for row in live)
+        repeated = [row for row in live if counts[row["origin"]] > 1]
+        if not repeated:
+            return []
+        values = container.read_table(self._appender.path, self._appender.info, repeated, [column])[column]
+        at, slices = 0, []
+        for row in repeated:
+            size = row["n_records"] + row["n_dropped"]
+            slices.append(set(values.slice(at, size).to_pylist()))
+            at += size
+        seen: dict[int, set] = {}
+        gone = []
+        for row, found in sorted(zip(repeated, slices), key=lambda item: -item[0]["shard"]):  # newest first (I9)
+            newer = seen.setdefault(row["origin"], set())
+            if found <= newer:
+                gone.append(shard_id(self._file_id, row["shard"]))
+            newer |= found
+        return self.retire(gone)
+
+
 def _meta(mine: str | None, extra: dict | None) -> str | None:
     """A shard's ``meta`` with a receipt's added. ponytail: in the index only; the copy beside the
     data keeps the part's own, so an index rebuilt from the data loses what a commit added."""
@@ -610,6 +657,17 @@ class PairWriter:
     def close(self) -> None:
         self.index.close()
         self.bulk.close()
+
+    def retire_covered(self, column: str) -> list[int]:
+        """`ContainerWriter.retire_covered` of the index, and the bulk shards those named. Returns
+        the index shards retired."""
+        import json
+
+        gone = self.index.retire_covered(column)
+        numbers = {split_shard_id(s)[1] for s in gone}
+        self.bulk.retire([s for row in self.index._appender.rows if row["shard"] in numbers
+                          for s in json.loads(row["meta"] or "{}").get("bulk", ())] if gone else [])
+        return gone
 
     def commit_parts(self, receipts: Iterable[dict]) -> list[dict]:
         """As `ContainerWriter.commit_parts`, for receipts of both parts."""

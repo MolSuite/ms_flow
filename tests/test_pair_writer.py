@@ -20,12 +20,13 @@ def _setup(tmp_path):
     return db, gen, tmp_path / "out", tmp_path / "parts"
 
 
-def _receipt(parts, part, attempt):
+def _receipt(parts, part, attempt, ids=(0, 1), origin=7):
     """A task's two part containers: values in the index, a blob per value in the bulk."""
     name = f"{part.replace(':', '_')}-{attempt}"
-    index = write_table(parts / f"{name}.index.arrows", pa.table({"id": [0, 1], "value": [attempt, attempt]}),
-                        part=part, meta={"run": "r"}, origin=7)
-    bulk = write_table(parts / f"{name}.bulk.arrows", pa.table({"id": [0, 1], "blob": [f"blob-{attempt}"] * 2}),
+    ids = list(ids)
+    index = write_table(parts / f"{name}.index.arrows", pa.table({"id": ids, "value": [attempt] * len(ids)}),
+                        part=part, meta={"run": "r"}, origin=origin)
+    bulk = write_table(parts / f"{name}.bulk.arrows", pa.table({"id": ids, "blob": [f"blob-{attempt}"] * len(ids)}),
                        part=part)
     return {"part": part, "path": str(index), "bulk": str(bulk)}
 
@@ -92,5 +93,42 @@ def test_scores_and_blobs_come_from_one_attempt(tmp_path, monkeypatch):
         # skipped or committed, no part is left behind; the crashed attempt's index part is the
         # task's leftover, as any part of a task that died before its commit
         assert sorted(p.name for p in parts.iterdir()) == ["t_1-1.index.arrows", "t_1-1.index.arrows.index"]
+    finally:
+        db.disconnect()
+
+
+def test_tasks_of_a_key_go_to_one_container_and_a_redo_retires_only_what_it_covers(tmp_path):
+    """What the compaction of tables was for (one file per key, no duplicate after a crash, the redo
+    wins), without a rewrite: a replay is skipped, a redo hides what it covers and nothing else."""
+    db, gen, out, parts = _setup(tmp_path)
+    try:
+        with _writer(db, out, gen) as writer:
+            writer.commit_parts([_receipt(parts, "t:whole", 1), _receipt(parts, "t:other", 2, origin=8)])
+            writer.commit_parts([_receipt(parts, "t:whole", 9)])  # a replay after a crash: skipped
+            writer.commit_parts([_receipt(parts, "t:narrow", 3, ids=[0])])
+            assert writer.retire_covered("id") == []  # record 1 is the whole run's alone
+            writer.commit_parts([_receipt(parts, "t:rest", 4, ids=[1])])
+            (gone,) = writer.retire_covered("id")
+            assert writer.retire_covered("id") == []
+        assert len(list(catalog.files(db, catalog.shard_spec(role=INDEX)))) == 1
+        live = _live(db, INDEX)
+        assert [g.part for _id, g in live] == ["t:other", "t:narrow", "t:rest"]
+        assert gone not in dict(live)
+        assert sorted(read_rows(next(catalog.files(db, catalog.shard_spec(role=INDEX)))["path"])["value"].to_pylist()) \
+            == [2, 2, 3, 4]
+        assert [g.part for _id, g in _live(db, BULK)] == ["t:other", "t:narrow", "t:rest"]  # its bulk went too
+    finally:
+        db.disconnect()
+
+
+def test_a_sealed_container_keeps_what_a_newer_one_covers(tmp_path):
+    db, gen, out, parts = _setup(tmp_path)
+    try:
+        with _writer(db, out, gen) as writer:
+            writer.commit_parts([_receipt(parts, "t:1", 1)])
+            writer.index.seal()  # I19: never appended to again, its index included
+            writer.commit_parts([_receipt(parts, "t:2", 2)])
+            assert writer.retire_covered("id") == []
+        assert [g.part for _id, g in _live(db, INDEX)] == ["t:1", "t:2"]
     finally:
         db.disconnect()
