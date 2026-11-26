@@ -172,3 +172,21 @@ def test_a_new_job_skips_receipted_parts(tmp_path):
     assert ids == sorted(f"p:{i}" for i in range(6))
     assert not list((home / "out" / "parts").iterdir())
     assert dict(_stage_results(home))[3]["_committed"] == [before]
+
+
+def test_containers_there_roll_at_their_bound(tmp_path, monkeypatch):
+    """The containers there have the bound of the ones here (I18): past it, the next part opens another."""
+    from ms_flow.core.data import catalog
+    from ms_flow.runner import commit_there
+
+    monkeypatch.setattr(catalog, "MAX_SHARDS", 4)
+    home = tmp_path / "job"
+    made = [workers.part_of({"n": n, "log": str(tmp_path / "log"), "out": str(home / "out")}) for n in range(10)]
+    where = commit_there(home, [receipt for result in made for receipt in workers.receipts_of(result)])
+    containers = {}
+    for entry in where:
+        containers.setdefault(entry["path"], []).extend(entry["shards"])
+    assert sorted(len(shards) for shards in containers.values()) == [2, 4, 4]
+    ids, names = _committed_parts(home)
+    assert ids == sorted(f"p:{n}" for n in range(10))
+    assert len([name for name in names if name.endswith(".arrows")]) == 3
