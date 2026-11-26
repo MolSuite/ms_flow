@@ -154,3 +154,31 @@ def test_two_parts_written_as_one_still_name_each_other_here(project, tmp_path):
             named = catalog.get_shard(project, sid)
             assert named is not None and named["role"] == "bulk" and Path(named["path"]).is_file()
             assert str(named["path"]).startswith(str(tmp_path / "p"))
+
+
+def test_the_workspace_brings_and_cleans_what_its_queue_keeps(tmp_path, monkeypatch):
+    """The two user actions, on an active queue of the workspace: bring a step's containers to the
+    open project, then clean that host of what has a verified copy here."""
+    from ms_flow.api import Workspace
+    from test_hosts_executors import _home
+
+    _home(tmp_path, monkeypatch)
+    ms = Workspace(app_id="role")
+    try:
+        ms.create_or_open_project(name="one", folder=tmp_path / "one", description="", activate=True)
+        ms.deactivate("local")
+        ms.save_host("local", env=sys.prefix, workdir=str(tmp_path / "far"))
+        ms.save_executor("far", kind="queue", scheduler="none", poll_seconds=0.2, bring_while_running=False,
+                         setup=f"export PYTHONPATH={_ROOT}:{_ROOT / 'src'}")
+        ms.activate("far")
+        assert ms.engine.executor("far").bring is False
+        project = ms.project_db
+        rows = _made_there(tmp_path / "far" / "c1", 3)
+        locations.register_there(project, "far", rows)
+        ids = _ids(project, "made")
+        assert ms.bring_there("far", ids) == ids
+        assert catalog.count(project, catalog.shard_spec(role="made")) == 3
+        said = ms.clean_host("far")
+        assert [(r["verified"], r["removed"]) for r in said] == [(True, True)] and not Path(rows[0]["path"]).exists()
+    finally:
+        ms.shutdown()

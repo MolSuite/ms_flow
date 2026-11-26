@@ -515,6 +515,27 @@ class WorkspaceJobApiMixin:
         return nodes() if nodes is not None else []
 
     @hosted()
+    def bring_there(self, executor: str, files) -> list[int]:
+        """The containers `files` (catalog ids of the active project) that a campaign left on the
+        queue `executor`, brought here as far as they are made (see `locations.bring`); the ids
+        brought. It asks that machine, so not from a thread that cannot wait."""
+        from ms_flow import locations
+
+        project = self._require_active_project_runtime()
+        return locations.bring(project.project_db, self.engine.executor(executor), list(files), location=executor)
+
+    @hosted()
+    def clean_host(self, executor: str, files=None, confirm: bool = False) -> list[dict]:
+        """The copies on the queue `executor` of the active project's containers (or of `files`)
+        removed where a verified copy is here; the others only with `confirm` (see
+        `locations.cleanup`). What each was, `{path, verified, removed}`."""
+        from ms_flow import locations
+
+        project = self._require_active_project_runtime()
+        return locations.cleanup(project.project_db, self.engine.executor(executor), location=executor,
+                                 files=files, confirm=confirm)
+
+    @hosted()
     def remove_remote_job(self, executor: str, dir: str) -> None:
         """Take one of `remote_jobs` out of the queue, with what it has there. One that a job of
         this session waits for is refused: cancel the job."""
