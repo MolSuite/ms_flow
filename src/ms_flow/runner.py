@@ -23,7 +23,7 @@ the others over what its `From` makes of an earlier one, made once into
 ended, which says how many parts and lines of errors it left. `progress.json` says which `stage`
 runs and how many are done (`stages_done`), and at the end what each left (`left`).
 A stage with a `commit` has the parts its tasks wrote committed here, by the runner, into
-containers over `catalog/project.db` (`_There`), before each result is written; the result then
+containers, each folder of them with its catalog (`catalog.db`, `_There`), before each result is written; the result then
 says where they went (`_committed`), and its `done` lists those containers (`files`).
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
@@ -269,21 +269,43 @@ class _Parts:
 
 class _There:
     """The containers the parts of a stage's tasks go into, there, as `catalog_sink` does here: one
-    writer per (folder, generation, roles), over a catalog of this directory's own
-    (`catalog/project.db`, the same ids of generations as the project's). The runner is the one
+    writer per (folder, generation, roles), each folder of containers with a catalog of its own
+    (`catalog.db` in it, the same ids of generations as the project's), so a folder a campaign
+    keeps for the next ones (a `KeptDir`) is found by them as it was left. The runner is the one
     process of its job that appends, and a part committed once is not twice (I10): what a task
-    that ran again left goes, so the folder holds containers, not a file per task."""
+    that ran again left goes, so a folder holds containers, not a file per task.
+    ponytail: two campaigns of one project appending to one kept folder at once: the second's
+    commits fail on the writer's lock (Busy), and it goes again later."""
 
     def __init__(self, home: Path):
-        from ms_flow.core.database.project import ProjectStore
+        self.home = Path(home)
+        self.writers, self.dbs, self.paths, self.generations = {}, {}, {}, set()
+        # The folders parts came from, and those of the containers, every run of the job: what a
+        # killed task left is known by the first (`tidy`), what the job made by the second (`files`).
+        self.folders = {name: self._read(name) for name in ("part_folders", "container_folders")}
 
-        self.db = ProjectStore()
-        self.db.connect(Path(home) / "catalog")
-        self.writers, self.paths, self.generations = {}, {}, set()
-        # The folders parts came from, every run of the job: what a killed task left there is
-        # known by that (`tidy`).
-        self._folders = Path(home) / "catalog" / "part_folders"
-        self.folders = set(self._folders.read_text().splitlines()) if self._folders.exists() else set()
+    def _read(self, name: str) -> set:
+        path = self.home / name
+        return set(path.read_text().splitlines()) if path.exists() else set()
+
+    def _note(self, name: str, folders: set) -> None:
+        new = folders - self.folders[name]
+        if new:
+            self.home.mkdir(parents=True, exist_ok=True)
+            with open(self.home / name, "a") as file:
+                file.write("".join(f"{folder}\n" for folder in sorted(new)))
+                file.flush()
+                os.fsync(file.fileno())
+            self.folders[name] |= new
+
+    def _db(self, folder: str):
+        if folder not in self.dbs:
+            from ms_flow.core.database.project import ProjectStore
+
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            self.dbs[folder] = db = ProjectStore()
+            db.connect_path(Path(folder) / "catalog.db", project_dir=Path(folder))
+        return self.dbs[folder]
 
     def commit(self, receipts: list) -> list:
         """`receipts` committed: for each, `{part, path, shards}`, the container and its shard
@@ -291,17 +313,13 @@ class _There:
         its containers are: its part's folder by default), or two parts written as one
         (`catalog.PairWriter`), `path` and `role` its index and `bulk`, `bulk_role` the other."""
         groups: dict = {}
-        seen = {str(Path(r[name]).parent) for r in receipts for name in ("path", "bulk") if r.get(name)} - self.folders
-        if seen:
-            with open(self._folders, "a") as file:
-                file.write("".join(f"{folder}\n" for folder in sorted(seen)))
-                file.flush()
-                os.fsync(file.fileno())
-            self.folders |= seen
         for at, receipt in enumerate(receipts):
             key = (str(receipt.get("folder") or Path(receipt["path"]).parent), receipt.get("generation_id"),
                    str(receipt["role"]), receipt.get("bulk_role"))
             groups.setdefault(key, []).append(at)
+        self._note("part_folders", {str(Path(r[name]).parent) for r in receipts for name in ("path", "bulk")
+                                    if r.get(name)})
+        self._note("container_folders", {key[0] for key in groups})
         where = [None] * len(receipts)
         for key, places in groups.items():
             done = self._writer(*key).commit_parts([
@@ -310,7 +328,7 @@ class _There:
             for at, receipt in zip(places, done):
                 if "error" in receipt:
                     raise RuntimeError(f"not committed there: {receipt['error']}")
-                where[at] = self._where(receipt)
+                where[at] = self._where(key[0], receipt)
         return where
 
     def _writer(self, folder: str, generation_id, role: str, bulk_role):
@@ -318,30 +336,31 @@ class _There:
 
         key = (folder, generation_id, role, bulk_role)
         if key not in self.writers:
-            if generation_id is not None and generation_id not in self.generations:
+            db = self._db(folder)
+            if generation_id is not None and (folder, generation_id) not in self.generations:
                 from ms_flow.core.database.project_models import ShardGeneration
 
-                with self.db.get_session() as session:  # the project's id, so what comes back names it
+                with db.get_session() as session:  # the project's id, so what comes back names it
                     if session.get(ShardGeneration, int(generation_id)) is None:
                         session.add(ShardGeneration(id=int(generation_id), step="there"))
                         session.commit()
-                self.generations.add(generation_id)
+                self.generations.add((folder, generation_id))
             self.writers[key] = (
-                catalog.PairWriter(self.db, folder, generation_id=generation_id, roles=(str(bulk_role), role))
-                if bulk_role else catalog.ContainerWriter(self.db, folder, generation_id=generation_id, role=role))
+                catalog.PairWriter(db, folder, generation_id=generation_id, roles=(str(bulk_role), role))
+                if bulk_role else catalog.ContainerWriter(db, folder, generation_id=generation_id, role=role))
         return self.writers[key]
 
-    def _where(self, receipt: dict) -> dict:
+    def _where(self, folder: str, receipt: dict) -> dict:
         from ms_flow.core.data.catalog import split_shard_id
         from ms_flow.core.database.project_models import CatalogFile
 
         def at(ids) -> dict:
             pairs = [split_shard_id(sid) for sid in ids]
             file_id = pairs[0][0] if pairs else None  # a part never spans two containers (I18)
-            if file_id is not None and file_id not in self.paths:
-                with self.db.get_session() as session:
-                    self.paths[file_id] = session.get(CatalogFile, file_id).path
-            return {"path": self.paths.get(file_id, ""), "shards": [n for _, n in pairs]}
+            if file_id is not None and (folder, file_id) not in self.paths:
+                with self._db(folder).get_session() as session:
+                    self.paths[folder, file_id] = session.get(CatalogFile, file_id).path
+            return {"path": self.paths.get((folder, file_id), ""), "shards": [n for _, n in pairs]}
 
         where = {"part": receipt["part"], **at(receipt["shards"])}
         if "bulk" in receipt:  # a pair: its other part's shards, named in the index shards' meta
@@ -359,29 +378,34 @@ class _There:
         """Once no task runs: what parts are left in their folders, of tasks a kill cut short (theirs
         ran again under another name), goes. How many files went."""
         gone = 0
-        for folder in self.folders:
+        for folder in self.folders["part_folders"]:
             for path in Path(folder).glob("*"):
-                if path.is_file() and path.name.endswith((".arrows", ".arrows.index", ".tmp")):
+                if path.is_file() and path.name.endswith((".arrows", ".index", ".tmp")):  # a write cut short too
                     path.unlink(missing_ok=True)
                     gone += 1
         return gone
 
     def files(self) -> list:
-        """The containers there, as the rows the project registers them with (`catalog.add_remote`)."""
+        """The containers of the folders the job committed to, as the rows the project registers
+        them with (`catalog.add_remote`)."""
         from sqlmodel import select
 
         from ms_flow.core.data import catalog
         from ms_flow.core.database.project_models import CatalogFile
 
-        with self.db.get_session() as session:
-            rows = session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
+        rows = []
+        for folder in sorted(self.folders["container_folders"]):
+            with self._db(folder).get_session() as session:
+                rows += session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
         return [{key: getattr(row, key) for key in ("path", "role", "generation_id", *catalog._COUNTS)} for row in rows]
 
     def close(self) -> None:
         for writer in self.writers.values():
             writer.close()
         self.writers.clear()
-        self.db.disconnect()
+        for db in self.dbs.values():
+            db.disconnect()
+        self.dbs.clear()
 
 
 def commit_there(home, receipts: list) -> list:
@@ -391,6 +415,19 @@ def commit_there(home, receipts: list) -> list:
         return there.commit(list(receipts))
     finally:
         there.close()
+
+
+def found_there(folder, part: str) -> dict | None:
+    """Where the part `part` was committed in the containers of `folder` (`{part, path, shards}`), or
+    None: what a task over there asks of a folder an earlier campaign kept, so it does not make it
+    again. From the containers' indexes alone."""
+    from ms_flow.core.data import container
+
+    for path in sorted(Path(folder).glob("*.arrows")):
+        shards = [row["shard"] for row in container.read_index(path)[1] if row["part"] == part and not row["retired"]]
+        if shards:
+            return {"part": part, "path": str(path), "shards": shards}
+    return None
 
 
 _RAN_ON: dict = {}  # what this runner runs with, told with every progress (see `ran_on`)

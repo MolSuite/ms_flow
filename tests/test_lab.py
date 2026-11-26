@@ -443,5 +443,6 @@ def test_parts_go_into_containers_there_through_a_kill(request, said):
     assert sorted(part for parts in held.values() for part in parts) == sorted(f"p:{n}" for n in range(100))
     root = os.path.dirname(os.path.dirname(next(iter(shards))))
     files = lab(f"cd {root} && find . -type f | sort").split()
-    assert len(files) == 30, files  # each key: its container, its index and its writer's lock
+    kinds = sorted({name.rsplit(".", 1)[-1] for name in files})
+    assert len(files) == 40 and kinds == ["arrows", "db", "index", "lock"], files  # each key: container, index, lock, catalog
     assert not [name for name in files if "/parts/" in name]

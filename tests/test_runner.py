@@ -190,3 +190,21 @@ def test_containers_there_roll_at_their_bound(tmp_path, monkeypatch):
     ids, names = _committed_parts(home)
     assert ids == sorted(f"p:{n}" for n in range(10))
     assert len([name for name in names if name.endswith(".arrows")]) == 3
+
+
+def test_a_kept_folder_has_its_own_catalog_and_the_next_campaign_finds_its_parts(tmp_path):
+    """What a campaign keeps for the next ones (a folder of the project there) is committed over a
+    catalog of that folder's own: a later campaign finds a part in it by its id, and committing it
+    again does not add it twice."""
+    from ms_flow.runner import commit_there, found_there
+
+    kept, log = tmp_path / "projects" / "u" / "made", str(tmp_path / "log")
+    first, second = tmp_path / "c1", tmp_path / "c2"
+    made = workers.part_of({"n": 1, "log": log, "out": str(first / "out")})
+    (where,) = commit_there(first, [{**workers.receipts_of(made)[0], "folder": str(kept)}])
+    assert found_there(kept, "p:1") == where and found_there(kept, "p:2") is None
+    again = workers.part_of({"n": 1, "log": log, "out": str(second / "out")})
+    assert commit_there(second, [{**workers.receipts_of(again)[0], "folder": str(kept)}]) == [where]
+    assert not list((second / "out" / "parts").iterdir())
+    names = sorted(path.name for path in kept.iterdir() if not path.name.endswith(".lock"))
+    assert sorted(name.rsplit(".", 1)[-1] for name in names) == ["arrows", "db", "index"], names
