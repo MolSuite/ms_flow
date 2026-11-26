@@ -31,6 +31,10 @@ def _nice(payload):
     return os.nice(0)
 
 
+def _blas_threads(payload):
+    return os.environ.get("OPENBLAS_NUM_THREADS")
+
+
 def _card(payload):
     time.sleep(0.3)  # long enough for the two cards to be held at once
     return os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -171,6 +175,31 @@ def test_results_are_taken_in_groups_and_done_only_once_taken():
         assert max(sizes) > 100  # one call for what had queued up, then one each to find the bad one
         assert len(written) == 198 and content_key(4) not in written
         assert "cannot store 8" in errors[content_key(4)] and "three" in errors[content_key(3)]
+
+
+def _short(payload):
+    time.sleep(0.02)
+    return payload
+
+
+def test_results_arriving_one_by_one_are_held_into_groups():
+    """A callback with a fixed cost (a commit) is called once for several results that arrive one
+    by one; what is held never keeps a worker idle, and the last results are not held (nothing
+    else of the job runs)."""
+    sizes = []
+
+    def write(pairs):
+        sizes.append(len(pairs))
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        start = time.perf_counter()
+        job = engine.submit("thread", _short, range(200), window=16, on_results=write)
+        snap = engine.wait(job, 30)
+        took = time.perf_counter() - start
+        assert snap.chunks_done == 200 and sum(sizes) == 200
+        assert len(sizes) <= 200 // 3, sizes  # one at a time before
+        assert took < 3.0  # 200 x 20 ms on 4 threads: 1 s when the workers stay fed
 
 
 @pytest.mark.parametrize("cost, expected", [
@@ -527,6 +556,23 @@ def test_workers_give_the_cpu_way_to_the_app():
             got.clear()
             engine.wait(engine.submit("process", _nice, [0], thread=thread, on_result=got.__setitem__), 60)
             assert list(got.values()) == [min(19, os.nice(0) + WORKER_NICE)]
+
+
+def test_a_worker_keeps_numpy_to_one_blas_thread_unless_told(monkeypatch):
+    """`import numpy` started 15 OpenBLAS threads that burned ~1 s of CPU per process
+    (2026-11-25), on cores the tasks of the engine and the user's programs hold."""
+    for told, expected in ((None, "1"), ("3", "3")):
+        if told is None:
+            monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+        else:
+            monkeypatch.setenv("OPENBLAS_NUM_THREADS", told)
+        got = {}
+        with Engine(cpus=2, mem_mb=0) as engine:
+            engine.register("process", ProcessExecutor(2))
+            for thread in (False, True):
+                got.clear()
+                engine.wait(engine.submit("process", _blas_threads, [0], thread=thread, on_result=got.__setitem__), 60)
+                assert list(got.values()) == [expected], (told, thread)
 
 
 @pytest.mark.slow

@@ -285,25 +285,35 @@ def finish_file(project_db, file_id: int, path: str | Path | None = None) -> Non
     update_file(project_db, file_id, path=path, status=READY, **_counts(project_db, path))
 
 
-def _counts(project_db, path: str | Path, exclusions=None) -> dict[str, Any]:
-    from ms_flow.core.data.shard import SUFFIX, _index
+def _counts(project_db, path: str | Path, exclusions=None, index=None) -> dict[str, Any]:
+    """``index``: the container's ``(info, table)`` when the caller has just read it."""
+    import pyarrow.compute as pc
+
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX
 
     if not str(path).endswith(SUFFIX):  # a table file: any Parquet, rows of its own schema, no shards
         import pyarrow.parquet as pq
 
         rows = pq.ParquetFile(path).metadata.num_rows
         return {"n_shards": 0, "n_records": rows, "n_active": rows, "scopes": ""}
-    info, rows, _header, groups = _index(Path(path))  # one read of the index, cached for `recount`
-    groups = [g for g in groups if not g.retired]
-    n_records = sum(g.n_records for g in groups)
-    return {"n_shards": len(groups), "n_records": n_records, **_committed(info, rows),
-            "n_active": n_records - _excluded(path, groups, exclusions, project_db),
-            "scopes": ",".join(str(s) for s in sorted({g.scope for g in groups if g.scope is not None}))}
+    info, table = index or container.read_index_table(path)  # in Arrow: no Python row per shard
+    live = table.filter(pc.invert(table["retired"]))
+    n_records = pc.sum(live["n_records"]).as_py() or 0
+    scopes = sorted(pc.unique(live["scope"].drop_null()).to_pylist())
+    return {"n_shards": live.num_rows, "n_records": n_records, **_committed(info, table),
+            "n_active": n_records - _excluded(path, None, exclusions, project_db),
+            "scopes": ",".join(str(s) for s in scopes)}
 
 
-def _committed(info: dict, rows: list[dict]) -> dict[str, int]:
-    return {"n_rows": len(rows), "n_retired": sum(1 for r in rows if r["retired"]),
-            "end": max([info["head_length"], *(r["offset"] + r["length"] for r in rows)])}
+def _committed(info: dict, table) -> dict[str, int]:
+    """What an index commits (I6), from its Arrow table."""
+    import pyarrow.compute as pc
+
+    from ms_flow.core.data import container
+
+    return {"n_rows": table.num_rows, "n_retired": pc.sum(table["retired"].cast("int64")).as_py() or 0,
+            "end": container.index_end(info, table)}
 
 
 def _check(row, now: dict[str, int]) -> None:
@@ -314,16 +324,19 @@ def _check(row, now: dict[str, int]) -> None:
 
 def recount(project_db, file_id: int) -> dict[str, Any]:
     """A container's counts again, from its index (I5): what is committed, never lowered (I6)."""
-    from ms_flow.core.data.shard import SUFFIX, _index
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX
     from ms_flow.core.database.project_models import CatalogFile
 
     with project_db.get_session() as session:
         row = session.get(CatalogFile, int(file_id))
         if row is None:
             raise ValueError(f"No catalog file {file_id}.")
+        index = None
         if str(row.path).endswith(SUFFIX):
-            _check(row, _committed(*_index(Path(row.path))[:2]))
-        counts = _counts(project_db, row.path)
+            index = container.read_index_table(row.path)
+            _check(row, _committed(*index))
+        counts = _counts(project_db, row.path, index=index)
         for name, value in counts.items():
             setattr(row, name, value)
         session.add(row)
@@ -343,7 +356,7 @@ def appender(project_db, file_id: int):
             raise ValueError(f"No catalog file {file_id}.")
         if row.status != READY or row.location:
             raise ValueError(f"{row.path}: {row.status}{' on ' + row.location if row.location else ''}, not appended to (I19)")
-        _check(row, _committed(*container.read_index(row.path)))
+        _check(row, _committed(*container.read_index_table(row.path)))
         return container.Appender(row.path)
 
 
@@ -368,6 +381,13 @@ def _step(step) -> None:
     """Where `ContainerWriter.commit_parts` is: a seam for the crash tests, nothing else."""
 
 
+def _header(app: dict | None) -> dict:
+    """What a container's header says of every shard in it: the part's own range and count left out.
+    A part whose header differs goes to another container (a shard is read by its file's header)."""
+    return {key: value for key, value in dict(app or {}).items()
+            if key not in ("shard_id", "base_id", "slot_count", "record_count")}
+
+
 class ContainerWriter:
     """The one writer of the containers of ``(generation, role)`` in ``folder``: receipts of parts
     in, shard ids out. A receipt is ``{"part": ..., "path": ..., ...}``: ``part`` names the unit of
@@ -389,7 +409,7 @@ class ContainerWriter:
         self.generation_id = None if generation_id is None else int(generation_id)
         self.role, self.prefix, self.on_commit = str(role), str(prefix), on_commit
         self._name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.role)
-        self._lock = self._appender = self._file_id = self._head = None
+        self._lock = self._appender = self._file_id = self._head = self._app = None
         self._done: dict[str, list[int]] = {}
 
     def __enter__(self) -> "ContainerWriter":
@@ -441,6 +461,7 @@ class ContainerWriter:
                 self._file_id = int(rows[-1].id)
                 self._appender = appender(self.db, self._file_id)  # I6 first
                 self._head = self._appender.head
+                self._app = _header(self._appender.info.get("app"))
                 recount(self.db, self._file_id)
         except BaseException:
             self.close()
@@ -460,7 +481,7 @@ class ContainerWriter:
         self._appender = container.Appender.create(path, ipc.read_schema(ipc.read_message(head)), app)
         _step(5.5)
         self._file_id = add_file(self.db, path, generation_id=self.generation_id, role=self.role)
-        self._head = self._appender.head
+        self._head, self._app = self._appender.head, _header(app)
 
     def _flush(self, batch: list) -> None:
         """One commit of whole parts into the current container. An unreadable part fails its own
@@ -533,9 +554,9 @@ class ContainerWriter:
             if self._appender is None:
                 self._create(head, app)
             if not batch:
-                used, size = len(self._appender.rows), self._appender.end
+                used, size = self._appender.index.num_rows, self._appender.end
             length = sum(row["length"] for row in live)
-            if used and (used + len(live) > MAX_SHARDS or size + length > MAX_BYTES):
+            if (used and (used + len(live) > MAX_SHARDS or size + length > MAX_BYTES)) or _header(app) != self._app:
                 self._flush(batch)  # I18: a part goes whole into one container
                 batch = []
                 seal(self.db, self._file_id)
@@ -696,10 +717,11 @@ class PairWriter:
 
 
 def _excluded(path, groups, exclusions, project_db) -> int:
-    """How many usable records of ``groups`` the cuts hide: a cut naming a hole or a drop hides none."""
+    """How many usable records of ``groups`` (None: the file's live ones, read only when a cut
+    exists) the cuts hide: a cut naming a hole or a drop hides none."""
     import numpy as np
 
-    from ms_flow.core.data.shard import usable_ids
+    from ms_flow.core.data.shard import file_groups, usable_ids
 
     if exclusions is None:
         from ms_flow.core.data.exclusions import active_exclusions
@@ -707,6 +729,8 @@ def _excluded(path, groups, exclusions, project_db) -> int:
         exclusions = active_exclusions(project_db)
     if not exclusions:
         return 0
+    if groups is None:
+        groups = [g for g in file_groups(path) if not g.retired]
     total = 0
     for group in groups:
         if group.scope is None or not group.n_records:

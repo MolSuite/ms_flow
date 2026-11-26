@@ -835,6 +835,10 @@ def _yield_cpu() -> None:
     is lost on a machine with nothing else to run."""
     if hasattr(os, "nice"):  # ponytail: POSIX only; Windows would need SetPriorityClass
         os.nice(WORKER_NICE)
+    # A worker holds the cores its tokens give, no more: `import numpy` started an OpenBLAS thread
+    # per core that burned ~1 s of CPU per process. Set before any task imports numpy; a value the
+    # user set is kept. ponytail: a task with cpu > 1 that wants BLAS threads sets its own.
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 
 def _die_with_parent(parent: int) -> None:

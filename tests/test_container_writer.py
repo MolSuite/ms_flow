@@ -284,3 +284,69 @@ def test_a_crash_at_each_step_loses_and_doubles_nothing(tmp_path, monkeypatch, k
         assert not any(parts.iterdir())
     finally:
         db.disconnect()
+
+
+def test_a_part_of_another_header_starts_another_container(tmp_path):
+    """The header (kind, serializer, metadata) is the container's, so it must be true of every
+    shard in it: a part that says otherwise goes to a container of its own, and back again."""
+    db, gen, out, parts = _setup(tmp_path)
+
+    def part(name, base, fmt):
+        with ShardWriter(parts / name, dataset_id=None, shard_id=0, base_id=base, kind=PayloadKind.GENERIC_BYTES,
+                         serializer=Serializer.UTF8, slot_count=4, metadata={"input_format": fmt}) as writer:
+            for id_ in range(base, base + 4):
+                writer.add(id_, f"r{id_}".encode())
+            writer.end_group(scope=1, base_id=base, slot_count=4)
+        return _receipt(parts / name, f"s:{name}")
+
+    try:
+        with catalog.ContainerWriter(db, out, generation_id=gen, prefix="s:") as writer:
+            done = writer.commit_parts([part("a.arrows", 0, "smi"), part("b.arrows", 4, "sdf")])
+            assert not any("error" in r for r in done)
+            done = writer.commit_parts([part("c.arrows", 8, "smi")])
+            assert not any("error" in r for r in done)
+        formats = {}
+        for row in catalog.files(db):
+            info, rows = container.read_index(row["path"])
+            formats.setdefault(info["app"]["metadata"]["input_format"], []).extend(
+                r["base_id"] for r in rows if not r["retired"])
+        assert {key: sorted(value) for key, value in formats.items()} == {"smi": [0, 8], "sdf": [4]}
+    finally:
+        db.disconnect()
+
+
+def test_a_commit_keeps_the_index_in_arrow(tmp_path, monkeypatch):
+    """The cost of a commit must not grow with the container: its index is never read back nor
+    rebuilt as Python rows, once the writer holds it."""
+    import pyarrow as pa
+
+    from ms_flow.core.data import shard
+
+    db, gen, out, parts = _setup(tmp_path)
+    try:
+        with catalog.ContainerWriter(db, out, generation_id=gen, prefix="s:") as writer:
+            writer.commit_parts([_receipt(_part(parts / "0.arrows", 0), "s:0")])
+            mine = lambda path: str(out) in str(path)  # noqa: E731
+            read, index, save = container.read_index, shard._index, container._save_index
+
+            def no_rows(real):
+                def guarded(path, *args):
+                    assert not mine(path), f"{path}: its index read back as Python rows"
+                    return real(path, *args)
+                return guarded
+
+            def arrow_only(path, info, rows):
+                assert not mine(path) or isinstance(rows, pa.Table), "the index rebuilt from Python rows"
+                return save(path, info, rows)
+
+            monkeypatch.setattr(container, "read_index", no_rows(read))
+            monkeypatch.setattr(shard, "_index", no_rows(index))
+            monkeypatch.setattr(container, "_save_index", arrow_only)
+            for n in range(1, 4):
+                (done,) = writer.commit_parts([_receipt(_part(parts / f"{n}.arrows", 4 * n), f"s:{n}")])
+                assert "error" not in done
+        monkeypatch.undo()
+        assert _bases(db) == [0, 4, 8, 12]
+        assert [(row["n_shards"], row["n_records"]) for row in catalog.files(db)] == [(4, 16)]
+    finally:
+        db.disconnect()

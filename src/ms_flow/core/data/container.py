@@ -7,6 +7,7 @@ import zlib
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 
 FORMAT = "ms_flow-container-arrows-v1"
@@ -145,8 +146,11 @@ def encode(schema, batches, attrs: dict) -> tuple[dict, bytes]:
     return attrs, data
 
 
-def _save_index(path: Path, info: dict, rows: list[dict]) -> None:
-    table = pa.Table.from_pylist(rows, schema=_INDEX.with_metadata({KEY: json.dumps(info).encode()}))
+def _save_index(path: Path, info: dict, rows) -> None:
+    """``rows``: the index as an Arrow table, or a list of row dicts."""
+    if not isinstance(rows, pa.Table):
+        rows = pa.Table.from_pylist(rows, schema=_INDEX)
+    table = rows.replace_schema_metadata({KEY: json.dumps(info).encode()})
     out = pa.BufferOutputStream()
     with ipc.new_stream(out, table.schema, options=_write_options()) as writer:
         writer.write_table(table)
@@ -161,6 +165,12 @@ def _save_index(path: Path, info: dict, rows: list[dict]) -> None:
 
 
 def read_index(path) -> tuple[dict, list[dict]]:
+    info, table = read_index_table(path)
+    return info, table.to_pylist()
+
+
+def read_index_table(path) -> tuple[dict, pa.Table]:
+    """The index as it is stored: an Arrow table, never Python rows."""
     data = index_path(path).read_bytes()
     if len(data) <= 4 or zlib.crc32(data[:-4]) != int.from_bytes(data[-4:], "little"):
         raise Damaged(f"{path}: damaged index")
@@ -168,7 +178,14 @@ def read_index(path) -> tuple[dict, list[dict]]:
     info = json.loads(table.schema.metadata[KEY])
     if info.get("format") != FORMAT:
         raise ValueError(f"{path}: unsupported container format {info.get('format')!r}")
-    return info, table.to_pylist()
+    return info, table.replace_schema_metadata(None).combine_chunks()
+
+
+def index_end(info: dict, table: pa.Table) -> int:
+    """Where the next shard goes: past the head and every committed shard."""
+    if not table.num_rows:
+        return info["head_length"]
+    return max(info["head_length"], pc.max(pc.add(table["offset"], table["length"])).as_py())
 
 
 def read_head(path, info) -> bytearray:
@@ -244,9 +261,10 @@ class Appender:
 
     def __init__(self, path):
         self.path, self._broken = Path(path), None
-        self.info, self.rows = read_index(self.path)
+        self.info, self.index = read_index_table(self.path)
+        self._rows = None
         self.head = read_head(self.path, self.info)
-        self.end = max([self.info["head_length"], *(r["offset"] + r["length"] for r in self.rows)])
+        self.end = index_end(self.info, self.index)
         size = os.path.getsize(self.path)
         if size < self.end:
             raise Damaged(f"{self.path}: shorter than what was committed")
@@ -267,6 +285,13 @@ class Appender:
         _save_index(path, {"format": FORMAT, "head_length": len(head), "head_crc": zlib.crc32(head),
                            "app": app or {}}, [])
         return cls(path)
+
+    @property
+    def rows(self) -> list[dict]:
+        """The index as Python rows, built on demand: the commit path never needs them."""
+        if self._rows is None:
+            self._rows = self.index.to_pylist()
+        return self._rows
 
     def commit(self, shards) -> list[int]:
         """`(attrs, data)` of any number of shards, as one commit; their indices here. `attrs` come
@@ -300,14 +325,15 @@ class Appender:
                             break
                         _write(file, block)
                         crc, length = zlib.crc32(block, crc), length + len(block)
-                    row.update(shard=len(self.rows) + len(added), offset=at, length=length, crc=crc,
+                    row.update(shard=self.index.num_rows + len(added), offset=at, length=length, crc=crc,
                                retired=False, n_dropped=attrs.get("n_dropped") or 0)
                     added.append(row)
                     at += length
                 if not added:
                     return []
                 _sync(file)
-            _save_index(self.path, self.info, self.rows + added)
+            table = pa.concat_tables([self.index, pa.Table.from_pylist(added, schema=_INDEX)]).combine_chunks()
+            _save_index(self.path, self.info, table)
         except BaseException as error:
             if reading:  # the caller's shard was unreadable: this container is as it was
                 try:
@@ -317,7 +343,7 @@ class Appender:
             else:
                 self._broken = error
             raise
-        self.rows += added
+        self.index, self._rows = table, None
         self.end = at
         return [row["shard"] for row in added]
 
@@ -338,15 +364,18 @@ class Appender:
         if self._broken is not None:
             raise RuntimeError(f"{self.path}: reopen it, the last commit failed") from self._broken
         gone = {int(shard) for shard in shards}
-        if gone - {row["shard"] for row in self.rows}:
-            raise ValueError(f"{self.path}: no such shards {sorted(gone - {row['shard'] for row in self.rows})}")
-        rows = [{**row, "retired": row["retired"] or row["shard"] in gone} for row in self.rows]
+        missing = gone - set(range(self.index.num_rows))  # a shard's number is its row
+        if missing:
+            raise ValueError(f"{self.path}: no such shards {sorted(missing)}")
+        hit = pc.is_in(self.index["shard"], pa.array(sorted(gone), pa.uint32()))
+        table = self.index.set_column(self.index.schema.get_field_index("retired"), "retired",
+                                      pc.or_(self.index["retired"], hit))
         try:
-            _save_index(self.path, self.info, rows)
+            _save_index(self.path, self.info, table)
         except BaseException as error:
             self._broken = error
             raise
-        self.rows = rows
+        self.index, self._rows = table, None
 
 
 def rebuild_index(path, app: dict | None = None, *, cut_tail: bool = False) -> int:
