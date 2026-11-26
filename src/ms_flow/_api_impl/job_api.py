@@ -139,7 +139,7 @@ def build_executor(name: str, settings, host_env=None):
                               runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
                               poll_s=config.poll_seconds, shared=config.shared_disk, env=env,
-                              keep_after=host.keep_after, grow=_grow(config))
+                              keep_after=host.keep_after, grow=_grow(config), bring=config.bring_while_running)
     from ms_flow.engine import ProcessExecutor
 
     return _batching(ProcessExecutor(_here(hosts[0])[0]), config)
@@ -165,6 +165,7 @@ def _retake(executor, settings, name: str) -> None:
     executor.script = executor.script_for()
     executor.capacity, executor.batch = config.max_jobs or sys.maxsize, config.elements_per_job or sys.maxsize
     executor.poll_s, executor.keep_after = config.poll_seconds, settings.hosts[config.hosts[0]].keep_after
+    executor.bring = config.bring_while_running
     executor.grow = _grow(config)
 
 

@@ -323,7 +323,7 @@ class RemoteExecutor:
                  elements_per_job: int | None = None, max_jobs: int | None = None, poll_s: float = 30,
                  part_seconds: float = 30, shared: bool | None = None, env: str = "", keep_after: float = 7,
                  poll_timeout: float = 120, asks: dict | None = None, grow: dict | None = None,
-                 grow_times: int = 2):
+                 grow_times: int = 2, bring: bool = True):
         self.remote, self.workdir, self.queue = Host(host), shlex.quote(workdir), SCHEDULERS[scheduler]
         if env:
             python = shlex.quote(f"{env}/bin/python")
@@ -335,6 +335,7 @@ class RemoteExecutor:
         self.capacity, self.batch = max_jobs or sys.maxsize, elements_per_job or sys.maxsize
         self.poll_s, self.part_seconds, self.shared = poll_s, part_seconds, host is None if shared is None else shared
         self.keep_after, self.poll_timeout = keep_after, poll_timeout
+        self.bring = bring  # what a campaign keeps there comes here every round (`Campaign._keep_up`)
         self.grow, self.grow_times = dict(grow or {}), grow_times
         # While the other machine does not answer: since when and what was said, for whoever shows
         # the jobs; `retries` grows with each `reconnect`.

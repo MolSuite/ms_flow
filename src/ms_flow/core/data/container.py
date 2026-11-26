@@ -171,7 +171,11 @@ def read_index(path) -> tuple[dict, list[dict]]:
 
 def read_index_table(path) -> tuple[dict, pa.Table]:
     """The index as it is stored: an Arrow table, never Python rows."""
-    data = index_path(path).read_bytes()
+    return parse_index(index_path(path).read_bytes(), path)
+
+
+def parse_index(data: bytes, path="an index") -> tuple[dict, pa.Table]:
+    """An index from its bytes (one read on another host): its crc checked."""
     if len(data) <= 4 or zlib.crc32(data[:-4]) != int.from_bytes(data[-4:], "little"):
         raise Damaged(f"{path}: damaged index")
     table = ipc.open_stream(data[:-4], options=_read_options()).read_all()

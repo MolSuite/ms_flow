@@ -497,7 +497,7 @@ def test_connect_registers_without_copying_data(tmp_path, monkeypatch):
     monkeypatch.setenv("CAMPAIGN_OUT", str(tmp_path / "p" / "made"))
     monkeypatch.setenv("CAMPAIGN_LOG", str(tmp_path / "log"))
     GOT.clear()
-    far = _far(tmp_path)
+    far = _far(tmp_path, bring=False)  # registered only: bringing is its own test
     engine = Engine(cpus=4)
     engine.register("thread", ThreadExecutor(4))
     engine.register("far", far)
@@ -523,3 +523,55 @@ def test_a_job_on_ray_says_how_its_cluster_is():
         "store_mb": 2000, "store_used_mb": 120}}, True)
     assert c.note == ("running in the queue (job 9): 3 of 10 done · Ray: 1 of 2 nodes, 6 of 8 CPUs busy, "
                       "store 120 of 2,000 MB")
+
+
+@task()
+def leaves_part_slowly(element):
+    from benchmarks.refactor_optimization import workers
+
+    time.sleep(0.4)
+    return workers.part_of(element)
+
+
+@campaign(output=lambda params, project: _Collect())
+def commits_there_slowly(params, project):
+    from benchmarks.refactor_optimization import workers
+
+    out = Dir(Path(os.environ["CAMPAIGN_OUT"]))
+    return [Stage("all", leaves_part_slowly, [{"n": n, "log": os.environ["CAMPAIGN_LOG"], "out": out,
+                                               "_cpu_required": 1} for n in range(24)], commit=workers.receipts_of)]
+
+
+@pytest.mark.parametrize("bring", [True, False])
+def test_what_a_stage_commits_there_comes_here_while_it_runs(tmp_path, monkeypatch, bring):
+    """Every round, what the stage committed there so far is registered here and, unless the
+    executor says not to, brought: the copy here grows with it, a shard at least."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    monkeypatch.setenv("CAMPAIGN_OUT", str(tmp_path / "p" / "made"))
+    monkeypatch.setenv("CAMPAIGN_LOG", str(tmp_path / "log"))
+    far = _far(tmp_path, bring=bring)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    seen_while_running = []
+    try:
+        with engine:
+            job = Flow(engine, project).submit(commits_there_slowly, {}, executor="far")
+            while engine.status(job).status in ("waiting", "running"):
+                rows = list(catalog.files(project, catalog.shard_spec(role="made")))
+                if rows and not rows[0]["location"]:
+                    seen_while_running.append(catalog.count(project, catalog.shard_spec(role="made")))
+                time.sleep(0.2)
+            assert engine.wait(job, 120).status == "completed"
+        [row] = list(catalog.files(project, catalog.shard_spec(role="made")))
+        if bring:
+            assert seen_while_running and 0 < seen_while_running[0] < 24, seen_while_running
+            assert row["location"] == "" and catalog.count(project, catalog.shard_spec(role="made")) == 24
+        else:
+            assert not seen_while_running and row["location"] == "far" and row["n_shards"] == 24
+    finally:
+        project.disconnect()

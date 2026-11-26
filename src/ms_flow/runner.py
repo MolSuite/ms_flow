@@ -280,6 +280,8 @@ class _There:
     def __init__(self, home: Path):
         self.home = Path(home)
         self.writers, self.dbs, self.paths, self.generations = {}, {}, {}, set()
+        # Commits come on the engine's delivery thread, `files` on the one that tells the progress.
+        self.lock = threading.RLock()
         # The folders parts came from, and those of the containers, every run of the job: what a
         # killed task left is known by the first (`tidy`), what the job made by the second (`files`).
         self.folders = {name: self._read(name) for name in ("part_folders", "container_folders")}
@@ -312,6 +314,10 @@ class _There:
         numbers in it. A receipt is `{part, path, role, generation_id}` and maybe `folder` (where
         its containers are: its part's folder by default), or two parts written as one
         (`catalog.PairWriter`), `path` and `role` its index and `bulk`, `bulk_role` the other."""
+        with self.lock:
+            return self._commit(receipts)
+
+    def _commit(self, receipts: list) -> list:
         groups: dict = {}
         for at, receipt in enumerate(receipts):
             key = (str(receipt.get("folder") or Path(receipt["path"]).parent), receipt.get("generation_id"),
@@ -394,18 +400,21 @@ class _There:
         from ms_flow.core.database.project_models import CatalogFile
 
         rows = []
-        for folder in sorted(self.folders["container_folders"]):
-            with self._db(folder).get_session() as session:
-                rows += session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
-        return [{key: getattr(row, key) for key in ("path", "role", "generation_id", *catalog._COUNTS)} for row in rows]
+        with self.lock:
+            for folder in sorted(self.folders["container_folders"]):
+                with self._db(folder).get_session() as session:
+                    rows += session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
+        return [{key: getattr(row, key) for key in ("id", "path", "role", "generation_id", *catalog._COUNTS)}
+                for row in rows]
 
     def close(self) -> None:
-        for writer in self.writers.values():
-            writer.close()
-        self.writers.clear()
-        for db in self.dbs.values():
-            db.disconnect()
-        self.dbs.clear()
+        with self.lock:
+            for writer in self.writers.values():
+                writer.close()
+            self.writers.clear()
+            for db in self.dbs.values():
+                db.disconnect()
+            self.dbs.clear()
 
 
 def commit_there(home, receipts: list) -> list:
@@ -619,8 +628,10 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
 
     def tell(now, running):
         status = now.status if last or not now.status.startswith("completed") else "running"
+        # What it committed there so far: whoever follows it registers and brings it as it grows.
+        made = {"files": there.files()} if there is not None else {}
         _tell(home, total=now.chunks_total, done=now.chunks_done, failed=now.chunks_failed, running=running,
-              status=status, error=None if now.status in _GOING else now.error, **said)
+              status=status, error=None if now.status in _GOING else now.error, **said, **made)
 
     job = engine.submit(
         "run", partial(_returns_data, fn, needs.get("batched", False)), elements(), total=total, journal="journal",

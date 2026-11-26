@@ -550,6 +550,7 @@ class Campaign:
             self._why_from(said)
             if not self._canceling:
                 self._tell(told, alive)
+                self._keep_up(told.get("files"))
                 if alive and time.monotonic() > self._accounted + _ACCOUNT_EVERY:
                     self._account()
             for name in streamed:
@@ -632,15 +633,20 @@ class Campaign:
 
     def _register(self, left: dict) -> None:
         """The containers the stages committed there, in the project's catalog as being there (by
-        the executor's name): their rows and counts from that side, no data moved."""
-        if self.project is None or not getattr(self.project, "project_dir", None) or not self.executor:
+        the executor's name), and brought here unless the executor says not to."""
+        self._keep_up([row for said in left.values() for row in said.get("files") or ()])
+
+    def _keep_up(self, rows) -> None:
+        """`rows` (containers there, as its runner lists them) registered here and, with the
+        executor's `bring`, brought as far as they are made. What does not come now comes next round."""
+        if not rows or self.project is None or not getattr(self.project, "project_dir", None) or not self.executor:
             return
-        for said in left.values():
-            for row in said.get("files") or ():
-                counts = {key: value for key, value in row.items() if key in catalog._COUNTS}
-                file_id = catalog.add_remote(self.project, row["path"], location=self.executor, role=row["role"],
-                                             counts=counts, generation_id=row["generation_id"])
-                catalog.update_file(self.project, file_id, **counts)  # one registered before has grown
+        try:
+            ids = locations.register_there(self.project, self.executor, rows)
+            if self.remote.bring:
+                locations.bring(self.project, self.remote, ids, location=self.executor)
+        except Exception as error:  # ponytail: one warning a round while a host or a file misbehaves
+            log.warning("campaign %s: what it made there did not come this round: %s", self.dir, error)
 
     def _glance(self) -> tuple[dict, bool]:
         """Its progress there, and whether its job is in the queue: nothing it made."""

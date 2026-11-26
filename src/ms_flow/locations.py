@@ -7,6 +7,9 @@ copy that went (a purged scratch) is found by `reconcile`, or by the next campai
 """
 from __future__ import annotations
 
+import json
+import os
+import re
 import shlex
 import uuid
 from datetime import datetime
@@ -101,4 +104,207 @@ def reconcile(project, remote) -> list[str]:
     return gone
 
 
-__all__ = ["forget", "host_of", "inside", "known", "reconcile", "record", "root", "uid"]
+# --- Containers a step made on another host (M11) ----------------------------------------------
+#
+# A container a campaign committed there is registered here as being there (`register_there`,
+# `CatalogFile.location` = the executor's name). `bring` copies it here as far as its index there
+# goes, a shard at least: the index first, then only the bytes not here yet, every new shard's crc
+# checked, the index here last. Here it is sealed (only `bring` makes it grow) and readable; the
+# copy there is recorded in `ms_locations`. `cleanup` removes copies there whose copy here is
+# verified (the same index: shards, offsets, lengths, crcs), the rest only when asked to.
+
+
+def _meta(project, key: str) -> dict:
+    with _engine(project).connect() as conn:
+        value = conn.exec_driver_sql("SELECT value FROM ms_project_meta WHERE key = ?", (key,)).scalar()
+    return json.loads(value) if value else {}
+
+
+def _save_meta(project, key: str, value: dict) -> None:
+    with _engine(project).begin() as conn:
+        conn.exec_driver_sql("INSERT INTO ms_project_meta (key, value) VALUES (?, ?) ON CONFLICT (key) "
+                             "DO UPDATE SET value = excluded.value", (key, json.dumps(value, sort_keys=True)))
+
+
+def mirror(project, location: str, there: str) -> Path:
+    """Where the file at `there` on `location` is kept here."""
+    return Path(project.project_dir) / "hosts" / re.sub(r"[^A-Za-z0-9._-]+", "_", location) / str(there).lstrip("/")
+
+
+def _there_of(project, location: str, here: str) -> str | None:
+    folder = mirror(project, location, "")
+    try:
+        return "/" + PurePosixPath(Path(here).relative_to(folder)).as_posix()
+    except ValueError:
+        return None
+
+
+def register_there(project, location: str, rows) -> list[int]:
+    """The containers a step committed on `location` (the rows of its catalog there, `id` among
+    them), in the project's catalog as being there, with their counts from there: no data moves.
+    One already brought here keeps its row; one registered before has its counts moved."""
+    from ms_flow.core.data import catalog
+
+    ids, far = [], _meta(project, f"far:{location}")
+    for row in rows:
+        counts = {key: value for key, value in row.items() if key in catalog._COUNTS}
+        here = str(mirror(project, location, row["path"]))
+        with project.get_session() as session:
+            from sqlmodel import select
+
+            from ms_flow.core.database.project_models import CatalogFile
+
+            brought = session.exec(select(CatalogFile.id).where(CatalogFile.path == here)).first()
+        if brought is not None:
+            file_id = int(brought)
+        else:
+            file_id = catalog.add_remote(project, row["path"], location=location, role=row["role"], counts=counts,
+                                         generation_id=row["generation_id"])
+            catalog.update_file(project, file_id, **counts)
+        if row.get("id") is not None:  # what its pairs there name it by
+            far[f"{Path(row['path']).parent}|{int(row['id'])}"] = file_id
+        ids.append(file_id)
+    _save_meta(project, f"far:{location}", far)
+    return ids
+
+
+def _same(a: list, b: list) -> bool:
+    keys = ("shard", "offset", "length", "crc")
+    return [tuple(r[k] for k in keys) for r in a] == [tuple(r[k] for k in keys) for r in b]
+
+
+def _start(here: Path, info: dict, rows: list) -> int:
+    """How much of the copy here is the file there: what its own index committed, when that is a
+    beginning of the index there; else (a cut copy) its head and the whole shards whose crc holds."""
+    from ms_flow.core.data import container
+
+    if not here.is_file():
+        return 0
+    try:
+        _, mine = container.read_index(here)
+        if _same(mine, rows[:len(mine)]):
+            return min(here.stat().st_size, container.index_end(info, container.read_index_table(here)[1]))
+    except (OSError, ValueError):
+        pass
+    try:
+        container.read_head(here, info)
+    except (OSError, ValueError):
+        return 0
+    at = info["head_length"]
+    for row in sorted(rows, key=lambda r: r["offset"]):
+        try:
+            for _ in container._blocks(here, row):
+                pass
+        except (OSError, ValueError):
+            break
+        at = row["offset"] + row["length"]
+    return at
+
+
+def bring(project, remote, file_ids, *, location: str, piece: int = 64 << 20) -> list[int]:
+    """The containers `file_ids` of `location` (the host of `remote`) brought here as far as their
+    index there goes, in pieces of at most `piece` bytes; a cut copy goes on from what came. A
+    pair's references to its other part (`meta["bulk"]`, ids of the catalog there) become this
+    project's, so bring both parts. Returns the ids brought."""
+    import hashlib
+
+    from ms_flow.core.data import catalog, container
+    from ms_flow.core.database.project_models import CatalogFile
+    from ms_env import HostError
+
+    far, done = _meta(project, f"far:{location}"), []
+    for file_id in file_ids:
+        with project.get_session() as session:
+            row = session.get(CatalogFile, int(file_id))
+        if row is None:
+            continue
+        there = row.path if row.location == location else _there_of(project, location, row.path) if not row.location else None
+        if there is None:
+            continue
+        here = mirror(project, location, there)
+        said = remote.remote.run(f"cat {shlex.quote(there + '.index')}")
+        info, table = container.parse_index(said, there)
+        rows, end = table.to_pylist(), container.index_end(info, table)
+        here.parent.mkdir(parents=True, exist_ok=True)
+        at = _start(here, info, rows)
+        with open(here, "r+b" if here.exists() else "wb") as file:
+            file.truncate(at)
+        while at < end:
+            n = min(int(piece), end - at)
+            data = remote.remote.run(f"tail -c +{at + 1} {shlex.quote(there)} | head -c {n}")
+            if len(data) != n:
+                raise HostError(f"{there}: {len(data)} of {n} bytes came")
+            with open(here, "ab") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            at += n
+        container.read_head(here, info)
+        for shard in rows:  # what came is what was committed there (I16)
+            for _ in container._blocks(here, shard):
+                pass
+        folder = str(Path(there).parent)
+        for shard in rows:
+            meta = json.loads(shard["meta"] or "{}")
+            if meta.get("bulk"):
+                meta["bulk"] = [catalog.shard_id(far[f"{folder}|{f}"], n)
+                                for f, n in map(catalog.split_shard_id, meta["bulk"])]
+                shard["meta"] = json.dumps(meta, separators=(",", ":"))
+        container._save_index(here, info, rows)  # the index last: it never names bytes not here
+        if row.location:
+            catalog.adopt(project, int(file_id), here)
+            catalog.seal(project, int(file_id))  # only `bring` makes it grow
+        else:
+            catalog.update_file(project, int(file_id), **catalog._counts(project, here))
+        sha = hashlib.sha256(said).hexdigest()
+        record(project, host_of(remote), {there: (end, sha), there + ".index": (len(said), sha)})
+        done.append(int(file_id))
+    return done
+
+
+def cleanup(project, remote, *, location: str, files=None, confirm: bool = False) -> list[dict]:
+    """The copies of `location` (the host of `remote`) of this project's containers, or of `files`
+    (catalog ids): each `{path, verified, removed}`. One whose copy here has the same index is
+    removed there; one with no verified copy here only with `confirm`, and then, if it was only
+    there, its catalog row goes too."""
+    from sqlmodel import select
+
+    from ms_flow.core.data import container
+    from ms_flow.core.database.project_models import CatalogFile
+
+    host, wanted = host_of(remote), None if files is None else {int(f) for f in files}
+    with project.get_session() as session:
+        rows = session.exec(select(CatalogFile)).all()
+    candidates = []
+    for row in rows:
+        if wanted is not None and int(row.id) not in wanted:
+            continue
+        if row.location == location:
+            candidates.append((row, row.path, False))
+        elif not row.location:
+            there = _there_of(project, location, row.path)
+            if there is not None and there in known(project, host):
+                candidates.append((row, there, True))
+    said = []
+    for row, there, here_too in candidates:
+        verified = False
+        if here_too:
+            try:
+                _, theirs = container.parse_index(remote.remote.run(f"cat {shlex.quote(there + '.index')}"), there)
+                verified = _same(container.read_index(row.path)[1], theirs.to_pylist())
+            except (OSError, ValueError):
+                verified = False
+        removed = verified or confirm
+        if removed:
+            remote.remote.run(f"rm -f {shlex.quote(there)} {shlex.quote(there + '.index')}")
+            forget(project, host, [there])
+            if not here_too:
+                with project.get_session() as session:
+                    session.delete(session.get(CatalogFile, row.id))
+                    session.commit()
+        said.append({"path": there, "verified": verified, "removed": removed})
+    return said
+
+
+__all__ = ["bring", "cleanup", "forget", "host_of", "inside", "known", "mirror", "reconcile", "record",
+           "register_there", "root", "uid"]
