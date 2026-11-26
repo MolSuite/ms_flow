@@ -253,3 +253,84 @@ def test_undo_restores_both_counts(tmp_path):
         assert _row(db, file_id)["n_shards_excluded"] == 1
     finally:
         db.disconnect()
+
+
+def _stat(path):
+    st = path.stat()
+    return st.st_ino, st.st_mtime_ns, st.st_size
+
+
+def test_one_more_shard_does_not_rewrite_the_done_set(tmp_path, monkeypatch):
+    """A shard marked done adds a small piece: the file of what was done before stays as it was."""
+    from ms_flow.core.data import states
+
+    monkeypatch.setattr(states, "COMPACT_AT", 1000)
+    db = _project(tmp_path)
+    try:
+        mark_done(db, "run", "k", range(100))
+        states.sidecar(db, "run", "k")  # folded into one file
+        base = states._file(db, "run", "k")
+        before = _stat(base)
+        assert mark_done(db, "run", "k", [100], records={100: ([0, 1], [2])}) == 101
+        assert _stat(base) == before
+        assert done(db, "run", "k").tolist() == list(range(101))
+        (state,) = progress(db, "run")
+        assert (state["shards_done"], state["records_done"], state["records_failed"]) == (101, 2, 1)
+    finally:
+        db.disconnect()
+
+
+def test_the_pieces_fold_into_one_file(tmp_path, monkeypatch):
+    from ms_flow.core.data import states
+
+    monkeypatch.setattr(states, "COMPACT_AT", 3)
+    db = _project(tmp_path)
+    try:
+        for shard in range(7):
+            mark_done(db, "run", "k", [shard], records={shard: ([0], [1])} if shard == 4 else None)
+        pieces = states._file(db, "run", "k").with_suffix(".pieces")
+        assert len(list(pieces.glob("*.parquet"))) < 3
+        states._CACHE.clear()  # what another process reads off the disk
+        assert done(db, "run", "k").tolist() == list(range(7))
+        assert failed(db, "run", "k", 4).tolist() == [1]
+    finally:
+        db.disconnect()
+
+
+def test_a_fold_that_crashed_before_deleting_its_pieces_reads_the_same(tmp_path, monkeypatch):
+    from ms_flow.core.data import states
+
+    monkeypatch.setattr(states, "COMPACT_AT", 1000)
+    db = _project(tmp_path)
+    try:
+        mark_done(db, "run", "k", [1], narrowed_by="cut-1")
+        mark_done(db, "run", "k", [1], records={1: ([0, 1, 2], [3])})  # whole, and its counts
+        pieces = states._file(db, "run", "k").with_suffix(".pieces")
+        kept = {p.name: p.read_bytes() for p in pieces.glob("*.parquet")}
+        states.sidecar(db, "run", "k")
+        for name, data in kept.items():  # as if the fold died before deleting them
+            (pieces / name).write_bytes(data)
+        states._CACHE.clear()
+        assert done(db, "run", "k").tolist() == [1]
+        assert failed(db, "run", "k", 1).tolist() == [3]
+    finally:
+        db.disconnect()
+
+
+def test_a_reader_sees_what_another_process_wrote_since(tmp_path, monkeypatch):
+    from ms_flow.core.data import states
+
+    monkeypatch.setattr(states, "COMPACT_AT", 2)
+    db = _project(tmp_path)
+    try:
+        mark_done(db, "run", "k", [1])
+        assert done(db, "run", "k").tolist() == [1]
+        mine = dict(states._CACHE)
+        states._CACHE.clear()
+        for shard in (2, 3, 4):  # "another process": its own cache, a fold among them
+            mark_done(db, "run", "k", [shard])
+        states._CACHE.clear()
+        states._CACHE.update(mine)  # back to the reader's stale view
+        assert done(db, "run", "k").tolist() == [1, 2, 3, 4]
+    finally:
+        db.disconnect()
