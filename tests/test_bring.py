@@ -128,7 +128,9 @@ def test_bringing_one_step_brings_nothing_else(project, tmp_path):
     far = _far(tmp_path / "far")
     rows = _made_there(tmp_path / "far" / "c1", 2, "first") + _made_there(tmp_path / "far" / "c1", 2, "second", start=5)
     locations.register_there(project, "far", rows)
+    assert locations.copies(project) == {"far": {"there": 2, "here_too": 0}}
     locations.bring(project, far, _ids(project, "first"), location="far")
+    assert locations.copies(project) == {"far": {"there": 1, "here_too": 1}}
     assert [r["location"] for r in catalog.files(project, catalog.shard_spec(role="second"))] == ["far"]
     assert not [p for p in (tmp_path / "p").rglob("second*")]
 

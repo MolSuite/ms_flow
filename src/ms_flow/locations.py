@@ -262,6 +262,25 @@ def bring(project, remote, file_ids, *, location: str, piece: int = 64 << 20) ->
     return done
 
 
+def copies(project) -> dict[str, dict[str, int]]:
+    """By the name of the executor that has them, how many containers of the project are only there
+    (`there`) and how many are here with that copy too (`here_too`, brought by `bring`)."""
+    from sqlmodel import select
+
+    from ms_flow.core.database.project_models import CatalogFile
+
+    with project.get_session() as session:
+        rows = session.exec(select(CatalogFile.path, CatalogFile.location)).all()
+    hosts, said = Path(project.project_dir) / "hosts", {}
+    for path, location in rows:
+        if location:
+            said.setdefault(location, {"there": 0, "here_too": 0})["there"] += 1
+        elif str(path).startswith(f"{hosts}/"):
+            name = Path(path).relative_to(hosts).parts[0]
+            said.setdefault(name, {"there": 0, "here_too": 0})["here_too"] += 1
+    return said
+
+
 def cleanup(project, remote, *, location: str, files=None, confirm: bool = False, dry: bool = False) -> list[dict]:
     """The copies of `location` (the host of `remote`) of this project's containers, or of `files`
     (catalog ids): each `{path, verified, removed}`. One whose copy here has the same index is
@@ -306,5 +325,5 @@ def cleanup(project, remote, *, location: str, files=None, confirm: bool = False
     return said
 
 
-__all__ = ["bring", "cleanup", "forget", "host_of", "inside", "known", "mirror", "reconcile", "record",
+__all__ = ["bring", "cleanup", "copies", "forget", "host_of", "inside", "known", "mirror", "reconcile", "record",
            "register_there", "root", "uid"]
