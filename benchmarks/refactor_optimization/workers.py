@@ -101,3 +101,56 @@ def packs_with_dictionary(element: dict) -> dict:
 
     data = element["data"]
     return {"n": element["n"], "structure_payload_id": Payload(data, series="guests", dictionary=element["dictionary"])}
+
+
+def _digest(path: str) -> str:
+    import hashlib
+
+    digest = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as file:
+        while block := file.read(1 << 22):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def landed(payload: dict) -> dict:
+    """Where the node keeps the container it was given, and what it holds."""
+    import tempfile
+
+    path = payload["container"]
+    return {"ino": os.stat(path).st_ino, "tmp": tempfile.gettempdir(), "data": _digest(path),
+            "index": _digest(path + ".index")}
+
+
+def leave_bytes(payload: dict) -> dict:
+    """Leaves in `out` a container of `size` random bytes with its index, a small top one with its
+    index, and an empty file. Names `out`, or the top container alone with `top_only`."""
+    out, size = payload["out"], payload["size"]
+    part, top = os.path.join(out, "part.arrows"), os.path.join(out, "top.arrows")
+    with open(part, "wb") as file:
+        left, n = size, 0
+        while left:
+            block = os.urandom(min(left, 1 << 24))
+            file.write(block)
+            left, n = left - len(block), n + 1
+    for path, text in ((part + ".index", b"index"), (top, b"top"), (top + ".index", b"top index"),
+                       (os.path.join(out, "empty.bin"), b"")):
+        with open(path, "wb") as file:
+            file.write(text)
+    made = {name: _digest(os.path.join(out, name)) for name in os.listdir(out)}
+    return {"named": top if payload.get("top_only") else out, "made": made}
+
+
+def held_on(payload: dict) -> dict:
+    """Says it began in `log`; on the node whose temporary directory is `victim`, the first time,
+    waits there until that node is taken away."""
+    import tempfile
+
+    with open(payload["log"], "a") as file:
+        file.write(f"{payload['n']} {tempfile.gettempdir()}\n")
+    if tempfile.gettempdir() == payload["victim"]:
+        time.sleep(600)
+    made = os.path.join(payload["out"], f"{payload['n']}.txt")
+    with open(made, "w") as file:
+        file.write(str(payload["n"]))
+    return {"made": made}
