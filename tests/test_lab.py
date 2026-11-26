@@ -407,3 +407,41 @@ if __name__ == "__main__":  # one client of test_two_clients_of_one_campaign_que
     os.environ["CAMPAIGN_FILE"] = str(Path(sys.argv[2]) / "said.txt")
     snap = run({"n": 8, "nap": 2, "tag": sys.argv[1]}, tempfile.mkdtemp())
     print(json.dumps({"status": snap.status, "error": snap.error, "got": got()}))
+
+
+def test_parts_go_into_containers_there_through_a_kill(request, said):
+    """10 containers of 10 shards, the runner killed mid-run: every part once, none lost, and there
+    the containers, not a file per task."""
+    killed = []
+
+    def kill(engine, job):
+        until(lambda: len(lab_tasks.GOT) >= 20)
+        # The workers' own containers: ssh from the login to a worker is refused in this lab.
+        for name in (["vhpc-sge-sge-1"] if SGE else ["vhpc-molsuite-slurm-worker1-1", "vhpc-molsuite-slurm-worker2-1"]):
+            said = subprocess.run(["docker", "exec", name, "pkill", "-9", "-f", "[m]s_flow.runner"], capture_output=True)
+            killed.append(said.returncode == 0)
+        killed.append(len(lab_tasks.GOT))
+
+    with lab_engine(said, far()) as engine:
+        job = Flow(engine, None).submit(lab_tasks.committing, params(request, n=100, nap=0.5), executor="far",
+                                        journal="j")
+        threading.Thread(target=kill, args=(engine, job), daemon=True).start()
+        assert engine.wait(job, 900).status == "completed"
+    by_n = {}
+    for result in lab_tasks.GOT:  # a result the kill caught between its line and its note comes twice
+        assert by_n.setdefault(result["n"], result["_committed"]) == result["_committed"]
+    assert any(killed[:-1]) and killed[-1] < 100, f"no runner was killed mid-run: {killed}"
+    assert sorted(by_n) == list(range(100))
+    shards = {}
+    for [entry] in by_n.values():
+        shards.setdefault(entry["path"], []).extend(entry["shards"])
+    assert len(shards) == 10 and all(sorted(numbers) == list(range(10)) for numbers in shards.values())
+    held = json.loads(lab(
+        f"PYTHONPATH={THERE}/flow /opt/venv/bin/python -c 'import json, sys; from ms_flow.core.data import container; "
+        "print(json.dumps({p: [r[\"part\"] for r in container.read_index(p)[1] if not r[\"retired\"]] for p in sys.argv[1:]}))' "
+        + " ".join(sorted(shards))))
+    assert sorted(part for parts in held.values() for part in parts) == sorted(f"p:{n}" for n in range(100))
+    root = os.path.dirname(os.path.dirname(next(iter(shards))))
+    files = lab(f"cd {root} && find . -type f | sort").split()
+    assert len(files) == 30, files  # each key: its container, its index and its writer's lock
+    assert not [name for name in files if "/parts/" in name]

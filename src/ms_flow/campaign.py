@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ms_flow import locations
+from ms_flow.core.data import catalog
 from ms_flow.core.data.companions import companions
 from ms_flow.engine.files import Dir, File, KeptDir, swap
 from ms_flow.engine.flow import job, task
@@ -90,6 +91,10 @@ class Stage:
     reduce: Optional[Callable] = None
     deliver: str = "stream"
     digests: Optional[dict] = None
+    # The receipts of a result (`ms_flow.runner._There`): the parts its task wrote, committed there
+    # into containers before the result counts, which then names them (`_committed`). Registered in
+    # the project as being there once the stage ends; nothing of them comes here.
+    commit: Optional[Callable] = None
 
 
 _LET_GO = 120.0  # seconds a queue has to let a canceled job go before that is an error
@@ -229,6 +234,8 @@ class Campaign:
                 if isinstance(mark, Dir):  # made there, under the campaign's directory, and left there
                     return Dir(made.setdefault(mark, f"out/{len(made)}"))
                 if mark not in carried:
+                    if project is not None and getattr(project, "project_dir", None):
+                        catalog._seal_shipped(project, mark)  # before its hash (I15)
                     sha, path = known.get(mark) or _sha256(mark), self._store and locations.inside(project, mark)
                     carried[mark] = self._store + path if path else f"files/{sha}/{os.path.basename(mark)}"
                     self._shas[carried[mark]] = sha
@@ -239,7 +246,7 @@ class Campaign:
 
             listed = [{"name": stage.name, "fn": bound(stage.task),
                        "needs": {need: stage.task.__task__[need] for need in _CHUNK_NEEDS},
-                       "reduce": stage.reduce,
+                       "reduce": stage.reduce, "commit": stage.commit,
                        "from": None if place == 0 else (stage.source.stage, stage.source.fn,
                                                         swap(tuple(stage.source.args), carry))}
                       for place, stage in enumerate(stages)]
@@ -567,6 +574,7 @@ class Campaign:
                 lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
                 lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
                 if not lost and not reduced:
+                    self._register(left)
                     self._account(final=True)
                     return
                 gone = "it ended there, but what it made is not all there any longer"
@@ -612,6 +620,18 @@ class Campaign:
                 log.warning("campaign %s left the queue at %s%s: queued again", self.dir, now, self._ended_as(state))
                 self._submit()
             self._stop.wait(min(_GLANCE_EVERY, self.remote.poll_s) if time.monotonic() < glancing else self.remote.poll_s)
+
+    def _register(self, left: dict) -> None:
+        """The containers the stages committed there, in the project's catalog as being there (by
+        the executor's name): their rows and counts from that side, no data moved."""
+        if self.project is None or not getattr(self.project, "project_dir", None) or not self.executor:
+            return
+        for said in left.values():
+            for row in said.get("files") or ():
+                counts = {key: value for key, value in row.items() if key in catalog._COUNTS}
+                file_id = catalog.add_remote(self.project, row["path"], location=self.executor, role=row["role"],
+                                             counts=counts, generation_id=row["generation_id"])
+                catalog.update_file(self.project, file_id, **counts)  # one registered before has grown
 
     def _glance(self) -> tuple[dict, bool]:
         """Its progress there, and whether its job is in the queue: nothing it made."""

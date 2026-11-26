@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 
 import pytest
 
@@ -98,3 +99,76 @@ def test_a_job_staged_with_pickles_is_refused_with_why(tmp_path):
     (tmp_path / "spec.json").write_text(json.dumps({"fn": "f", "total": 1, "python": "3.12"}))
     assert _runner(tmp_path).wait(60) == 1
     assert "staged by another ms_flow" in _progress(tmp_path)["error"]
+
+
+def _committing(home, n, s, *, log):
+    from ms_flow.runner import stage_campaign
+
+    stages = [{"name": "all", "fn": workers.part_of, "needs": {}, "reduce": None, "from": None,
+               "commit": workers.receipts_of}]
+    return stage_campaign(home, stages, [{"n": i, "s": s, "log": str(log), "out": str(home / "out")} for i in range(n)],
+                          part_seconds=0.1)
+
+
+def _stage_results(home):
+    found = []
+    for part in sorted((home / "stages" / "all" / "results").glob("part-*.jsonl")):
+        with open(part, "rb") as file:
+            found += read_part(file)
+    return found
+
+
+def _committed_parts(home):
+    """Every part id the containers there hold, repeats kept, and the files in its folder."""
+    from ms_flow.core.data import container
+
+    ids = []
+    for path in sorted((home / "out").glob("*.arrows")):
+        ids += [row["part"] for row in container.read_index(path)[1] if not row["retired"]]
+    return sorted(ids), sorted(p.name for p in (home / "out").iterdir() if p.is_file())
+
+
+def test_walltime_kill_loses_at_most_the_open_part(tmp_path):
+    home, log = tmp_path / "job", tmp_path / "log"
+    _committing(home, 40, 0.4, log=log)
+    first = _runner(home)
+    deadline = time.monotonic() + 60
+    while len(_stage_results(home)) < 10 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    first.send_signal(signal.SIGKILL)  # the queue's walltime, at its worst: no time to tidy
+    first.wait(60)
+    time.sleep(1)  # what its workers were at, they may still finish
+    started = {int(line) for line in log.read_text().split()}
+    written = {index for index, _ in _stage_results(home)}
+    if (home / "stages" / "all" / "results" / "open.tmp").exists():
+        with open(home / "stages" / "all" / "results" / "open.tmp", "rb") as file:
+            written |= {index for index, _ in read_part(file)}
+    assert _runner(home).wait(120) == 0
+    runs = Counter(int(line) for line in log.read_text().split())
+    again = {n for n, times in runs.items() if times > 1}
+    assert again <= started - written, f"ran again {again}, open at the kill {started - written}"
+    assert max(runs.values()) <= 2 and len(again) < 40 - len(written)
+    ids, names = _committed_parts(home)
+    assert ids == sorted(f"p:{i}" for i in range(40)), "lost or doubled"
+    assert len([name for name in names if name.endswith(".arrows")]) == 1  # one container, not one per task
+    assert not list((home / "out" / "parts").iterdir())  # committed parts go
+    results = dict(_stage_results(home))
+    assert sorted(results) == list(range(40))
+    assert {entry["path"] for result in results.values() for entry in result["_committed"]} == {
+        str(home / "out" / name) for name in names if name.endswith(".arrows")}
+
+
+def test_a_new_job_skips_receipted_parts(tmp_path):
+    """A part committed there before its result was noted (the kill came between the two): the
+    task that runs again leaves a part that is not committed twice, and goes."""
+    from ms_flow.runner import commit_there
+
+    home, log = tmp_path / "job", tmp_path / "log"
+    _committing(home, 6, 0, log=log)
+    early = workers.part_of({"n": 3, "log": str(tmp_path / "early"), "out": str(home / "out")})
+    (before,) = commit_there(home, workers.receipts_of(early))
+    assert _runner(home).wait(120) == 0
+    ids, _names = _committed_parts(home)
+    assert ids == sorted(f"p:{i}" for i in range(6))
+    assert not list((home / "out" / "parts").iterdir())
+    assert dict(_stage_results(home))[3]["_committed"] == [before]

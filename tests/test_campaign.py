@@ -430,3 +430,85 @@ def test_a_job_that_ran_out_asks_for_more_at_most_grow_times(tmp_path):
     assert c._grow("OUT_OF_MEMORY") == ""  # twice already
     c._asks, c._grown, c.remote.asks = {}, 0, {}
     assert c._grow("TIMEOUT") == ""  # it asked for no time: the queue's default, unknown here
+
+
+def test_a_growing_container_is_sealed_before_it_ships(tmp_path, monkeypatch):
+    """A container still taking parts has no stable hash (I15): the campaign seals it first, and the
+    next part goes to another container. One its writer holds open now cannot be shipped."""
+    import hashlib
+
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+    from test_container_writer import _part, _receipt
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    gen = catalog.create_generation(project, step="import")
+    catalog.activate_generation(project, gen)
+    lib, parts = tmp_path / "p" / "lib", tmp_path / "parts"
+    shipped = None
+    try:
+        with catalog.ContainerWriter(project, lib, generation_id=gen, prefix="s:") as writer:
+            writer.commit_parts([_receipt(_part(parts / "0.arrows", 0), "s:0")])
+            [row] = list(catalog.files(project))
+            assert row["status"] == catalog.READY
+            monkeypatch.setenv("CAMPAIGN_PAIRS", row["path"])
+            with pytest.raises(RuntimeError, match="still being written"):
+                Campaign(_far(tmp_path), ship_pairs, {}, project)
+        shipped = Campaign(_far(tmp_path), ship_pairs, {}, project)
+        assert [r["status"] for r in catalog.files(project)] == [catalog.SEALED]
+        sha = hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest()
+        assert sha in shipped._shas.values()
+        with catalog.ContainerWriter(project, lib, generation_id=gen, prefix="s:") as writer:
+            writer.commit_parts([_receipt(_part(parts / "1.arrows", 4), "s:1")])
+        rows = list(catalog.files(project))
+        assert [r["path"] for r in rows][0] == row["path"] and len(rows) == 2
+        assert hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest() == sha
+    finally:
+        if shipped is not None:
+            shipped.close()
+        project.disconnect()
+
+
+@task()
+def leaves_part(element):
+    from benchmarks.refactor_optimization import workers
+
+    return workers.part_of(element)
+
+
+@campaign(output=lambda params, project: _Collect())
+def commits_there(params, project):
+    from benchmarks.refactor_optimization import workers
+
+    out = Dir(Path(os.environ["CAMPAIGN_OUT"]))
+    return [Stage("all", leaves_part, [{"n": n, "log": os.environ["CAMPAIGN_LOG"], "out": out, "_cpu_required": 1}
+                                       for n in range(8)], commit=workers.receipts_of)]
+
+
+def test_connect_registers_without_copying_data(tmp_path, monkeypatch):
+    """The parts of a stage go into containers there; once it ends, the project lists them as
+    being on that executor, with their counts, and holds none of their bytes."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    monkeypatch.setenv("CAMPAIGN_OUT", str(tmp_path / "p" / "made"))
+    monkeypatch.setenv("CAMPAIGN_LOG", str(tmp_path / "log"))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    try:
+        with engine:
+            job = Flow(engine, project).submit(commits_there, {}, executor="far")
+            assert engine.wait(job, 120).status == "completed"
+        rows = list(catalog.files(project, catalog.shard_spec(role="made")))
+        assert [(row["location"], row["role"], row["n_shards"], row["n_records"]) for row in rows] == [("far", "made", 8, 32)]
+        assert rows[0]["path"].startswith(str(tmp_path / "far")) and os.path.isfile(rows[0]["path"])
+        assert not list((tmp_path / "p").rglob("*.arrows*")), "data came here"
+        assert {entry["path"] for result in GOT for entry in result["_committed"]} == {rows[0]["path"]}
+    finally:
+        project.disconnect()

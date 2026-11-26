@@ -154,3 +154,27 @@ def held_on(payload: dict) -> dict:
     with open(made, "w") as file:
         file.write(str(payload["n"]))
     return {"made": made}
+
+
+def part_of(payload: dict) -> dict:
+    """A task that leaves a part of 4 records in its `out` and says so; every run is a line in `log`."""
+    import uuid
+
+    import pyarrow as pa
+
+    from ms_flow.core.data.shard import write_table
+
+    n = int(payload["n"])
+    with open(payload["log"], "a") as log:
+        log.write(f"{n}\n")
+    time.sleep(float(payload.get("s", 0)))
+    path = os.path.join(payload["out"], "parts", f"{n}-{uuid.uuid4().hex[:8]}.arrows")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_table(path, pa.table({"x": [4 * n + i for i in range(4)]}), part=f"p:{n}", base_id=4 * n)
+    return {"n": n, "part": path}
+
+
+def receipts_of(result: dict) -> list:
+    """What `part_of` left, as the receipt its stage commits there."""
+    return [{"part": f"p:{result['n']}", "path": result["part"], "role": "made", "generation_id": None,
+             "folder": os.path.dirname(os.path.dirname(result["part"]))}]

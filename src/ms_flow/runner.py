@@ -22,6 +22,9 @@ the others over what its `From` makes of an earlier one, made once into
 `errors.jsonl` as above, `reduced.json` (what its `reduce` made of its results) and `done` once it
 ended, which says how many parts and lines of errors it left. `progress.json` says which `stage`
 runs and how many are done (`stages_done`), and at the end what each left (`left`).
+A stage with a `commit` has the parts its tasks wrote committed here, by the runner, into
+containers over `catalog/project.db` (`_There`), before each result is written; the result then
+says where they went (`_committed`), and its `done` lists those containers (`files`).
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
 the elements run in a process pool on this machine; with it, on the Ray cluster at that address
@@ -264,6 +267,132 @@ class _Parts:
                 os.replace(self.open, self.folder / f"part-{self.n:05d}.jsonl")
 
 
+class _There:
+    """The containers the parts of a stage's tasks go into, there, as `catalog_sink` does here: one
+    writer per (folder, generation, roles), over a catalog of this directory's own
+    (`catalog/project.db`, the same ids of generations as the project's). The runner is the one
+    process of its job that appends, and a part committed once is not twice (I10): what a task
+    that ran again left goes, so the folder holds containers, not a file per task."""
+
+    def __init__(self, home: Path):
+        from ms_flow.core.database.project import ProjectStore
+
+        self.db = ProjectStore()
+        self.db.connect(Path(home) / "catalog")
+        self.writers, self.paths, self.generations = {}, {}, set()
+        # The folders parts came from, every run of the job: what a killed task left there is
+        # known by that (`tidy`).
+        self._folders = Path(home) / "catalog" / "part_folders"
+        self.folders = set(self._folders.read_text().splitlines()) if self._folders.exists() else set()
+
+    def commit(self, receipts: list) -> list:
+        """`receipts` committed: for each, `{part, path, shards}`, the container and its shard
+        numbers in it. A receipt is `{part, path, role, generation_id}` and maybe `folder` (where
+        its containers are: its part's folder by default), or two parts written as one
+        (`catalog.PairWriter`), `path` and `role` its index and `bulk`, `bulk_role` the other."""
+        groups: dict = {}
+        seen = {str(Path(r[name]).parent) for r in receipts for name in ("path", "bulk") if r.get(name)} - self.folders
+        if seen:
+            with open(self._folders, "a") as file:
+                file.write("".join(f"{folder}\n" for folder in sorted(seen)))
+                file.flush()
+                os.fsync(file.fileno())
+            self.folders |= seen
+        for at, receipt in enumerate(receipts):
+            key = (str(receipt.get("folder") or Path(receipt["path"]).parent), receipt.get("generation_id"),
+                   str(receipt["role"]), receipt.get("bulk_role"))
+            groups.setdefault(key, []).append(at)
+        where = [None] * len(receipts)
+        for key, places in groups.items():
+            done = self._writer(*key).commit_parts([
+                {"part": str(receipts[at]["part"]), "path": str(receipts[at]["path"]),
+                 **({"bulk": str(receipts[at]["bulk"])} if key[3] else {})} for at in places])
+            for at, receipt in zip(places, done):
+                if "error" in receipt:
+                    raise RuntimeError(f"not committed there: {receipt['error']}")
+                where[at] = self._where(receipt)
+        return where
+
+    def _writer(self, folder: str, generation_id, role: str, bulk_role):
+        from ms_flow.core.data import catalog
+
+        key = (folder, generation_id, role, bulk_role)
+        if key not in self.writers:
+            if generation_id is not None and generation_id not in self.generations:
+                from ms_flow.core.database.project_models import ShardGeneration
+
+                with self.db.get_session() as session:  # the project's id, so what comes back names it
+                    if session.get(ShardGeneration, int(generation_id)) is None:
+                        session.add(ShardGeneration(id=int(generation_id), step="there"))
+                        session.commit()
+                self.generations.add(generation_id)
+            self.writers[key] = (
+                catalog.PairWriter(self.db, folder, generation_id=generation_id, roles=(str(bulk_role), role))
+                if bulk_role else catalog.ContainerWriter(self.db, folder, generation_id=generation_id, role=role))
+        return self.writers[key]
+
+    def _where(self, receipt: dict) -> dict:
+        from ms_flow.core.data.catalog import split_shard_id
+        from ms_flow.core.database.project_models import CatalogFile
+
+        def at(ids) -> dict:
+            pairs = [split_shard_id(sid) for sid in ids]
+            file_id = pairs[0][0] if pairs else None  # a part never spans two containers (I18)
+            if file_id is not None and file_id not in self.paths:
+                with self.db.get_session() as session:
+                    self.paths[file_id] = session.get(CatalogFile, file_id).path
+            return {"path": self.paths.get(file_id, ""), "shards": [n for _, n in pairs]}
+
+        where = {"part": receipt["part"], **at(receipt["shards"])}
+        if "bulk" in receipt:  # a pair: its other part's shards, named in the index shards' meta
+            bulk = (receipt.get("meta") or {}).get("bulk")
+            if bulk is None:  # committed before: the index says
+                from ms_flow.core.data import container
+
+                mine = set(where["shards"])
+                bulk = [sid for row in container.read_index(where["path"])[1] if row["shard"] in mine
+                        for sid in json.loads(row["meta"] or "{}").get("bulk", ())]
+            where["bulk"] = at(bulk)
+        return where
+
+    def tidy(self) -> int:
+        """Once no task runs: what parts are left in their folders, of tasks a kill cut short (theirs
+        ran again under another name), goes. How many files went."""
+        gone = 0
+        for folder in self.folders:
+            for path in Path(folder).glob("*"):
+                if path.is_file() and path.name.endswith((".arrows", ".arrows.index", ".tmp")):
+                    path.unlink(missing_ok=True)
+                    gone += 1
+        return gone
+
+    def files(self) -> list:
+        """The containers there, as the rows the project registers them with (`catalog.add_remote`)."""
+        from sqlmodel import select
+
+        from ms_flow.core.data import catalog
+        from ms_flow.core.database.project_models import CatalogFile
+
+        with self.db.get_session() as session:
+            rows = session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
+        return [{key: getattr(row, key) for key in ("path", "role", "generation_id", *catalog._COUNTS)} for row in rows]
+
+    def close(self) -> None:
+        for writer in self.writers.values():
+            writer.close()
+        self.writers.clear()
+        self.db.disconnect()
+
+
+def commit_there(home, receipts: list) -> list:
+    """`receipts` committed into the containers of the job in `home`, as its runner does (`_There`)."""
+    there = _There(Path(home))
+    try:
+        return there.commit(list(receipts))
+    finally:
+        there.close()
+
+
 _RAN_ON: dict = {}  # what this runner runs with, told with every progress (see `ran_on`)
 
 
@@ -331,8 +460,8 @@ def _stages(engine, home: Path, spec: dict) -> str:
                     (folder / "elements.json").write_text(json.dumps({"total": total}))
                 total = json.loads((folder / "elements.json").read_text())["total"]
             ended = _run_job(engine, home, folder, step["fn"], source, total, f"stage:{step['name']}", step["needs"],
-                             spec["part_seconds"], last=place == len(stages) - 1, stage=step["name"],
-                             stages_done=place)
+                             spec["part_seconds"], last=place == len(stages) - 1, commit=step.get("commit"),
+                             stage=step["name"], stages_done=place)
             if not ended.startswith("completed"):
                 return ended
             if step["reduce"] is not None:
@@ -341,9 +470,16 @@ def _stages(engine, home: Path, spec: dict) -> str:
                 os.replace(folder / "reduced.tmp", folder / "reduced.json")
             # What it left, for whoever takes it to see that all of it came (and nothing was purged).
             errors = folder / "errors.jsonl"
-            (folder / "done").write_text(json.dumps({
-                "parts": len(list((folder / "results").glob("part-*.jsonl"))),
-                "errors": len(errors.read_text().splitlines()) if errors.exists() else 0}))
+            left = {"parts": len(list((folder / "results").glob("part-*.jsonl"))),
+                    "errors": len(errors.read_text().splitlines()) if errors.exists() else 0}
+            if step.get("commit") is not None:  # the containers there, for the project to register
+                there = _There(home)
+                try:
+                    there.tidy()
+                    left["files"] = there.files()
+                finally:
+                    there.close()
+            (folder / "done").write_text(json.dumps(left, default=str))
         if (folder / "errors.jsonl").exists():
             status = "completed_with_errors"
     try:
@@ -384,10 +520,21 @@ def _returns_data(fn, batched, payload):
 
 
 def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key: str, needs: dict,
-             part_seconds: float, last: bool = True, **said) -> str:
+             part_seconds: float, last: bool = True, commit=None, **said) -> str:
     """Run `fn` over the elements in `source` as the job `key` of the journal, its results and
-    errors to `folder`. Only the `last` job of a run says it completed: the next run would do nothing."""
+    errors to `folder`. Only the `last` job of a run says it completed: the next run would do nothing.
+    `commit`: what makes the receipts of a result (see `_There`); they are committed there before
+    the result is written, which then says where they went (`_committed`)."""
     index_of, parts = {}, _Parts(folder / "results", part_seconds)
+    there = _There(home) if commit is not None else None
+
+    def delivered(pairs):
+        lines = []
+        for key, result in pairs:
+            if there is not None:
+                result = {**result, "_committed": there.commit(commit(result))}
+            lines.append(_line([index_of[key], result], "a result"))
+        parts.write(lines)
 
     def here(mark):
         if isinstance(mark, Dir) and not os.path.isabs(mark):
@@ -416,7 +563,7 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
     job = engine.submit(
         "run", partial(_returns_data, fn, needs.get("batched", False)), elements(), total=total, journal="journal",
         key=key,
-        on_results=lambda pairs: parts.write([_line([index_of[key], result], "a result") for key, result in pairs]),
+        on_results=delivered,
         on_error=failed, **needs)
     try:
         while True:
@@ -431,6 +578,9 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
         parts.roll(force=True)
         tell(engine.status(job), 0)
         raise
+    finally:
+        if there is not None:
+            there.close()
 
 
 def main(argv=None) -> int:

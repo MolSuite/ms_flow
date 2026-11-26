@@ -382,6 +382,28 @@ def seal(project_db, file_id: int) -> None:
         session.commit()
 
 
+def _seal_shipped(project_db, path: str | Path) -> None:
+    """A container of the catalog at ``path`` that still takes parts, sealed before it ships (I15):
+    its hash is then the one that arrives. One its writer holds now cannot be sealed under it."""
+    from sqlmodel import select
+
+    from ms_flow.core.database.project_models import CatalogFile
+    from ms_flow.engine.journal import Busy, own
+
+    with project_db.get_session() as session:
+        rows = session.exec(select(CatalogFile).where(CatalogFile.path == str(path), CatalogFile.location == "",
+                                                      CatalogFile.status == READY)).all()
+    for row in rows:
+        try:
+            lock = own(_lock_path(Path(path).parent, row.role, row.generation_id))
+        except Busy as error:
+            raise RuntimeError(f"{path} is still being written ({error}): send it once that ends") from None
+        try:
+            seal(project_db, row.id)
+        finally:
+            lock.close()
+
+
 MAX_SHARDS = 4096  # of one container (I18): its index is rewritten whole per commit, ~10 ms at this size
 MAX_BYTES = 4 << 30  # committed bytes of one container, compressed (I18)
 
