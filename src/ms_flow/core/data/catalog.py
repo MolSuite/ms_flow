@@ -259,6 +259,14 @@ def add_file(
         return int(row.id)
 
 
+def add_remote(project_db, path: str | Path, *, location: str, role: str, counts: dict[str, Any],
+               generation_id: int | None) -> int:
+    """A file a step made on another host and left there (``location``): registered once, its
+    counts the ones made over there (`file_row`). The id of its row."""
+    return add_file(project_db, path, generation_id=generation_id, role=role, location=location,
+                    counts=counts, once=True)
+
+
 def update_file(project_db, file_id: int, **values: Any) -> None:
     """Move the columns of one file row (a writer's counts while it fills)."""
     from ms_flow.core.database.project_models import CatalogFile
@@ -1209,7 +1217,7 @@ def has_files(project_db, spec: QuerySpec | None = None) -> bool:
 
 
 __all__ = [
-    "ContainerWriter", "FIELDS", "GROUP_BITS", "MAX_BYTES", "MAX_SHARDS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "adopt",
+    "ContainerWriter", "FIELDS", "GROUP_BITS", "MAX_BYTES", "MAX_SHARDS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "add_remote", "adopt",
     "compact", "compact_tables", "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
     "progress", "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
     "underived",

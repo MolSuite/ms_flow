@@ -57,6 +57,7 @@ __all__ = [
     "ShardWriter",
     "get_serializer",
     "Group",
+    "PartWriter",
     "file_groups",
     "merge_shards",
     "read_dropped",
@@ -285,6 +286,8 @@ class ShardWriter:
     highest id actually written, so a partial last shard does not claim ids it never had.
     """
 
+    _source_optional = False  # `PartWriter`: a record may come without a source index
+
     def __init__(
         self,
         path: str | Path,
@@ -354,9 +357,9 @@ class ShardWriter:
         if self._last is not None and id_ <= self._last:
             raise ValueError(f"ids must be strictly increasing inside a shard: {id_} after {self._last}")
         if self._with_source:
-            if source_index is None:
+            if source_index is None and not self._source_optional:
                 raise ValueError("this writer stores a source_index per record; pass one")
-            self._sources.append(int(source_index))
+            self._sources.append(None if source_index is None else int(source_index))
         self._ids.append(id_)
         self._records.append(bytes(data))
         self._reasons.append(None)
@@ -516,6 +519,66 @@ class ShardWriter:
             return False
         self.close()
         return False
+
+
+class PartWriter(ShardWriter):
+    """One part, what a worker writes: records in, shards out, the header filled here.
+
+    The part's id range is ``like``'s (anything with ``base_id`` and ``slot_count``: the shard a
+    derived part comes from, or the span a worker was given), holes and all; without one it runs
+    from the first id to the last. ``group_size``: ids a shard, counted from the range's start
+    (a shard with no id is not written); None = the part is one shard. ``origin``: the shard a
+    derived part was made from. ``meta``: the app's facts, in the header. Same order rules as
+    `ShardWriter`; an exception inside ``with`` leaves nothing.
+    """
+
+    _source_optional = True
+
+    def __init__(self, path: str | Path, *, kind: int, serializer: int = Serializer.UTF8, like: Any = None,
+                 scope: int | None = None, origin: int | None = None, meta: dict[str, Any] | None = None,
+                 group_size: int | None = None) -> None:
+        base, slots = (int(like.base_id), int(like.slot_count)) if like is not None else (0, MAX_RECORDS)
+        super().__init__(path, dataset_id=None, shard_id=0, base_id=base, kind=kind, serializer=serializer,
+                         slot_count=slots, metadata=meta, source_index=True, scope=scope)
+        self._start = base if like is not None else None  # None until the first id, without `like`
+        self._end = base + slots if like is not None else None
+        self._size = None if group_size is None else max(1, int(group_size))
+        self._origin = origin
+        self._open: int | None = None  # the group being filled, with `group_size`
+
+    def _place(self, id_: int) -> None:
+        if self._start is None:
+            self.base_id = self._start = int(id_)
+        if self._size is not None:
+            group = (int(id_) - self._start) // self._size
+            if self._open is not None and group != self._open:
+                self._close_group(last=False)
+            self._open = group
+
+    def add(self, id_: int, data: bytes, source_index: int | None = None) -> None:
+        self._place(id_)
+        super().add(id_, data, source_index)
+
+    def drop(self, id_: int, reason: str = "") -> None:
+        self._place(id_)
+        super().drop(id_, reason)
+
+    def _close_group(self, *, last: bool) -> None:
+        if self._size is None:
+            if self._end is None:
+                self.end_group(origin=self._origin)  # first id to last
+            else:
+                self.end_group(base_id=self._start, slot_count=self._end - self._start, origin=self._origin)
+            return
+        lo = self._start + self._open * self._size
+        hi = min(lo + self._size, self._end) if self._end is not None else None if last else lo + self._size
+        self.end_group(base_id=lo, slot_count=None if hi is None else hi - lo, origin=self._origin)
+        self._open = None
+
+    def close(self) -> None:
+        if not self._closed and (self._size is None or self._open is not None):
+            self._close_group(last=True)
+        super().close()
 
 
 # ---------------------------------------------------------------------------
