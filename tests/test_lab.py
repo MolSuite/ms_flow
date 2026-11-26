@@ -446,3 +446,27 @@ def test_parts_go_into_containers_there_through_a_kill(request, said):
     kinds = sorted({name.rsplit(".", 1)[-1] for name in files})
     assert len(files) == 40 and kinds == ["arrows", "db", "index", "lock"], files  # each key: container, index, lock, catalog
     assert not [name for name in files if "/parts/" in name]
+
+
+def test_what_a_campaign_commits_there_comes_here_over_ssh(request, said):
+    """With a project open: the containers of the stage are registered here and brought every round
+    over the lab's ssh, and at the end the copies here are those there, byte for byte."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(said / "p")
+    try:
+        with lab_engine(said, far()) as engine:
+            job = Flow(engine, project).submit(lab_tasks.committing, params(request, n=40, nap=0.3), executor="far",
+                                               journal="j")
+            assert engine.wait(job, 600).status == "completed"
+        rows = [row for role in [f"k{k}" for k in range(4)] for row in catalog.files(project, catalog.shard_spec(role=role))]
+        assert len(rows) == 4 and all(not row["location"] for row in rows)
+        assert sum(catalog.count(project, catalog.shard_spec(role=f"k{k}")) for k in range(4)) == 40
+        for row in rows:
+            there = "/" + str(Path(row["path"]).relative_to(said / "p" / "hosts" / "far"))
+            assert lab(f"sha256sum {there}").split()[0] == __import__("hashlib").sha256(
+                Path(row["path"]).read_bytes()).hexdigest()
+    finally:
+        project.disconnect()
