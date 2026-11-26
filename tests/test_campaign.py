@@ -512,3 +512,14 @@ def test_connect_registers_without_copying_data(tmp_path, monkeypatch):
         assert {entry["path"] for result in GOT for entry in result["_committed"]} == {rows[0]["path"]}
     finally:
         project.disconnect()
+
+
+def test_a_job_on_ray_says_how_its_cluster_is():
+    c = Campaign.__new__(Campaign)
+    c.job, c.stages, c.steps = "9", [], []
+    c._why_from(b"123\n")
+    c._tell({"status": "running", "done": 3, "total": 10, "ray": {
+        "nodes": 1, "nodes_asked": 2, "cpus": 8, "cpus_busy": 6, "gpus": 0, "gpus_busy": 0,
+        "store_mb": 2000, "store_used_mb": 120}}, True)
+    assert c.note == ("running in the queue (job 9): 3 of 10 done · Ray: 1 of 2 nodes, 6 of 8 CPUs busy, "
+                      "store 120 of 2,000 MB")

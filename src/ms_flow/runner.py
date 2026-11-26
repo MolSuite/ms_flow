@@ -431,10 +431,33 @@ def found_there(folder, part: str) -> dict | None:
 
 
 _RAN_ON: dict = {}  # what this runner runs with, told with every progress (see `ran_on`)
+_RAY_NODES = 0  # on Ray: how many nodes the job asked for, and its state is told too (`ray_state`)
+
+
+def ray_state(nodes_asked: int) -> dict:
+    """How the Ray this runner drives is: its nodes alive of those the job asked for, CPUs and cards
+    busy of all, and its object store used, in MB. Read here, where the job runs."""
+    import ray
+
+    total, free, mb = ray.cluster_resources(), ray.available_resources(), 1 << 20
+
+    def busy(name):
+        return total.get(name, 0) - free.get(name, 0)
+
+    return {"nodes": sum(1 for node in ray.nodes() if node["Alive"]), "nodes_asked": int(nodes_asked),
+            "cpus": int(total.get("CPU", 0)), "cpus_busy": int(busy("CPU")),
+            "gpus": int(total.get("GPU", 0)), "gpus_busy": int(busy("GPU")),
+            "store_mb": int(total.get("object_store_memory", 0) // mb),
+            "store_used_mb": int(busy("object_store_memory") // mb)}
 
 
 def _tell(home: Path, **progress) -> None:
     told = {**progress, "home": str(home.resolve()), "at": time.time(), "ran_on": _RAN_ON}
+    if _RAY_NODES:
+        try:
+            told["ray"] = ray_state(_RAY_NODES)
+        except Exception:  # what it says of Ray never stops what it says of the job
+            pass
     (home / "progress.tmp").write_text(json.dumps(told))
     os.replace(home / "progress.tmp", home / "progress.json")
 
@@ -448,6 +471,8 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1, g
                            f"{_FORMAT}): submit the job again")
     if ray is not None and nodes > 1:
         _wait_for_nodes(ray, nodes)
+    global _RAY_NODES
+    _RAY_NODES = nodes if ray is not None else 0
     cpus = cpus or usable_cpus()
     if gpus is None:  # the cards the queue gave this job
         gpus = len([card for card in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if card.strip()])

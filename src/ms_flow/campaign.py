@@ -97,6 +97,15 @@ class Stage:
     commit: Optional[Callable] = None
 
 
+def _ray_said(ray: dict | None) -> str:
+    """What the runner said of its Ray, for the note: nothing when it runs without one."""
+    if not ray:
+        return ""
+    gpus = f", {ray['gpus_busy']} of {ray['gpus']} GPUs" if ray.get("gpus") else ""
+    return (f" · Ray: {ray['nodes']} of {ray['nodes_asked']} nodes, {ray['cpus_busy']} of {ray['cpus']} CPUs busy"
+            f"{gpus}, store {ray['store_used_mb']:,} of {ray['store_mb']:,} MB")
+
+
 _LET_GO = 120.0  # seconds a queue has to let a canceled job go before that is an error
 
 
@@ -690,7 +699,8 @@ class Campaign:
             stage = f"stage {told.get('stage')} ({told.get('stages_done', 0) + 1} of {len(self.stages)}): " \
                 if len(self.stages) > 1 else ""
             failed = f", {told['failed']} failed" if told.get("failed") else ""
-            self.note = f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} done{failed}"
+            self.note = (f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} "
+                         f"done{failed}{_ray_said(told.get('ray'))}")
         elif alive and not told:
             self.note = f"{self._waiting()} ({job}){self._because()}"
         elif alive:

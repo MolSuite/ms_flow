@@ -208,3 +208,17 @@ def test_a_kept_folder_has_its_own_catalog_and_the_next_campaign_finds_its_parts
     assert not list((second / "out" / "parts").iterdir())
     names = sorted(path.name for path in kept.iterdir() if not path.name.endswith(".lock"))
     assert sorted(name.rsplit(".", 1)[-1] for name in names) == ["arrows", "db", "index"], names
+
+
+def test_a_runner_on_ray_tells_how_its_cluster_is():
+    """What the runner says of the Ray it drives, with every progress: no ssh to a node needed."""
+    ray = pytest.importorskip("ray")
+    from ms_flow.runner import ray_state
+
+    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
+    try:
+        told = ray_state(nodes_asked=1)
+    finally:
+        ray.shutdown()
+    assert (told["nodes"], told["nodes_asked"], told["cpus"]) == (1, 1, 2)
+    assert 0 <= told["cpus_busy"] <= 2 and told["store_mb"] > 0 and 0 <= told["store_used_mb"] <= told["store_mb"]
