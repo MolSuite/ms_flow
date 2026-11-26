@@ -41,7 +41,7 @@ READABLE = (READY, SEALED)  # a read takes these; an append only READY
 GROUP_BITS = 20  # groups of a file: MAX_RECORDS (1 << 20) ids hold at most that many shards
 # Filters that name a shard, not a file: applied to the groups a file lists.
 _SHARD_FILTERS = ("scope", "shard_id")
-_COUNTS = ("n_shards", "n_records", "n_active", "scopes", "n_rows", "n_retired", "end")  # what a file says of itself
+_COUNTS = ("n_shards", "n_records", "n_active", "n_shards_excluded", "scopes", "n_rows", "n_retired", "end")  # what a file says of itself
 _COMMITTED = ("n_rows", "n_retired", "end")  # what only grows (I6)
 
 
@@ -296,13 +296,14 @@ def _counts(project_db, path: str | Path, exclusions=None, index=None) -> dict[s
         import pyarrow.parquet as pq
 
         rows = pq.ParquetFile(path).metadata.num_rows
-        return {"n_shards": 0, "n_records": rows, "n_active": rows, "scopes": ""}
+        return {"n_shards": 0, "n_records": rows, "n_active": rows, "n_shards_excluded": 0, "scopes": ""}
     info, table = index or container.read_index_table(path)  # in Arrow: no Python row per shard
     live = table.filter(pc.invert(table["retired"]))
     n_records = pc.sum(live["n_records"]).as_py() or 0
     scopes = sorted(pc.unique(live["scope"].drop_null()).to_pylist())
+    cut, cut_whole = _excluded(path, None, exclusions, project_db)
     return {"n_shards": live.num_rows, "n_records": n_records, **_committed(info, table),
-            "n_active": n_records - _excluded(path, None, exclusions, project_db),
+            "n_active": n_records - cut, "n_shards_excluded": cut_whole,
             "scopes": ",".join(str(s) for s in scopes)}
 
 
@@ -716,9 +717,10 @@ class PairWriter:
         return receipts
 
 
-def _excluded(path, groups, exclusions, project_db) -> int:
+def _excluded(path, groups, exclusions, project_db) -> tuple[int, int]:
     """How many usable records of ``groups`` (None: the file's live ones, read only when a cut
-    exists) the cuts hide: a cut naming a hole or a drop hides none."""
+    exists) the cuts hide, and how many of those shards they hide whole: a cut naming a hole or a
+    drop hides none."""
     import numpy as np
 
     from ms_flow.core.data.shard import file_groups, usable_ids
@@ -728,21 +730,24 @@ def _excluded(path, groups, exclusions, project_db) -> int:
 
         exclusions = active_exclusions(project_db)
     if not exclusions:
-        return 0
+        return 0, 0
     if groups is None:
         groups = [g for g in file_groups(path) if not g.retired]
-    total = 0
+    records = shards = 0
     for group in groups:
         if group.scope is None or not group.n_records:
             continue
         cut = exclusions.in_range(group.scope, group.base_id, group.base_id + group.slot_count)
         if len(cut):
-            total += len(np.intersect1d(cut, usable_ids(path, group), assume_unique=True))
-    return total
+            hidden = len(np.intersect1d(cut, usable_ids(path, group), assume_unique=True))
+            records += hidden
+            shards += hidden == group.n_records
+    return records, shards
 
 
 def refresh_active(project_db) -> None:
-    """``n_active`` of every ready file, after a cut was made or undone: one index read each."""
+    """``n_active`` and ``n_shards_excluded`` of every ready file, after a cut was made or undone:
+    one index read each."""
     from sqlmodel import select
 
     from ms_flow.core.data.exclusions import active_exclusions
@@ -756,7 +761,8 @@ def refresh_active(project_db) -> None:
                 groups = [g for g in file_groups(row.path) if not g.retired]
             except (OSError, ValueError):
                 continue  # a file gone missing is the reader's error to raise, not this one's
-            row.n_active = int(row.n_records) - _excluded(row.path, groups, exclusions, project_db)
+            cut, row.n_shards_excluded = _excluded(row.path, groups, exclusions, project_db)
+            row.n_active = int(row.n_records) - cut
             session.add(row)
         session.commit()
 
@@ -1162,6 +1168,41 @@ def underived(project_db, role: str, spec: QuerySpec | None = None, *, whole: bo
             yield row
 
 
+def progress(project_db, generation_id: int, role: str) -> dict[str, Any]:
+    """What a derived step has made of generation ``generation_id``, in the shape of
+    `states.progress`: its index is its state. Done = source shards with a shard of ``role`` (the
+    newest per origin), its records and its drops (the failed ones); totals = the source's. Reads
+    the indexes of ``role``'s files and the file rows; no data file. A task that failed wrote
+    nothing: its shards are not done and run again, so no shard counts as failed here."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX
+    from ms_flow.core.data.states import COMPLETE, PARTIAL, summary
+
+    made = [container.read_index_table(row["path"])[1]
+            for row in files(project_db, shard_spec(generation_id=int(generation_id), role=str(role)))
+            if str(row["path"]).endswith(SUFFIX)]
+    done_ = records = dropped = 0
+    if made:
+        table = pa.concat_tables([t.select(["origin", "n_records", "n_dropped", "retired"]) for t in made])
+        table = table.filter(pc.and_(pc.invert(table["retired"]), pc.is_valid(table["origin"])))
+        origins = table["origin"].to_numpy()
+        _, last = np.unique(origins[::-1], return_index=True)  # files in id order: the later wins
+        newest = table.take(len(origins) - 1 - last)
+        done_ = newest.num_rows
+        records = int(pc.sum(newest["n_records"]).as_py() or 0)
+        dropped = int(pc.sum(newest["n_dropped"]).as_py() or 0)
+    source = shard_spec(generation_id=int(generation_id), role=SOURCE)
+    shards_total, records_total = _sum(project_db, source, "n_shards"), _sum(project_db, source, "n_records")
+    return summary(kind=str(role), key="", status=COMPLETE if done_ >= (shards_total or 0) else PARTIAL,
+                   generation_id=int(generation_id), shards_done=done_, shards_failed=0,
+                   shards_total=shards_total, records_done=records, records_failed=dropped,
+                   records_total=records_total)
+
+
 def has_files(project_db, spec: QuerySpec | None = None) -> bool:
     """Is there any file at all (being written or ready) in the active generation."""
     return next(files(project_db, spec, page_size=1), None) is not None
@@ -1170,7 +1211,7 @@ def has_files(project_db, spec: QuerySpec | None = None) -> bool:
 __all__ = [
     "ContainerWriter", "FIELDS", "GROUP_BITS", "MAX_BYTES", "MAX_SHARDS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "adopt",
     "compact", "compact_tables", "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
-    "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
+    "progress", "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
     "underived",
     "update_file",
 ]
