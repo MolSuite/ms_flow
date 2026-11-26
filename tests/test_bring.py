@@ -78,6 +78,10 @@ def test_cleanup_never_takes_the_only_copy_silently(project, tmp_path):
     alone = _made_there(tmp_path / "far" / "c1", 2, "alone", start=10)
     locations.register_there(project, "far", brought + alone)
     locations.bring(project, far, _ids(project, "brought"), location="far")
+    planned = locations.cleanup(project, far, location="far", dry=True)  # what would go, nothing gone
+    assert {(Path(r["path"]).name.split(".")[0], r["verified"], r["removed"]) for r in planned} == {
+        ("brought", True, False), ("alone", False, False)}
+    assert Path(brought[0]["path"]).exists()
     said = locations.cleanup(project, far, location="far")
     assert {(Path(r["path"]).name.split(".")[0], r["verified"], r["removed"]) for r in said} == {
         ("brought", True, True), ("alone", False, False)}

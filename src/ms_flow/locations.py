@@ -262,11 +262,11 @@ def bring(project, remote, file_ids, *, location: str, piece: int = 64 << 20) ->
     return done
 
 
-def cleanup(project, remote, *, location: str, files=None, confirm: bool = False) -> list[dict]:
+def cleanup(project, remote, *, location: str, files=None, confirm: bool = False, dry: bool = False) -> list[dict]:
     """The copies of `location` (the host of `remote`) of this project's containers, or of `files`
     (catalog ids): each `{path, verified, removed}`. One whose copy here has the same index is
     removed there; one with no verified copy here only with `confirm`, and then, if it was only
-    there, its catalog row goes too."""
+    there, its catalog row goes too. `dry`: what would go, nothing removed."""
     from sqlmodel import select
 
     from ms_flow.core.data import container
@@ -294,7 +294,7 @@ def cleanup(project, remote, *, location: str, files=None, confirm: bool = False
                 verified = _same(container.read_index(row.path)[1], theirs.to_pylist())
             except (OSError, ValueError):
                 verified = False
-        removed = verified or confirm
+        removed = (verified or confirm) and not dry
         if removed:
             remote.remote.run(f"rm -f {shlex.quote(there)} {shlex.quote(there + '.index')}")
             forget(project, host, [there])

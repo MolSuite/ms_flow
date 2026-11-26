@@ -525,15 +525,15 @@ class WorkspaceJobApiMixin:
         return locations.bring(project.project_db, self.engine.executor(executor), list(files), location=executor)
 
     @hosted()
-    def clean_host(self, executor: str, files=None, confirm: bool = False) -> list[dict]:
+    def clean_host(self, executor: str, files=None, confirm: bool = False, dry: bool = False) -> list[dict]:
         """The copies on the queue `executor` of the active project's containers (or of `files`)
-        removed where a verified copy is here; the others only with `confirm` (see
-        `locations.cleanup`). What each was, `{path, verified, removed}`."""
+        removed where a verified copy is here; the others only with `confirm`; with `dry`, only
+        said (see `locations.cleanup`). What each was, `{path, verified, removed}`."""
         from ms_flow import locations
 
         project = self._require_active_project_runtime()
         return locations.cleanup(project.project_db, self.engine.executor(executor), location=executor,
-                                 files=files, confirm=confirm)
+                                 files=files, confirm=confirm, dry=dry)
 
     @hosted()
     def remove_remote_job(self, executor: str, dir: str) -> None:
