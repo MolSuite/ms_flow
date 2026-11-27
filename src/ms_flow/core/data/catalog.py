@@ -96,8 +96,12 @@ def create_generation(project_db, *, step: str, folder: str | Path = "", job_id:
         return int(row.id)
 
 
-def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None:
+def activate_generation(project_db, generation_id: int, *, on_drop=None, keep_previous: bool = False,
+                        drop: bool = True) -> None:
     """Make one generation the dataset and forget the ones outside the window, rows and files.
+
+    ``keep_previous``: the one active until now is `kept`, in the same transaction (a repack, D4).
+    ``drop=False``: nothing is forgotten (going back to a kept one deletes nothing).
 
     ``on_drop(session, files)``: the app's turn to clear what it keeps per file before a
     generation goes, in the same transaction; it returns the paths of files of its own to delete
@@ -120,9 +124,11 @@ def activate_generation(project_db, generation_id: int, *, on_drop=None) -> None
         if target is None:
             raise ValueError(f"No shard generation {generation_id} to activate.")
         for row in generations.values():
+            if keep_previous and row.is_active and row.id != target.id:
+                row.kept = True
             row.is_active = row.id == target.id
             session.add(row)
-        keep = {int(target.id)} | ({int(target.parent_id)} if target.parent_id is not None else set())
+        keep = set(generations) if not drop else {int(target.id)} | ({int(target.parent_id)} if target.parent_id is not None else set())
         keep |= {gen_id for gen_id, row in generations.items() if row.kept}
         doomed = [gen_id for gen_id in generations if gen_id not in keep | named]
         for row in generations.values():
