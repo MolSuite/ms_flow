@@ -194,7 +194,7 @@ def _zstd():
         # system one); the PyPI wheel carries its own zstd and does not care.
         hint = ""
         if "versions mismatch" in str(exc):
-            hint = (" (another library loaded a different libzstd first; the PyPI wheel carries its"
+            hint = (" (another package loaded a different libzstd first; the PyPI wheel carries its"
                     " own: pip install --force-reinstall --no-deps zstandard)")
         raise RuntimeError(f"zstd payloads need the zstandard package, which cannot load: {exc}{hint}") from exc
     return zstandard

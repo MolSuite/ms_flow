@@ -163,7 +163,7 @@ def test_a_zstandard_that_cannot_load_says_why(project, monkeypatch):
             reader.payloads.get(pid)
     finally:
         reader.dispose()
-    assert "another library loaded a different libzstd first" in str(caught.value)
+    assert "another package loaded a different libzstd first" in str(caught.value)
     assert "--force-reinstall --no-deps zstandard" in str(caught.value)
     assert caught.value.__cause__ is mismatch
     with pytest.raises(RuntimeError, match="cannot load: undefined symbol") as caught:
