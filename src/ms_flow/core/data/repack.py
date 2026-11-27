@@ -2,7 +2,7 @@
 fuller shards, every record id kept, and the old one kept.
 
     reason = offer(db)                  # None, or why not (a later step works on it)
-    new, elements = plan(db, folder, records=256)
+    new = start(db, folder)             # at submit; `elements(db, new, records=256)` in the job
     receipts = [part(e) for e in elements]   # by workers: the records re-encoded as parts (I12)
     ... committed into the new generation (`sinks.catalog_sink` / `catalog.ContainerWriter`)
     activate(db, new)                   # the previous one `kept`, in the same transaction
@@ -51,16 +51,28 @@ def offer(project_db) -> str | None:
     return None
 
 
-def plan(project_db, folder, *, records: int, max_slots: int = MAX_SLOTS) -> tuple[int, list[dict]]:
-    """A new generation (not active yet) and the elements that fill it: each a run of neighbouring
-    shards of the active one (same scope, id order) whose usable records are at most `records`,
-    spanning at most `max_slots` ids, with the ids its cuts leave out. A shard the cuts empty goes."""
+def start(project_db, folder) -> int:
+    """The new generation a repack fills (parented to the active one, not active yet), its parts
+    under `folder`. At submit: what a resumed job rebuilds its elements from (trap 17)."""
     reason = offer(project_db)
     if reason:
         raise ValueError(f"Not repacked: {reason}.")
-    shards = sorted(catalog.shards(project_db), key=lambda row: (row["scope"] or 0, row["base_id"]))
-    folder = Path(folder)
-    new = catalog.create_generation(project_db, step="repack", folder=str(folder))
+    return catalog.create_generation(project_db, step="repack", folder=str(folder))
+
+
+def elements(project_db, generation_id: int, *, records: int, max_slots: int = MAX_SLOTS) -> list[dict]:
+    """What fills `generation_id` (from `start`), the same every time it is asked: runs of
+    neighbouring shards of its parent (same scope, id order) holding at most `records` usable
+    records and spanning at most `max_slots` ids, each with the ids its cuts leave. A shard the
+    cuts empty goes."""
+    from ms_flow.core.database.project_models import ShardGeneration
+
+    with project_db.get_session() as session:
+        made = session.get(ShardGeneration, int(generation_id))
+    if made is None or made.parent_id is None:
+        raise ValueError(f"No repack generation {generation_id} to fill.")
+    spec = catalog.shard_spec(generation_id=int(made.parent_id))
+    shards = sorted(catalog.shards(project_db, spec), key=lambda row: (row["scope"] or 0, row["base_id"]))
     runs: list[list[dict]] = []
     used, scope = 0, object()
     for row in shards:  # already narrowed by the cuts: `n_records` usable, `record_ids` which
@@ -76,14 +88,17 @@ def plan(project_db, folder, *, records: int, max_slots: int = MAX_SLOTS) -> tup
                          "slot_count": row["slot_count"], "scope": row["scope"],
                          "keep": None if row.get("record_ids") is None else [int(i) for i in row["record_ids"]]})
         used += usable
-    elements = []
-    for run in runs:
-        base = run[0]["base_id"]
-        elements.append({"shards": run, "scope": run[0]["scope"], "base_id": base,
-                         "slot_count": run[-1]["base_id"] + run[-1]["slot_count"] - base,
-                         "out": str(folder / "parts"), "part": f"repack:{new}:{run[0]['scope']}:{base}",
-                         "generation_id": new})
-    return new, elements
+    out = str(Path(made.folder) / "parts")
+    return [{"shards": run, "scope": run[0]["scope"], "base_id": run[0]["base_id"],
+             "slot_count": run[-1]["base_id"] + run[-1]["slot_count"] - run[0]["base_id"], "out": out,
+             "part": f"repack:{generation_id}:{run[0]['scope']}:{run[0]['base_id']}", "generation_id": generation_id}
+            for run in runs]
+
+
+def plan(project_db, folder, *, records: int, max_slots: int = MAX_SLOTS) -> tuple[int, list[dict]]:
+    """`start` and its `elements`, at once."""
+    new = start(project_db, folder)
+    return new, elements(project_db, new, records=records, max_slots=max_slots)
 
 
 def part(element: dict) -> dict:
@@ -169,4 +184,4 @@ def delete(project_db, generation_id: int) -> None:
         catalog._unlink(path)
 
 
-__all__ = ["MAX_SLOTS", "activate", "delete", "go_back", "offer", "part", "plan"]
+__all__ = ["MAX_SLOTS", "activate", "delete", "elements", "go_back", "offer", "part", "plan", "start"]
