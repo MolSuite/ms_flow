@@ -8,14 +8,14 @@ database grows with the number of files while a read still hands out one row per
 active exclusions (`exclusions.py`). A caller never filters either itself.
 
 A shard's id is ``(file_id << 20) | group index``: an int for every payload and log, stable
-because a file never changes once it is ``ready`` (a rewrite is a new generation, and a
-compaction happens before a generation is read).
+because a file never changes once it is ``ready``: it only grows by appended shards, and
+`merge`, which moves shards to another file, leaves alone any file whose shards something names.
 
 A *derived* file is what a step made of source shards, with the same ids (``role`` names the
 step): each of its shards names the source shard it came from (``origin``). The catalog row is
 the state: a source shard is done for a step when a ready file of that role holds a shard with
 its origin (`derived`, `underived`); the newest file wins, so redoing a shard needs no edit of
-the older file, and `compact` drops the copy it shadows. A derived file takes the generation of
+the older file, and a merge leaves the shadowed copy out once it is retired. A derived file takes the generation of
 its source, so it goes with it.
 
 A *generation* is one rewrite of the whole dataset. A step that renumbers records writes a new
@@ -802,103 +802,6 @@ def refresh_active(project_db) -> None:
             session.add(row)
         session.commit()
 
-
-def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
-    """The small files of a generation (a worker's file per task) merged into big ones, up to
-    `MAX_RECORDS` ids per file, every shard kept as it was. Scopes share a file (a shard says its
-    scope); ids never do: a file whose ids another one in the bin already holds — a second
-    import, which restarts at 0 — goes to another. Returns how many files went. For the parent
-    once a step is done, before anything reads the generation.
-
-    Crash-safe in order: the big file is complete before a row points at it, and the small
-    files go only after the rows moved.
-    """
-    from uuid import uuid4
-
-    from sqlmodel import select
-
-    from ms_flow.core.data.shard import MAX_RECORDS, SUFFIX, file_groups, merge_shards
-    from ms_flow.core.database.project_models import CatalogFile
-
-    with project_db.get_session() as session:
-        # READY, not READABLE: a compaction deletes its inputs, and a sealed container stays as it shipped.
-        query = select(CatalogFile).where(CatalogFile.generation_id == int(generation_id),
-                                          CatalogFile.status == READY, CatalogFile.location == "")
-        if role is not None:
-            query = query.where(CatalogFile.role == str(role))
-        rows = list(session.exec(query).all())
-    listed = {}
-    newest: dict[tuple[str, int], int] = {}  # (role, origin) -> the newest file holding it
-    for row in sorted(rows, key=lambda r: int(r.id)):
-        path = Path(str(row.path))
-        if not path.is_file() or not row.n_shards:
-            continue  # ponytail: left as it is; a missing file is the reader's error to raise. A
-            # table file has no shards: `compact_tables` is its compaction.
-        listed[int(row.id)] = [g for g in file_groups(path) if not g.retired]
-        for group in listed[int(row.id)]:
-            if group.origin is not None:
-                newest[(str(row.role), group.origin)] = int(row.id)
-    groups: dict[tuple[str, str], list[tuple[int, int, Any]]] = {}
-    skip: set[tuple[str, int]] = set()  # shards a newer file of their role redid
-    empty = []  # files whose every shard was redone elsewhere: they just go
-    for row in rows:
-        if int(row.id) not in listed:
-            continue
-        kept = []
-        for group in listed[int(row.id)]:
-            if group.origin is not None and newest[(str(row.role), group.origin)] != int(row.id):
-                skip.add((str(row.path), group.shard))
-            else:
-                kept.append((group.shard, group))
-        if not kept:
-            if listed[int(row.id)]:
-                empty.append(row)
-            continue
-        lo, hi = min(g.base_id for _i, g in kept), max(g.base_id + g.slot_count for _i, g in kept)
-        spans = [(g.base_id, g.base_id + g.slot_count, index) for index, g in kept]
-        groups.setdefault((str(Path(str(row.path)).parent), str(row.role)), []).append((lo, hi, row, spans))
-    merged: list[tuple[list[Any], Path]] = []
-    for (folder, _role), members in groups.items():
-        # Ties by first scope: two imports both start at id 0, and each should keep to its own file.
-        members.sort(key=lambda item: (item[0], str(item[2].scopes)))
-        bins: list[list[tuple[int, int, Any, list]]] = []
-        for member in members:  # first bin it fits: no shard's ids taken there, inside its window
-            lo, hi, _row, spans = member
-            at = next((i for i, b in enumerate(bins)
-                       if max(hi, max(m[1] for m in b)) - min(lo, b[0][0]) <= MAX_RECORDS
-                       and not _overlaps(spans, b)), None)
-            if at is None:
-                bins.append([])
-                at = len(bins) - 1
-            bins[at].append(member)
-        for members_bin in bins:
-            if len(members_bin) < 2 and not any(key[0] == str(members_bin[0][2].path) for key in skip):
-                continue  # one file already, nothing in it redone elsewhere
-            dest = Path(folder) / f"merged_{uuid4().hex[:12]}{SUFFIX}"
-            # Shard by shard in id order: a redone shard sits between the ones of an older file.
-            parts = sorted((span, str(row.path)) for _lo, _hi, row, spans in members_bin for span in spans)
-            merge_shards([(path, span[2]) for span, path in parts], dest)
-            merged.append(([m[2] for m in members_bin], dest))
-    if empty:
-        merged.append((empty, None))
-    if not merged:
-        return 0
-    old = []
-    for members_bin, dest in merged:
-        if dest is not None:
-            add_file(project_db, dest, generation_id=int(generation_id), role=str(members_bin[0].role))
-        with project_db.get_session() as session:
-            for row in members_bin:
-                found = session.get(CatalogFile, int(row.id))
-                if found is not None:
-                    session.delete(found)
-                old.append(str(row.path))
-            session.commit()
-    for text in old:
-        _unlink(text)
-    return len(old)
-
-
 def referenced_shards(project_db):
     """Every shard id something of the project names, as a sorted numpy array: an origin, or the
     other part of a pair (``meta["bulk"]``), in the index of a container here, and a state
@@ -1028,77 +931,6 @@ def merge(project_db, generation_id: int | None, role: str) -> int:
             lock.close()
     return went
 
-
-def compact_tables(project_db, role: str, *, unique_by: Iterable[str] = (), stats: Iterable[str] = (),
-                   rows_per_group: int = 1 << 20) -> int:
-    """The table files of ``role`` (a task's file each) concatenated into one per generation and
-    folder: each file's rows stay one row group (or more, past ``rows_per_group``), statistics
-    only on the ``stats`` columns (a reader filters on those). With ``unique_by``, the row of the
-    newest file wins per value of those columns: a redo, or what a crash between `add_file` and
-    `states.mark_done` ran twice. Columns a file lacks are null; the newest file's schema
-    metadata is the merged one's. How many files went.
-
-    Streams file by file: only the ``unique_by`` columns of the whole role are held in memory.
-    Crash-safe in the order of `compact`.
-    """
-    from uuid import uuid4
-
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
-    from sqlmodel import select
-
-    from ms_flow.core.database.project_models import CatalogFile
-
-    with project_db.get_session() as session:
-        rows = list(session.exec(select(CatalogFile).where(  # READY: these files are rewritten (see `compact`)
-            CatalogFile.role == str(role), CatalogFile.status == READY, CatalogFile.n_shards == 0,
-        ).order_by(CatalogFile.id)).all())
-    bins: dict[tuple[Any, str], list[Any]] = {}
-    for row in rows:
-        if Path(str(row.path)).is_file():
-            bins.setdefault((row.generation_id, str(Path(str(row.path)).parent)), []).append(row)
-    unique_by, stats = list(unique_by), list(stats)
-    gone = 0
-    for (generation_id, folder), members in bins.items():
-        if len(members) < 2:
-            continue
-        paths = [str(row.path) for row in members]
-        schemas = [pq.read_schema(path) for path in paths]
-        schema = pa.unify_schemas(schemas).with_metadata(schemas[-1].metadata)
-        keep = None
-        if unique_by:
-            keys = pa.concat_tables([pq.read_table(path, columns=unique_by) for path in paths])
-            order = pa.array(range(keys.num_rows), pa.int64())
-            newest = keys.append_column("__row", order).group_by(unique_by).aggregate([("__row", "max")])
-            keep = pc.is_in(order, value_set=newest["__row_max"])
-        dest = Path(folder) / f"merged_{uuid4().hex[:12]}{Path(paths[0]).suffix}"
-        tmp = dest.with_name(dest.name + ".tmp")
-        offset = 0
-        with pq.ParquetWriter(tmp, schema, compression="zstd", write_statistics=stats or False) as writer:
-            for path in paths:
-                table = pq.read_table(path)
-                if keep is not None:
-                    mask, offset = keep.slice(offset, table.num_rows), offset + table.num_rows
-                    table = table.filter(mask)
-                if table.num_rows:
-                    table = pa.table([table[f.name] if f.name in table.column_names else pa.nulls(table.num_rows, f.type)
-                                      for f in schema], schema=schema)
-                    writer.write_table(table, row_group_size=int(rows_per_group))
-        tmp.replace(dest)
-        add_file(project_db, dest, generation_id=generation_id, role=str(role))
-        with project_db.get_session() as session:
-            for row in members:
-                found = session.get(CatalogFile, int(row.id))
-                if found is not None:
-                    session.delete(found)
-            session.commit()
-        for path in paths:
-            _unlink(path)
-        gone += len(members)
-    return gone
-
-
 def roles(project_db, *, generation_id: int | None = None) -> list[str]:
     """The roles the active generation (or the one named) has files of, sorted: what a view's
     selector lists. `SOURCE` first when it is there."""
@@ -1158,13 +990,6 @@ def remove(project_db, role: str) -> int:
         if path and path not in still:
             _unlink(path)
     return len(rows)
-
-
-def _overlaps(spans: list[tuple[int, int, int]], members: list) -> bool:
-    """Does any of ``spans`` share an id with the shards of ``members``. ponytail: pairwise, a
-    compaction sees tens of files; an interval tree if it ever sees thousands."""
-    return any(lo < b_hi and b_lo < hi for lo, hi, _n in spans for m in members for b_lo, b_hi, _m in m[3])
-
 
 def _pinned(project_db, spec: QuerySpec | None) -> QuerySpec:
     """Any read, on the active generation and on the source files. A spec that names a generation is
@@ -1376,7 +1201,8 @@ def has_files(project_db, spec: QuerySpec | None = None) -> bool:
 
 __all__ = [
     "ContainerWriter", "FIELDS", "GROUP_BITS", "MAX_BYTES", "MAX_SHARDS", "READABLE", "READY", "SEALED", "SOURCE", "StaleIndex", "TABLE", "WRITING", "activate_generation", "appender", "active_generation_id", "add_file", "add_remote", "adopt",
-    "compact", "compact_tables", "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
+    "count", "create_generation", "derived", "file_row", "files", "finish_file", "get_shard", "has_files",
+    "merge", "referenced_shards",
     "progress", "recount", "record_count", "refresh_active", "remove", "seal", "roles", "shard_id", "shard_spec", "shards", "split_shard_id", "sweep",
     "underived",
     "update_file",

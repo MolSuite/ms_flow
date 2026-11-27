@@ -159,53 +159,6 @@ def _no_decoding():
         patch.setattr(Shard, "open", refuse)
         yield
 
-
-def test_compact_merges_a_generations_files_scopes_together_ids_never(tmp_path):
-    db = _project(tmp_path)
-    try:
-        gen = catalog.create_generation(db, step="stats")
-        paths = []
-        for scope, base in ((1, 0), (1, 4), (2, 0), (3, 8)):
-            paths.append(_file(tmp_path / f"s{scope}_{base}.arrows", [(scope, base, base, base + 2)], step="stats"))
-        for path in reversed(paths):  # file order is not id order
-            catalog.add_file(db, path, generation_id=gen)
-
-        # Scope 3 (ids 8-11) joins scope 1 in one file; scope 2 reuses ids 0-3, so it stays apart.
-        with _no_decoding():
-            assert catalog.compact(db, gen) == 3
-        assert len(list(catalog.files(db, catalog.shard_spec(generation_id=gen)))) == 2
-        got = sorted(catalog.shards(db, catalog.shard_spec(generation_id=gen), whole=True),
-                     key=lambda r: (r["scope"], r["base_id"]))
-        assert [(r["scope"], r["base_id"], r["slot_count"], r["n_records"]) for r in got] == [
-            (1, 0, 4, 2), (1, 4, 4, 2), (2, 0, 4, 2), (3, 8, 4, 2)]
-        assert got[0]["path"] == got[1]["path"] == got[3]["path"] and not paths[0].exists()
-        with Shard.open(got[1]["path"], shard=got[1]["shard_index"]) as shard:
-            assert [r.load() for r in shard] == ["r1.4", "r1.6"] and shard.metadata["step"] == "stats"
-        assert catalog.compact(db, gen) == 0
-    finally:
-        db.disconnect()
-
-
-def test_compact_copies_bytes(tmp_path):
-    """A shard moves into the big file as the bytes it was written with: nothing is decoded."""
-    from ms_flow.core.data import container
-
-    db = _project(tmp_path)
-    try:
-        gen = catalog.create_generation(db, step="stats")
-        paths = [_file(tmp_path / f"p{base}.arrows", [(1, base, base, base + 1)]) for base in (0, 4, 8)]
-        for path in paths:
-            catalog.add_file(db, path, generation_id=gen)
-        before = [bytes(container.read_raw(path, container.read_index(path)[1][0])) for path in paths]
-        with _no_decoding():
-            assert catalog.compact(db, gen) == 3
-        merged = next(catalog.files(db, catalog.shard_spec(generation_id=gen)))["path"]
-        rows = container.read_index(merged)[1]
-        assert [bytes(container.read_raw(merged, row)) for row in rows] == before
-    finally:
-        db.disconnect()
-
-
 def test_a_file_of_another_host_is_listed_but_not_read_until_it_is_adopted(tmp_path):
     """What a step wrote there and left there: its row says the host, so nothing here opens it;
     brought back, it is local, with the counts its header says."""

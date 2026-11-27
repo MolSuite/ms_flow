@@ -39,39 +39,6 @@ def _task(db, folder, key, shards, gen, n, *, crash=False, value=0):
     if not crash:
         states.mark_done(db, "step", key, [s["id"] for s in shards], total=6, generation_id=gen)
 
-
-def test_tasks_per_key_compact_to_one_file_and_a_crash_leaves_no_duplicate(tmp_path):
-    db = _project(tmp_path)
-    try:
-        gen = _source(db, tmp_path)
-        shards = list(catalog.shards(db))
-        assert len(shards) == 6
-        for key in ("a", "b"):
-            for n in range(3):
-                _task(db, tmp_path, key, shards[2 * n:2 * n + 2], gen, n, crash=(key == "b" and n == 1))
-        (row,) = [r for r in catalog.files(db, catalog.shard_spec(role="table:a"))][:1]
-        assert (row["n_shards"], row["n_records"]) == (0, 8)
-        # "b" died after registering its second file: those shards run again.
-        redo = states.pending(db, "step", "b", [s["id"] for s in shards])
-        assert redo == [s["id"] for s in shards[2:4]]
-        _task(db, tmp_path, "b", shards[2:4], gen, 3, value=1)
-
-        for key in ("a", "b"):
-            catalog.compact_tables(db, f"table:{key}", unique_by=["record"], stats=["record"])
-            (made,) = list(catalog.files(db, catalog.shard_spec(role=f"table:{key}")))
-            table = pq.read_table(made["path"])
-            assert sorted(table["record"].to_pylist()) == list(range(24)) and made["n_records"] == 24
-            assert states.pending(db, "step", key, [s["id"] for s in shards]) == []
-            assert {p["key"]: p["status"] for p in states.progress(db, "step")}[key] == "complete"
-        b = pq.read_table(next(catalog.files(db, catalog.shard_spec(role="table:b")))["path"]).to_pylist()
-        assert {r["value"] for r in b if 8 <= r["record"] < 16} == {1}  # the redo won
-        # Table files are no shards: the shard reads, and their compaction, never see them.
-        assert len(list(catalog.shards(db, catalog.shard_spec(role="table:a")))) == 0
-        assert catalog.compact(db, gen, role="table:a") == 0
-    finally:
-        db.dispose()
-
-
 def test_a_cut_then_undo_leaves_only_the_narrowed_shards_pending(tmp_path):
     db = _project(tmp_path)
     try:
