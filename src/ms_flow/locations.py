@@ -96,7 +96,8 @@ def reconcile(project, remote) -> list[str]:
         return []
     listing = "".join(f"{size} {path}\n" for path, (size, _) in recorded.items()).encode()
     said = remote.remote.run(f"cd {shlex.quote(root(remote, project))} 2>/dev/null || exec cat; "
-                             "while read -r s p; do [ \"$(stat -c %s -- \"$p\" 2>/dev/null)\" = \"$s\" ] || "
+                             # `stat -c` is GNU's, `-f %z` the BSD one (macOS).
+                             "while read -r s p; do [ \"$(stat -c %s -- \"$p\" 2>/dev/null || stat -f %z -- \"$p\" 2>/dev/null)\" = \"$s\" ] || "
                              "printf '%s %s\\n' \"$s\" \"$p\"; done", listing).decode()
     gone = {name for line in said.splitlines() if line.strip() for name in whole(line.partition(" ")[2])}
     gone = sorted(gone & recorded.keys())

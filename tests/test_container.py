@@ -500,10 +500,9 @@ _PEAK = textwrap.dedent('''
     sys.path.insert(0, sys.argv[1])
     import pyarrow as pa
     from ms_flow.core.data import container as c
-    def peak():
-        for line in open("/proc/self/status"):
-            if line.startswith("VmHWM"):
-                return int(line.split()[1]) / 1024  # MiB
+    import resource
+    def peak():  # MiB: VmHWM; kB on Linux, bytes on macOS
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 20 if sys.platform == "darwin" else 1024)
     path = Path(sys.argv[3])
     if sys.argv[2] == "append":
         target = c.Appender(path)
