@@ -88,7 +88,7 @@ def elements(project_db, generation_id: int, *, records: int, max_slots: int = M
                          "slot_count": row["slot_count"], "scope": row["scope"],
                          "keep": None if row.get("record_ids") is None else [int(i) for i in row["record_ids"]]})
         used += usable
-    out = str(Path(made.folder) / "parts")
+    out = str(made.folder)  # the containers go beside their parts (`sinks.catalog_sink`)
     return [{"shards": run, "scope": run[0]["scope"], "base_id": run[0]["base_id"],
              "slot_count": run[-1]["base_id"] + run[-1]["slot_count"] - run[0]["base_id"], "out": out,
              "part": f"repack:{generation_id}:{run[0]['scope']}:{run[0]['base_id']}", "generation_id": generation_id}
