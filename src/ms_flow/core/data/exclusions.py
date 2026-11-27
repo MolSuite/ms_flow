@@ -113,7 +113,8 @@ class Exclusions:
         ids = self.by_scope.get(int(scope))
         if ids is None:
             return np.empty(0, dtype=np.uint64)
-        return ids[np.searchsorted(ids, lo):np.searchsorted(ids, hi)]
+        kind = ids.dtype.type  # a Python int against uint64 makes numpy convert the whole array
+        return ids[np.searchsorted(ids, kind(max(int(lo), 0))):np.searchsorted(ids, kind(max(int(hi), 0)))]
 
     def narrow(
         self,
@@ -178,8 +179,12 @@ def _id_range(row: Mapping[str, Any], path_key: str) -> tuple[int, int]:
     return min(g.base_id for g in groups), max(g.base_id + g.slot_count for g in groups)
 
 
+_KNOWN: dict = {}  # (project root, the active cuts and their files) -> their union, per process
+
+
 def active_exclusions(project_db) -> Exclusions:
-    """What is out now: the union of every active cut, read once per call."""
+    """What is out now: the union of every active cut, read again only when a cut or its file
+    changed (a read of the library asks for it every time)."""
     import numpy as np
     import pyarrow.parquet as pq
 
@@ -187,16 +192,29 @@ def active_exclusions(project_db) -> Exclusions:
     if not rows:
         return Exclusions()
     root = _root(project_db)
+    files = [(int(row.id), root / row.path) for row in rows]
+    key = (str(root), tuple((cut, path.stat().st_mtime_ns, path.stat().st_size) for cut, path in files))
+    if key in _KNOWN:
+        return _KNOWN[key]
     parts: dict[int, list] = {}
-    for row in rows:
-        table = pq.read_table(root / row.path)
+    for _cut, path in files:
+        table = pq.read_table(path)
         scope, ids = table["scope"].to_numpy(), table["id"].to_numpy()
-        for value in np.unique(scope):
-            parts.setdefault(int(value), []).append(ids[scope == value])
+        if scope.size and np.all(scope[:-1] <= scope[1:]):  # as `exclude` writes it: scopes in a row
+            edges = np.flatnonzero(np.diff(scope)) + 1
+            for start, end in zip(np.r_[0, edges], np.r_[edges, scope.size]):
+                parts.setdefault(int(scope[start]), []).append(ids[start:end])
+        else:
+            for value in np.unique(scope):
+                parts.setdefault(int(value), []).append(ids[scope == value])
     # ponytail: the whole union in memory (8 bytes an id: 650k ids = 5 MB). Compact the cut
     # files into one when they pile up; stream per scope if a union reaches hundreds of millions.
-    return Exclusions({scope: np.unique(np.concatenate(arrays)) for scope, arrays in parts.items()},
-                      cuts=[int(row.id) for row in rows])
+    # One cut is sorted and unique already (`exclude` writes it so): only a union needs `unique`.
+    union = Exclusions({scope: arrays[0] if len(arrays) == 1 else np.unique(np.concatenate(arrays))
+                        for scope, arrays in parts.items()}, cuts=[cut for cut, _path in files])
+    _KNOWN.clear()  # ponytail: one project's union kept, the last one asked for
+    _KNOWN[key] = union
+    return union
 
 
 __all__ = ["Exclusions", "active_exclusions", "exclude", "list_exclusions", "set_exclusion_active"]
