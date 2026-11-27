@@ -27,3 +27,17 @@ def isolated_workspace(tmp_path_factory, monkeypatch):
     empty = tmp_path_factory.mktemp("empty_workspace")
     monkeypatch.setenv("MS_FLOW_WORKSPACE_ROOT", str(empty))
     monkeypatch.delenv("MSFLOW_ENGINE_HOST", raising=False)  # inline unless a test says (`test_engine_host.py`)
+
+
+# In parallel (`-n 8 --dist loadgroup`) these go to one worker, one after another: they start a
+# local Ray cluster (two Rays of this machine at once meet each other), or they read this
+# machine's `none` queue, which lists every job of it, another test's too (`test_remote.py`).
+_RAY = {"test_engine_core.py", "test_hosts_executors.py", "test_files.py", "test_payloads_jobs.py",
+        "test_payloads_read.py", "test_runner.py", "test_ray_transfer.py", "test_remote.py"}
+
+
+@pytest.hookimpl(tryfirst=True)  # before xdist reads the group
+def pytest_collection_modifyitems(items):
+    for item in items:
+        if item.path.name in _RAY:
+            item.add_marker(pytest.mark.xdist_group("ray_cluster"))

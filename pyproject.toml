@@ -71,6 +71,9 @@ testpaths = ["tests"]
 # `ms_flow` vive en src/ y los benchmarks en benchmarks/. Con esto pytest los pone en
 # sys.path el solo: ningun test necesita tocar sys.path a mano.
 pythonpath = ["src", "."]
+# In parallel: `pytest -n 8 --dist loadgroup` (tests/conftest.py groups the Ray and queue modules).
+timeout = 300
+timeout_method = "thread"
 markers = [
     "slow: tarda segundos (benchmarks y escenarios de concurrencia). Excluir con -m 'not slow'.",
     "lab: needs the vHPC lab (MS_FLOW_LAB=<its lab/ dir>); skipped without it. Run with -m lab.",
