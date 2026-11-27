@@ -184,7 +184,7 @@ _KNOWN: dict = {}  # (project root, the active cuts and their files) -> their un
 
 def active_exclusions(project_db) -> Exclusions:
     """What is out now: the union of every active cut, read again only when a cut or its file
-    changed (a read of the library asks for it every time)."""
+    changed (every read of the dataset asks for it)."""
     import numpy as np
     import pyarrow.parquet as pq
 
