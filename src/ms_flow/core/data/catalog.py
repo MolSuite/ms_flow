@@ -893,6 +893,136 @@ def compact(project_db, generation_id: int, *, role: str | None = None) -> int:
     return len(old)
 
 
+def referenced_shards(project_db):
+    """Every shard id something of the project names, as a sorted numpy array: an origin, or the
+    other part of a pair (``meta["bulk"]``), in the index of a container here, and a state
+    (`states`). A merge leaves their containers as they are: it changes shard ids.
+    ponytail: an app that keeps shard ids in tables of its own must not merge those roles."""
+    import json
+
+    import numpy as np
+    from sqlmodel import select
+
+    from ms_flow.core.data import container, states
+    from ms_flow.core.database.project_models import CatalogFile
+
+    with project_db.get_session() as session:
+        paths = session.exec(select(CatalogFile.path).where(CatalogFile.location == "")).all()
+    found = []
+    for path in paths:
+        if not Path(str(path)).is_file():
+            continue
+        _info, table = container.read_index_table(path)
+        origins = table["origin"].drop_null().to_numpy()
+        found.append(origins.astype(np.int64))
+        for meta in table["meta"].drop_null().to_pylist():  # ponytail: only the rows that have one
+            if '"bulk"' in meta:
+                found.append(np.asarray(json.loads(meta)["bulk"], dtype=np.int64))
+    for row in states.progress(project_db):
+        found.append(states._table(project_db, row["kind"], row["key"])["shard"].to_numpy().astype(np.int64))
+    return np.unique(np.concatenate(found)) if found else np.empty(0, dtype=np.int64)
+
+
+def merge(project_db, generation_id: int | None, role: str) -> int:
+    """The containers of ``(generation, role)`` here merged into as few as their bound allows
+    (I18): the small ones and those with retired shards, their live shards copied as bytes (I12),
+    the retired left out. Returns how many containers went.
+
+    It changes shard ids, so it leaves as they are: a container one of whose shards something
+    names (`referenced_shards`), one with a copy on another host (``ms_locations``) or brought
+    from one (`locations.bring` keeps it as it is there), and a folder whose writer runs now (its
+    lock). For when no job reads them: the caller sees to that.
+
+    A kill leaves one readable copy: the new containers are whole before their rows exist, the
+    rows swap in one transaction, and the old files go after it (`sweep` finds either leftover).
+    """
+    import uuid
+
+    import numpy as np
+    import pyarrow.ipc as ipc
+    from sqlmodel import select
+
+    from ms_flow.core.data import container
+    from ms_flow.core.data.shard import SUFFIX
+    from ms_flow.core.database.project_models import CatalogFile, RemoteLocation
+    from ms_flow.engine.journal import Busy, own
+
+    with project_db.get_session() as session:
+        rows = list(session.exec(select(CatalogFile).where(
+            CatalogFile.generation_id == generation_id, CatalogFile.role == str(role),
+            CatalogFile.status.in_(READABLE), CatalogFile.location == "").order_by(CatalogFile.id)).all())
+        elsewhere = set(session.exec(select(RemoteLocation.path)).all())
+    project_dir = Path(getattr(project_db, "project_dir", "") or "")
+    hosts = project_dir / "hosts"
+    refs = referenced_shards(project_db)
+    by_folder: dict[str, list] = {}
+    for row in rows:
+        path = Path(str(row.path))
+        if not path.is_file() or str(path).startswith(f"{hosts}/"):
+            continue
+        try:
+            inside = path.resolve().relative_to(project_dir.resolve()).as_posix() if project_dir.parts else None
+        except ValueError:
+            inside = None
+        if inside is not None and inside in elsewhere:
+            continue
+        info, index = container.read_index(path)
+        ids = np.asarray([shard_id(int(row.id), r["shard"]) for r in index], dtype=np.int64)
+        if ids.size and np.isin(ids, refs).any():
+            continue
+        live = [r for r in index if not r["retired"]]
+        if len(live) >= MAX_SHARDS and len(live) == len(index):
+            continue  # full, nothing dead in it
+        by_folder.setdefault(str(path.parent), []).append((row, path, info, live, len(index) - len(live)))
+    went = 0
+    name = __import__("re").sub(r"[^A-Za-z0-9._-]+", "_", str(role))
+    for folder, members in by_folder.items():
+        if len(members) < 2 and not any(dead for *_rest, dead in members):
+            continue
+        try:
+            lock = own(_lock_path(folder, role, generation_id))
+        except Busy:
+            continue  # its writer appends now
+        try:
+            made, old = [], []
+            by_head: dict[bytes, list] = {}
+            for member in members:
+                by_head.setdefault(bytes(container.read_head(member[1], member[2])), []).append(member)
+            for head, group in by_head.items():
+                bins, used, size = [[]], 0, 0
+                for member in group:
+                    length = sum(r["length"] for r in member[3])
+                    if bins[-1] and (used + len(member[3]) > MAX_SHARDS or size + length > MAX_BYTES):
+                        bins.append([])
+                        used, size = 0, 0
+                    bins[-1].append(member)
+                    used, size = used + len(member[3]), size + length
+                for members_bin in bins:
+                    dest = Path(folder) / f"{name}.{uuid.uuid4().hex[:16]}{SUFFIX}"
+                    appender = container.Appender.create(dest, ipc.read_schema(ipc.read_message(head)),
+                                                         members_bin[0][2].get("app"))
+                    appender.commit(({**r}, container._blocks(path, r)) for _row, path, _info, live, _d in members_bin
+                                    for r in live)
+                    made.append(dest)
+                    old += [member[0] for member in members_bin]
+            _step("merge:written")
+            with project_db.get_session() as session:
+                for dest in made:
+                    counts = {k: v for k, v in _counts(project_db, dest).items() if k in _COUNTS}
+                    session.add(CatalogFile(generation_id=generation_id, role=str(role), path=str(dest),
+                                            status=READY, location="", **counts))
+                for row in old:
+                    session.delete(session.get(CatalogFile, int(row.id)))
+                session.commit()  # the swap: either every old row or every new one
+            _step("merge:swapped")
+            for row in old:
+                _unlink(row.path)
+            went += len(old)
+        finally:
+            lock.close()
+    return went
+
+
 def compact_tables(project_db, role: str, *, unique_by: Iterable[str] = (), stats: Iterable[str] = (),
                    rows_per_group: int = 1 << 20) -> int:
     """The table files of ``role`` (a task's file each) concatenated into one per generation and
