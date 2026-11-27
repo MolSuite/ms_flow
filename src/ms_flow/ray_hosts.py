@@ -7,6 +7,7 @@ by it on the ports Ray opens. They join when the executor is made and leave when
 from __future__ import annotations
 
 import logging
+import platform
 import shlex
 import socket
 import time
@@ -67,10 +68,22 @@ class RayOverHosts(RayExecutor):
                  for cpus, gpus, memory_gb in limits or [(0, 0, 0)] * len(hosts)]
         # ponytail: by hostname, so two machines that share one are shown as the first of them.
         called = {socket.gethostname(): "local"}
-        for (host, _ray_there), name in zip(self._hosts, names or hosts, strict=True):
+        from ray import __version__ as ray_here
+
+        here = (platform.python_version(), ray_here)
+        for (host, _ray_there), there, name in zip(self._hosts, envs, names or hosts, strict=True):
             # ponytail: Slurm is the one told apart there (`job_api._login_node` tells SGE too); warned, not refused.
-            said = host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURMD_NODENAME" ] && echo @login; hostname',
-                            timeout=60).decode().split()
+            python = shlex.quote(f"{there}/bin/python")
+            said = host.run('command -v sbatch >/dev/null 2>&1 && [ -z "$SLURMD_NODENAME" ] && echo @login; hostname; '
+                            f'{python} -c "import sys, ray; print(sys.version.split()[0], ray.__version__)" '
+                            '2>/dev/null || echo - -', timeout=60).decode().split()
+            # Ray refuses a node whose Python patch differs, only after `join_seconds` and saying nothing.
+            found = tuple(said[-2:])
+            del said[-2:]
+            if found != here:
+                has = f"no Python with Ray in {there}" if found[0] == "-" else f"Python {found[0]} and Ray {found[1]}"
+                raise HostError(f"{host.address} has {has}; this machine has Python {here[0]} and Ray {here[1]}. "
+                                "Ray needs the same on every machine: prepare the host again.")
             if said[0] == "@login":
                 said.pop(0)
                 log.warning("%s is the login node of a Slurm cluster: the Ray tasks that run there share it with "

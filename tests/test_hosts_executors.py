@@ -340,6 +340,32 @@ def test_a_machine_joins_with_the_token_of_this_ray_through_stdin(monkeypatch):
     assert stdin == b"a" * 32 and "a" * 32 not in words and words.endswith('RAY_AUTH_TOKEN="$(cat)" ')
 
 
+def test_a_machine_with_another_python_or_ray_is_refused_before_ray_starts(monkeypatch):
+    """Ray refuses a node whose Python patch differs, after `join_seconds` and with no reason:
+    an env set by hand (not made by ms_env) is asked first, in the ssh call that asks its name."""
+    import platform
+
+    ray = pytest.importorskip("ray")
+    from ms_env import HostError
+
+    from ms_flow import ray_hosts
+
+    asked = []
+
+    class Far:
+        def __init__(self, address):
+            self.address = address
+
+        def run(self, command, data=b"", timeout=600):
+            asked.append(command)
+            return f"laptop\n3.12.12 {ray.__version__}\n".encode()
+
+    monkeypatch.setattr(ray_hosts, "Host", Far)
+    with pytest.raises(HostError, match=rf"Python 3\.12\.12 .*Python {platform.python_version()}"):
+        ray_hosts.RayOverHosts(["laptop"], "/far/env")
+    assert len(asked) == 1 and "/far/env/bin/python" in asked[0]  # no `ray start`, no Ray here
+
+
 def test_a_login_node_is_told_apart(monkeypatch):
     from ms_flow._api_impl import job_api
 

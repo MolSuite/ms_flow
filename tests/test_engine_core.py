@@ -258,6 +258,23 @@ def test_an_executor_that_does_its_own_accounting_is_told_what_each_chunk_needs(
     assert sorted(costed.costs) == [(2, 0, 0), (2, 1, 0), (3, 0, 50)]
 
 
+def test_tasks_must_fit_cpu_and_memory_on_the_same_node():
+    costed = _Costed()
+    costed.node_resources = lambda **_: ((4, 0, 8192), (4, 0, 8192), (4, 0, 8192), (8, 0, 1024))
+    with Engine() as engine:
+        engine.register("ray", costed)
+        with pytest.raises(ValueError, match="no single node"):
+            engine.submit("ray", _echo, [{"n": 1}], cpu=6, mem_mb=2048)
+        errors = []
+        chunks = [{"n": 1, "_cpu_required": 6, "_mem_mb": 2048}, {"n": 2, "_cpu_required": 6}]
+        ended = engine.wait(engine.submit("ray", _echo, chunks,
+                                         on_error=lambda _, error: errors.append(error)), 5)
+        assert ended.chunks_failed == 1
+        assert ended.chunks_done == 1
+        assert "no single node" in errors[0]
+    assert costed.costs == [(6, 0, 0)]
+
+
 def test_an_executor_with_a_total_gets_only_the_tasks_it_has_room_for():
     """Ray with 4 CPUs and one GPU took 4 GPU tasks at once and ran one: the other three waited
     in its queue, counted as running. With its total said, the engine hands it one at a time."""

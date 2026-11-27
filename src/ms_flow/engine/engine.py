@@ -190,7 +190,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "came_after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "auto", "source", "fine", "needs", "key", "label", "thread",
-                 "states", "executor", "usage", "held", "far", "canceling")
+                 "states", "executor", "usage", "held", "far", "canceling", "node_resources")
 
     def used(self) -> dict:
         """`usage` up to now, with what it holds at this moment counted until now."""
@@ -263,8 +263,7 @@ def _room(slot: _Slot, needs) -> bool:
     tasks asked for: one it has no room for waits in its queue, counted as running all the while.
     The caller lets a task through when the executor runs nothing, a need larger than the whole
     included, for the executor to judge."""
-    # ponytail: summed over the cluster, so a task that fits no single node (64 CPUs on two of
-    # 32) still waits in Ray; per-node room if that shows up.
+    # Aggregate room is a dispatch hint. Node fit is checked separately.
     total = getattr(slot.impl, "total", None)
     return total is None or all(h + n <= t for h, n, t in zip(slot.held, needs, total) if n)
 
@@ -277,6 +276,14 @@ def _at_once(slot: _Slot, needs, tokens=None) -> int:
         if n:
             most = min(most, int(t // n))
     return max(1, most)
+
+
+def _node_fit_error(executor, needs, nodes) -> str | None:
+    if nodes is None or any(all(limit is None or need <= limit for need, limit in zip(needs, node))
+                            for node in nodes):
+        return None
+    return (f"Task needs (CPU, GPU, MiB)={needs}, but no single node of executor {executor!r} "
+            f"can fit it. Node capacities: {sorted(set(nodes), key=repr)}.")
 
 
 def _take(slot: _Slot, needs, sign: int) -> None:
@@ -495,6 +502,17 @@ class Engine:
         """The executor registered as `name`."""
         return self._executors[name].impl
 
+    def executor_node_resources(self, name: str, *, resources=None, key=None) -> tuple | None:
+        """Total (CPU, GPU, MiB) per node, before subtracting running tasks.
+
+        An unknown resource is None. An executor with unknown topology returns None.
+        `resources` can override the requests of a queue, as in Flow.submit.
+        """
+        executor = self.executor(name)
+        if hasattr(executor, "node_resources"):
+            return executor.node_resources(resources=resources, key=key)
+        return (self.tokens.total,) if executor.uses_tokens else None
+
     def attach(self, name: str, path) -> None:
         """Open the journal at `path`; jobs submitted with `journal=name` are recorded in it.
 
@@ -628,6 +646,9 @@ class Engine:
         if job.cost is not None and not self.tokens.ever_fits(job.cost):
             raise ValueError(f"a chunk needing (cpu, gpu, mem_mb)={job.cost} can never run: "
                              f"the engine has {self.tokens.total}")
+        job.node_resources = self.executor_node_resources(executor, key=job.key) if job.cost is None else None
+        if error := _node_fit_error(job.executor, job.needs, job.node_resources):
+            raise ValueError(error)
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.batch, job.batched, job.fine, job.label = batch or 0, batched, progress, label
         job.thread = thread and slot.threads
@@ -1150,6 +1171,14 @@ class Engine:
                 return False
         chunk = ready[0]
         cost = chunk.cost
+        if (chunk.needs != job.needs
+                and (error := _node_fit_error(job.executor, chunk.needs, job.node_resources))):
+            ready.popleft()
+            job.seq += 1
+            job.open += 1
+            self._settle(job, chunk.key, 1, error, n=chunk.n)
+            job.room.set()
+            return True
         if slot.inflight and not _room(slot, chunk.needs):
             return False
         if cost is not None and self.tokens.ever_fits(cost) and (
