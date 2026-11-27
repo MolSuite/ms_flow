@@ -140,7 +140,7 @@ def _zstandard_fails(monkeypatch, error):
 
 
 def test_a_missing_zstandard_says_what_to_install(project, monkeypatch):
-    (pid,) = put(project, [Payload(molecule(1))])
+    (pid,) = put(project, [Payload(specimen(1))])
     _zstandard_fails(monkeypatch, ModuleNotFoundError("No module named 'zstandard'", name="zstandard"))
     reader = ProjectStore.open_at(project.db_path)
     try:
@@ -152,7 +152,7 @@ def test_a_missing_zstandard_says_what_to_install(project, monkeypatch):
 
 def test_a_zstandard_that_cannot_load_says_why(project, monkeypatch):
     """Installed but not loadable: the reason is in the message, not "pip install zstandard"."""
-    (pid,) = put(project, [Payload(molecule(1))])
+    (pid,) = put(project, [Payload(specimen(1))])
     mismatch = ImportError("zstd C API versions mismatch; Python bindings were not compiled/linked against "
                            "expected zstd version (10408 returned by the lib, 10507 hardcoded in zstd headers, "
                            "10506 hardcoded in the cext)")
