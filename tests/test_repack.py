@@ -1,4 +1,4 @@
-"""M12b: after a strong cut, a library repacked into a new generation of fuller shards, record ids
+"""M12b: after a strong cut, a dataset repacked into a new generation of fuller shards, record ids
 kept; the previous one kept, gone back to without deleting anything, deleted only when nothing
 names it."""
 import numpy as np
@@ -11,8 +11,8 @@ from ms_flow.core.database import ProjectStore
 SHARDS, SLOTS = 8, 32
 
 
-def _library(tmp_path):
-    """An imported library: 8 shards of 32 records (scope 1), ids 0..255, one container."""
+def _dataset(tmp_path):
+    """An imported dataset: 8 shards of 32 records (scope 1), ids 0..255, one container."""
     db = ProjectStore()
     db.connect(tmp_path / "project")
     gen = catalog.create_generation(db, step="import")
@@ -38,7 +38,7 @@ def _cut(db, keep_every=4):
 
 
 def _records(db):
-    """{id: bytes} of every usable record of the active generation's library."""
+    """{id: bytes} of every usable record of the active generation."""
     from ms_flow.core.data.shard import Shard
 
     out = {}
@@ -62,7 +62,7 @@ def _repacked(db, tmp_path, records=32):
 
 
 def test_repack_keeps_every_record_id(tmp_path):
-    db, old = _library(tmp_path)
+    db, old = _dataset(tmp_path)
     try:
         _cut(db)
         before = _records(db)
@@ -78,7 +78,7 @@ def test_repack_keeps_every_record_id(tmp_path):
 
 
 def test_repack_is_not_offered_under_later_steps(tmp_path):
-    db, gen = _library(tmp_path)
+    db, gen = _dataset(tmp_path)
     try:
         assert repack.offer(db) is None
         states.mark_done(db, "docked", "k", [catalog.shards(db).__next__()["id"]], generation_id=gen)
@@ -92,7 +92,7 @@ def test_repack_is_not_offered_under_later_steps(tmp_path):
 
 
 def test_the_previous_generation_stays_if_kept(tmp_path):
-    db, old = _library(tmp_path)
+    db, old = _dataset(tmp_path)
     try:
         _cut(db)
         paths = [row["path"] for row in catalog.files(db, catalog.shard_spec(generation_id=old))]
@@ -107,7 +107,7 @@ def test_the_previous_generation_stays_if_kept(tmp_path):
 
 
 def test_going_back_deletes_nothing(tmp_path):
-    db, old = _library(tmp_path)
+    db, old = _dataset(tmp_path)
     try:
         _cut(db)
         new = _repacked(db, tmp_path)
@@ -123,7 +123,7 @@ def test_going_back_deletes_nothing(tmp_path):
 def test_undo_works_after_going_back(tmp_path):
     """The repack left the cut records out; going back to the one before, undoing the cut brings
     them all back."""
-    db, old = _library(tmp_path)
+    db, old = _dataset(tmp_path)
     try:
         cut = _cut(db)
         _repacked(db, tmp_path)
@@ -135,7 +135,7 @@ def test_undo_works_after_going_back(tmp_path):
 
 
 def test_delete_is_refused_while_named(tmp_path):
-    db, old = _library(tmp_path)
+    db, old = _dataset(tmp_path)
     try:
         _cut(db)
         new = _repacked(db, tmp_path)

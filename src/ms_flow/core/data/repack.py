@@ -39,7 +39,7 @@ def offer(project_db) -> str | None:
 
     active = catalog.active_generation_id(project_db)
     if active is None:
-        return "there is no library yet"
+        return "there is no dataset yet"
     named = _named(project_db, active)
     if named:
         return f"a later step keeps a state on it ({named[0]['kind']} {named[0]['key']})"
