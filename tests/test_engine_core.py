@@ -12,6 +12,7 @@ from contextlib import closing
 import pytest
 
 from benchmarks.refactor_optimization import workers
+from ms_flow.engine import engine as engine_module
 from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key, launched, report
 
 
@@ -514,7 +515,7 @@ class _CountingPool(ProcessExecutor):
 
 
 @pytest.mark.slow
-def test_short_chunks_share_a_task_and_long_ones_do_not():
+def test_short_chunks_share_a_task_and_long_ones_do_not(monkeypatch):
     results, errors = {}, {}
     with Engine(cpus=4, mem_mb=0) as engine:
         pool = _CountingPool(4)
@@ -529,7 +530,10 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         assert len(results) == 4999 and results[content_key(payloads[8])] == {"idx": 8}
         assert pool.tasks < 1000 and engine.tokens.free[0] == 4
 
-        pool.tasks = 0  # a chunk worth a task of its own gets one
+        # A chunk worth a task of its own gets one. A loaded machine (the suite in parallel) makes
+        # trips of several ms, and 100 of them outlast 0.2 s: the engine rightly packs two then.
+        monkeypatch.setattr(engine_module, "_TRIPS", 1)
+        pool.tasks = 0
         long = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.2} for i in range(40)]), 120)
         assert (long.status, long.chunks_done, pool.tasks) == ("completed", 40, 40)
 
