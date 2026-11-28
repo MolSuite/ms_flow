@@ -34,6 +34,11 @@ def _inside(folder) -> list:
     return found
 
 
+def _homes(tmp_path) -> list:
+    """The job folders on the far side; its poller's `.poll.*` files come and go beside them."""
+    return [entry for entry in (tmp_path / "far").iterdir() if not entry.name.startswith(".")]
+
+
 def _until(check, seconds=60):
     deadline = time.monotonic() + seconds
     while not check() and time.monotonic() < deadline:
@@ -61,7 +66,7 @@ def test_results_come_while_it_runs_and_a_job_out_of_the_queue_is_sent_again(tmp
         job = engine.submit("far", workers.nap, [{"s": 0.3, "n": i} for i in range(12)], on_results=got.extend)
         assert _until(lambda: engine.status(job).chunks_done)
         assert engine.status(job).status == "running" and engine.status(job).chunks_done < 12
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         for pid in _inside(home):  # what a queue does to a job whose time ran out
             os.kill(pid, signal.SIGTERM)
         ended = engine.wait(job, 120)
@@ -73,7 +78,7 @@ def test_a_canceled_job_leaves_the_queue_and_nothing_behind(tmp_path):
         engine.register("far", _far(tmp_path, runner="--cpus 1"))
         job = engine.submit("far", workers.nap, [{"s": 0.3, "n": i} for i in range(40)])
         assert _until(lambda: engine.status(job).chunks_done)
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         assert _inside(home)
         engine.cancel(job)
         assert engine.wait(job, 60).status == "canceled"
@@ -141,7 +146,7 @@ def test_closing_leaves_a_job_with_a_key_running_and_it_is_taken_up_again(tmp_pa
         job = _napping(engine, tmp_path, got)
         assert _until(lambda: engine.status(job).chunks_done)
     before = len(got)
-    (home,) = (tmp_path / "far").iterdir()
+    (home,) = _homes(tmp_path)
     assert 0 < before < 12 and _inside(home), "still running there, with the engine gone"
 
     with Engine(cpus=2) as engine:  # in other tasks than before: each waits for what is already there
@@ -161,7 +166,7 @@ def test_what_was_left_there_is_listed_and_removed_by_hand(tmp_path):
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])
         assert _until(lambda: engine.status(job).chunks_done)
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         (row,) = engine.executor("far").jobs_there()
         assert (row["dir"], row["followed"]) == (home.name, True)
         with pytest.raises(ValueError, match="cancel the job"):
@@ -183,7 +188,7 @@ def test_canceling_stops_what_an_earlier_run_left_there(tmp_path):
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])
         assert _until(lambda: engine.status(job).chunks_done)
-    (home,) = (tmp_path / "far").iterdir()
+    (home,) = _homes(tmp_path)
     assert _inside(home)
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])

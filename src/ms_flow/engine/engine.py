@@ -59,8 +59,9 @@ _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers fo
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
 # A job's results that arrive one by one wait this long for more of their own (a callback with a
 # fixed cost, a commit, then pays it once for several), unless `_held_most` wait or nothing else
-# of the job runs (its last results are not held).
-_DELIVER_WAIT = 1.0
+# of the job runs (its last results are not held). Only while more keep coming: a job whose
+# results stop for `_DELIVER_QUIET` gets what came (a few tasks ending together are not kept).
+_DELIVER_WAIT, _DELIVER_QUIET = 1.0, 0.2
 _NOTHING = object()
 
 
@@ -1337,16 +1338,18 @@ class Engine:
         get, get_nowait, monotonic = self._deliveries.get, self._deliveries.get_nowait, time.monotonic
         held: dict[_Job, list] = {}  # results, as (job, key, attempt, result, n), waiting for more
         since: dict[_Job, float] = {}
+        last: dict[_Job, float] = {}  # when the newest of them came
 
         def hand(job: _Job) -> None:  # one call for the callback, one event for the loop
             batch = held.pop(job)
-            del since[job]
+            del since[job], last[job]
             self._events.put((self._on_delivered, job, self._hand_over(job, batch)))
 
         while True:
             if held:
                 try:
-                    item = get(timeout=max(min(since.values()) + _DELIVER_WAIT - monotonic(), 0.0))
+                    due = min(min(at + _DELIVER_WAIT, last[job] + _DELIVER_QUIET) for job, at in since.items())
+                    item = get(timeout=max(due - monotonic(), 0.0))
                 except queue.Empty:
                     item = _NOTHING
             else:
@@ -1369,6 +1372,7 @@ class Engine:
                     if job not in held:
                         held[job], since[job] = [], monotonic()
                     held[job].append(item)
+                    last[job] = monotonic()
                     if len(held[job]) >= _DELIVER_MAX:
                         hand(job)
                 try:
@@ -1377,7 +1381,8 @@ class Engine:
                     item = _NOTHING
             now = monotonic()
             for job in tuple(held):
-                if len(held[job]) >= _held_most(job) or now - since[job] >= _DELIVER_WAIT or not job.flying:
+                if (len(held[job]) >= _held_most(job) or now - since[job] >= _DELIVER_WAIT
+                        or now - last[job] >= _DELIVER_QUIET or not job.flying):
                     hand(job)
 
     @staticmethod

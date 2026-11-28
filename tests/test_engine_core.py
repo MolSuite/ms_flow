@@ -202,6 +202,27 @@ def test_results_arriving_one_by_one_are_held_into_groups():
         assert took < 3.0  # 200 x 20 ms on 4 threads: 1 s when the workers stay fed
 
 
+def _sleep(payload):
+    time.sleep(payload)
+    return payload
+
+
+def test_a_few_results_ending_together_are_not_held_for_more():
+    """Held only while more of the job keep coming: three tasks ending together reach the
+    callback at once, not a `_DELIVER_WAIT` later, though the job still runs a long one."""
+    came = []
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        start = time.perf_counter()
+        job = engine.submit("thread", _sleep, [0.05, 0.05, 0.05, 3.0],
+                            on_results=lambda pairs: came.append((time.perf_counter() - start, len(pairs))))
+        while sum(n for _, n in came) < 3 and time.perf_counter() - start < 2.5:
+            time.sleep(0.01)
+        assert sum(n for _, n in came[:3]) == 3 and came[-1][0] < 0.6, came
+        engine.wait(job, 30)
+
+
 @pytest.mark.parametrize("cost, expected", [
     ({"cpu": 2}, 4),                # 8 CPUs / 2
     ({"mem_mb": 400}, 2),           # 1000 MB / 400
