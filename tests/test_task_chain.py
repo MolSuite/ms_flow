@@ -55,6 +55,10 @@ def test_a_failed_step_stops_only_what_builds_on_it(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_a_chain_says_its_steps():
+    assert chain(task(steps=("read", "lay out"))(lambda element: {}), rescore).__task__["steps"] == ("read", "lay out", "rescore")
+
+
 def test_a_chain_runs_on_a_thread_only_if_every_step_does():
     assert chain(dock, rescore).__task__["thread"] is True
     assert chain(dock, contacts, thread=True).__task__["thread"] is True

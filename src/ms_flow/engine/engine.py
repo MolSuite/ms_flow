@@ -158,6 +158,12 @@ class JobSnapshot:
     asked: dict | None = None
     # The keys of the jobs it was submitted after (`after`), for a monitor to draw it under them.
     after: tuple = ()
+    # What each of its tasks does, in order, as its task says (`task(steps=...)`), for a monitor.
+    task_steps: tuple = ()
+    # How many chunks a task carries now, and the seconds a chunk took in the tasks that ended, a
+    # moving average (what the worker ran, without the trip to it); None until one ended.
+    chunks_per_task: int = 1
+    chunk_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +185,7 @@ class _Job:
                  "peak_mem_mb", "started_at", "finished_at", "finished", "journal", "n", "uid", "spec",
                  "skip", "after", "came_after", "chunks", "pace", "pack", "elastic", "retries", "retry_wait", "timeout",
                  "retried", "batch", "batched", "auto", "source", "fine", "needs", "key", "label", "thread",
-                 "states", "executor", "usage", "held", "far", "canceling", "node_resources")
+                 "states", "executor", "usage", "held", "far", "canceling", "node_resources", "mean", "does")
 
     def used(self) -> dict:
         """`usage` up to now, with what it holds at this moment counted until now."""
@@ -208,7 +214,8 @@ class _Job:
                            None if self.finished_at else getattr(self.far, "unreachable", None),
                            None if self.finished_at else getattr(self.far, "note", None),
                            bool(self.canceling) and not self.finished_at, tuple(getattr(self.far, "steps", ())),
-                           getattr(self.far, "asked", None) or None, self.came_after)
+                           getattr(self.far, "asked", None) or None, self.came_after,
+                           self.does, self.pack, self.mean)
 
 
 @functools.cache
@@ -530,7 +537,7 @@ class Engine:
                total: int | None = None, name: str = "", journal: str | None = None, key: str | None = None,
                after=(), retries: int = 0, retry_wait: float = 1.0, timeout: float | None = None,
                batch: int | None = None, batched: bool = False, autobatch: bool | int | None = None,
-               progress: bool | None = None, origin=None, label=None, thread: bool = False,
+               progress: bool | None = None, origin=None, label=None, thread: bool = False, steps=(),
                on_result=None, on_results=None, on_error=None, on_finish=None, on_terminal=None) -> int:
         """Run `fn(payload)` for every payload in `chunks` on `executor`. Returns the job id.
 
@@ -580,6 +587,7 @@ class Engine:
         its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
         dict payload) or a function `(payload)` that returns the text. It runs here, never in a
         worker, and only for a chunk that is shown.
+        `steps` says what `fn` does, in order, a line each, for a monitor (`JobSnapshot.task_steps`).
         `journal` names an attached journal; without it nothing about the job reaches the disk.
         `key` is what the job is called there. Submitting an interrupted or canceled job again
         under its key continues it: the chunks it had done are recognised by their own keys and
@@ -640,9 +648,10 @@ class Engine:
             raise ValueError(error)
         job.id, job.name, job.slot, job.fn, job.max_cpu = next(self._ids), name, slot, fn, max_cpu
         job.batch, job.batched, job.fine, job.label = batch or 0, batched, progress, label
+        job.does = tuple(steps)
         job.thread = thread and slot.threads
         job.window = max(window or 2 * slot.impl.capacity * (batch or 1), batch or 1)
-        job.pace, job.pack, job.elastic = 0.0, batch or 1, window is None
+        job.pace, job.pack, job.elastic, job.mean = 0.0, batch or 1, window is None, None
         job.auto = _Autobatch(batch, getattr(slot.impl, "batch_max", 0), getattr(slot.impl, "task_seconds", 0),
                               start) if autobatch else None
         if job.auto is not None:
@@ -936,6 +945,9 @@ class Engine:
         if peak_mb > job.peak_mem_mb:
             job.peak_mem_mb = peak_mb
         pack, chunk.pack = chunk.pack, None
+        if status == DONE:  # a chunk's seconds as its worker ran them: the start-up and the trip left out
+            each = used.get("seconds", time.perf_counter() - chunk.started) / (len(pack) if pack else 1)
+            job.mean = each if job.mean is None else 0.8 * job.mean + 0.2 * each
         if slot.packs and status == DONE:
             # Seconds per chunk as seen from here, so with the trip to the worker and back: a
             # payload that is expensive to send is never mistaken for a short chunk.
