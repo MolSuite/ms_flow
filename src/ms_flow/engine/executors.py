@@ -592,7 +592,7 @@ def _hosted(task):
     call, *task = pickle.loads(task)
     result, used = call(*task)
     # ponytail: where and how long only; cores and memory would be the process's, shared by its threads.
-    return result, {"where": used["where"], "seconds": used["seconds"]}
+    return result, {"where": used["where"], "seconds": used["seconds"], "fresh": used["fresh"]}
 
 
 # --- Worker side --------------------------------------------------------------------
@@ -654,9 +654,16 @@ class _Usage:
         self.cpu = (sum(os.times()[:4]) - self.cpu) / max(self.seconds, 1e-6)
 
     def report(self) -> dict:
+        global _fresh
         cards = getattr(_task, "cards", None)
+        fresh, _fresh = _fresh, False
         return {"where": socket.gethostname() + (f":{cards}" if cards else ""), "seconds": self.seconds,
-                "cpu": self.cpu, "mb": _peak_mb()}
+                "cpu": self.cpu, "mb": _peak_mb(), "fresh": fresh}
+
+
+# The first task a process runs also paid for starting it and for the imports its function
+# needed: its trip is not what handing out the next ones costs.
+_fresh = True
 
 
 def _call(fn, payload):
