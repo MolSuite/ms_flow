@@ -511,6 +511,19 @@ def test_chunks_that_turn_slow_never_leave_workers_idle_behind_a_shrunk_window()
     assert worst <= 0, f"{worst} chunks in flight past the window"
 
 
+def test_a_worker_that_is_slow_to_start_does_not_make_its_tasks_bigger():
+    # A fresh worker's first trip also starts it and imports what the function needs: taken as
+    # what every trip costs, it packed chunks of a second into tasks of minutes.
+    from benchmarks.refactor_optimization import slow_start
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        pool = _CountingPool(4)
+        pool.sizes = []
+        engine.register("process", pool)
+        job = engine.wait(engine.submit("process", slow_start.nap, [{"idx": i, "s": 0.5} for i in range(24)]), 120)
+    assert job.chunks_done == 24 and max(pool.sizes) == 1, pool.sizes
+
+
 class _FarPool(_CountingPool):
     """A pool whose every task costs 10 ms to hand out, as a remote one's would."""
 

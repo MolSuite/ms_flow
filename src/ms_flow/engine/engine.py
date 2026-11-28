@@ -940,7 +940,7 @@ class Engine:
             # Seconds per chunk as seen from here, so with the trip to the worker and back: a
             # payload that is expensive to send is never mistaken for a short chunk.
             took = max(time.perf_counter() - chunk.started, 1e-6)
-            if "seconds" in used:  # down at once, up warily: a worker's start-up is one long trip
+            if "seconds" in used and not used.get("fresh"):  # a worker's start-up is no trip; down at once, up warily
                 trip = max(took - used["seconds"], 0.0)
                 slot.trip = trip if not slot.trip or trip < slot.trip else (slot.trip + trip) / 2
             took /= len(pack) if pack else 1
