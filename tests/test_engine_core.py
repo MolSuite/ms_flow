@@ -496,6 +496,21 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         assert "worker process died" in died.error and pool.tasks < 1500 and engine.tokens.free[0] == 4
 
 
+@pytest.mark.slow
+def test_chunks_that_turn_slow_never_leave_workers_idle_behind_a_shrunk_window():
+    # Fast chunks first pack many to a task; once they turn slow the packs shrink, and so did the
+    # window, below what the big tasks still held: the job sent nothing until they drained.
+    payloads = [{"idx": i, "s": 0.005} for i in range(12)] + [{"idx": i, "s": 0.3} for i in range(12, 132)]
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("process", ProcessExecutor(4))
+        job_id = engine.submit("process", workers.nap, payloads)
+        job, worst = engine._jobs[job_id], 0
+        while job.finished.wait(0.02) is False:
+            worst = max(worst, job.open - job.window)
+        assert engine.status(job_id).chunks_done == 132
+    assert worst <= 0, f"{worst} chunks in flight past the window"
+
+
 class _FarPool(_CountingPool):
     """A pool whose every task costs 10 ms to hand out, as a remote one's would."""
 

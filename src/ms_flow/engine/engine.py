@@ -948,8 +948,8 @@ class Engine:
             if not job.batch:
                 task = max(_TASK_SECONDS, _TRIPS * slot.trip)
                 job.pack = max(1, min(int(task / job.pace), _PACK_MAX))
-                if job.elastic:
-                    job.window = 2 * slot.impl.capacity * job.pack
+                if job.elastic:  # never smaller: a window under what is in flight sends nothing
+                    job.window = max(job.window, 2 * slot.impl.capacity * job.pack)
             elif job.auto is not None:
                 settled, was, n = job.auto.settled, job.auto.size, len(pack) if pack else 1
                 job.auto.seen(n, took * n, used.get("where", ""))
