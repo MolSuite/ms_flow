@@ -99,6 +99,16 @@ def appended(params, project):
     return range(params["n"])
 
 
+@task(steps=lambda params: [f"count to {params['n']}", "write a line"])
+def counted_line(n: int) -> str:
+    return f"{n}\n"
+
+
+@job(task=counted_line, output=file_sink("out/counted.txt", fmt="text", append=True))
+def counted(params, project):
+    return range(params["n"])
+
+
 @job(task=halve, output=file_sink("out/halves.json"))
 def whole_file(params, project):
     return range(0, 8, 2)
@@ -230,6 +240,7 @@ def test_a_job_writes_files_or_through_its_own_writer_which_has_the_last_word(pr
         submit = lambda job, params=None: engine.wait(flow.submit(job, params, executor="thread"), 60)
 
         assert submit(appended, {"n": 50}).status == "completed"
+        assert submit(counted, {"n": 3}).task_steps == ("count to 3", "write a line")  # from what it was asked
         assert sorted((tmp_path / "out/lines.txt").read_text().split(), key=int) == [str(n) for n in range(50)]
         assert submit(whole_file).status == "completed"  # one file, written when the job completes
         assert sorted(row["half"] for row in json.loads((tmp_path / "out/halves.json").read_text())) == [0, 1, 2, 3]

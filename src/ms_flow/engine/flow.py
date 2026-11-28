@@ -41,7 +41,8 @@ log = logging.getLogger(__name__)
 
 
 def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0, batch: int | None = None,
-         batched: bool = False, autobatch: bool | int | None = None, label=None, thread: bool = False):
+         batched: bool = False, autobatch: bool | int | None = None, label=None, thread: bool = False,
+         steps: tuple[str, ...] = ()):
     """Mark a function as a task: what runs on one element, and what it needs to run.
 
     `batch` is how many elements the author wants to travel together; `batched` says the
@@ -53,10 +54,13 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
     `thread` is for a function that only waits for a program it starts (a docking binary): on
     this machine it runs on a thread of one process kept for all of them, and no worker is kept
     for it.
+    `steps` says what it does, in order, a line each, or is a function `(params)` of the job that
+    returns them: the monitor shows them (`JobSnapshot.task_steps`).
     """
     def mark(fn):
         fn.__task__ = {"cpu": cpu, "gpu": gpu, "mem_mb": mem_mb, "retries": retries, "batch": batch,
-                       "batched": batched, "autobatch": autobatch, "label": label, "thread": thread}
+                       "batched": batched, "autobatch": autobatch, "label": label, "thread": thread,
+                       "steps": steps if callable(steps) else tuple(steps)}
         return fn
     return mark
 
@@ -120,6 +124,12 @@ class _Chain:
         return merged
 
 
+def _said(step) -> tuple:
+    """What a step of a chain says it does, else its name: the chain's own steps are said without its params."""
+    said = step.__task__.get("steps")
+    return (step.__name__,) if not said or callable(said) else tuple(said)
+
+
 def chain(*steps, needs=None, on_error=None, thread=None):
     """Tasks that run one after the other on each element, as one task whose result is for a `graph_sink`.
 
@@ -141,7 +151,9 @@ def chain(*steps, needs=None, on_error=None, thread=None):
     run = _Chain(steps, dict(needs or {}), on_error)
     first = steps[0].__task__
     run.__task__ = {**first, **{need: max(step.__task__[need] for step in steps) for need in ("cpu", "gpu", "mem_mb")},
-                    "thread": all(step.__task__.get("thread", False) for step in steps) if thread is None else thread}
+                    "thread": all(step.__task__.get("thread", False) for step in steps) if thread is None else thread,
+                    # what each step says it does, else its name
+                    "steps": tuple(line for step in steps for line in _said(step))}
     return run
 
 
@@ -326,6 +338,8 @@ class Flow:
         own = getattr(self.engine.executor(executor), "batch", None)
         needs = {**fn.__task__, "batch": batch or own or fn.__task__["batch"], "cpu": cpu or fn.__task__["cpu"],
                  "thread": fn.__task__.get("thread", False) if thread is None else thread}
+        if callable(needs.get("steps")):  # what it does depends on what the job was asked
+            needs["steps"] = tuple(needs["steps"](params))
         if engine.get("journal") is not None:
             engine["key"] = engine.get("key") or uuid.uuid4().hex
             engine["origin"] = _origin(job, params, {"executor": asked, "batch": batch, "cpu": cpu, "thread": thread,

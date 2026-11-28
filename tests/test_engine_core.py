@@ -528,6 +528,15 @@ def test_a_worker_that_is_slow_to_start_does_not_make_its_tasks_bigger():
     assert job.chunks_done == 24 and max(pool.sizes) == 1, pool.sizes
 
 
+def test_a_job_says_what_its_tasks_do_and_how_long_a_chunk_takes():
+    with Engine(cpus=2, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(2))
+        job_id = engine.submit("thread", workers.nap, [{"idx": i, "s": 0.05} for i in range(6)], steps=("nap", "answer"))
+        snapshot = engine.wait(job_id, 30)
+    assert snapshot.task_steps == ("nap", "answer") and snapshot.chunks_per_task == 1
+    assert 0.04 < snapshot.chunk_seconds < 0.5
+
+
 class _FarPool(_CountingPool):
     """A pool whose every task costs 10 ms to hand out, as a remote one's would."""
 
