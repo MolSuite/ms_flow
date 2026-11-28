@@ -192,15 +192,21 @@ def test_results_arriving_one_by_one_are_held_into_groups():
     def write(pairs):
         sizes.append(len(pairs))
 
+    def timed(**callback):
+        start = time.perf_counter()
+        snap = engine.wait(engine.submit("thread", _short, range(200), window=16, **callback), 30)
+        assert snap.chunks_done == 200
+        return time.perf_counter() - start
+
     with Engine(cpus=4, mem_mb=0) as engine:
         engine.register("thread", ThreadExecutor(4))
-        start = time.perf_counter()
-        job = engine.submit("thread", _short, range(200), window=16, on_results=write)
-        snap = engine.wait(job, 30)
-        took = time.perf_counter() - start
-        assert snap.chunks_done == 200 and sum(sizes) == 200
+        fed = timed()  # nothing delivered, nothing held: the workers' pace on this machine
+        took = timed(on_results=write)
+        assert sum(sizes) == 200
         assert len(sizes) <= 200 // 3, sizes  # one at a time before
-        assert took < 3.0  # 200 x 20 ms on 4 threads: 1 s when the workers stay fed
+        # 200 x 20 ms on 4 threads is 1 s when the workers stay fed; a slow machine (a macOS
+        # runner sleeps long) is measured against itself, not against that second.
+        assert took < 1.5 * fed + 0.5, (took, fed)
 
 
 def _sleep(payload):
