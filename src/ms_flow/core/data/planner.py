@@ -59,7 +59,7 @@ class DataTransportPlanner:
             if profile.backend == "ray":
                 return ResolvedHandle(strategy="ray_output_transfer", spec_kind=spec.kind)
             if profile.backend == "hpc":
-                # Output stays where it was produced. Copying a screening run's fragments back
+                # Output stays where it was produced. Copying a run's output fragments back
                 # is the network cost the cluster was chosen to avoid; only what the parent
                 # selects travels, and it travels inline in the chunk result.
                 return ResolvedHandle(strategy="hpc_output_dir", spec_kind=spec.kind)

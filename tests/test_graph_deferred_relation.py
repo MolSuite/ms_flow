@@ -2,7 +2,7 @@
 
 Without `deferred` the case had only two bad outcomes: declare the relation and have the
 topological order detect a cycle, or invent a stable per-parent index in the child table so the
-row can be pointed at before its id exists — exactly the `bs_index` AMDock used to drag around,
+row can be pointed at before its id exists — exactly the `bs_index` DemoApp used to drag around,
 with its UNIQUE and its slot reservation. The test pins both halves: the direct relation still
 resolves the child's FK, and the deferred one leaves the parent pointing at the right child
 (not the first, not the last).
@@ -23,14 +23,14 @@ def _patch_fake_home(monkeypatch, fake_home: Path):
 @task()
 def _run_chunk(payload: dict):
     index = int(payload["index"])
-    # Three sites per molecule; the active one is the middle one, so a "take the first" or
+    # Three sites per specimen; the active one is the middle one, so a "take the first" or
     # "take the last" bug cannot pass the test by accident.
     return {
-        "molecules": [
-            {"$ref": f"mol_{index}", "name": f"rec-{index}", "active_site_ref": f"site_{index}_b"},
+        "specimens": [
+            {"$ref": f"spc_{index}", "name": f"rec-{index}", "active_site_ref": f"site_{index}_b"},
         ],
-        "binding_sites": [
-            {"$ref": f"site_{index}_{tag}", "molecule_ref": f"mol_{index}", "label": f"{index}-{tag}"}
+        "spots": [
+            {"$ref": f"site_{index}_{tag}", "specimen_ref": f"spc_{index}", "label": f"{index}-{tag}"}
             for tag in ("a", "b", "c")
         ],
     }
@@ -39,20 +39,20 @@ def _run_chunk(payload: dict):
 def _sink():
     return graph_sink(
         nodes=(
-            {"name": "molecules", "table": "molecules", "columns": ("name", "active_site_id")},
-            {"name": "binding_sites", "table": "binding_sites", "columns": ("molecule_id", "label")},
+            {"name": "specimens", "table": "specimens", "columns": ("name", "active_site_id")},
+            {"name": "spots", "table": "spots", "columns": ("specimen_id", "label")},
         ),
         relations=(
             {
-                "source_node": "binding_sites",
-                "source_ref_field": "molecule_ref",
-                "target_node": "molecules",
-                "fk_field": "molecule_id",
+                "source_node": "spots",
+                "source_ref_field": "specimen_ref",
+                "target_node": "specimens",
+                "fk_field": "specimen_id",
             },
             {
-                "source_node": "molecules",
+                "source_node": "specimens",
                 "source_ref_field": "active_site_ref",
-                "target_node": "binding_sites",
+                "target_node": "spots",
                 "fk_field": "active_site_id",
                 "deferred": True,
             },
@@ -80,8 +80,8 @@ def test_deferred_relation_points_the_parent_at_its_own_child(tmp_path, monkeypa
         db_path = ms.project_db.db_path
         conn = sqlite3.connect(str(db_path))
         try:
-            conn.execute("CREATE TABLE molecules (id INTEGER PRIMARY KEY, name TEXT, active_site_id INTEGER)")
-            conn.execute("CREATE TABLE binding_sites (id INTEGER PRIMARY KEY, molecule_id INTEGER, label TEXT)")
+            conn.execute("CREATE TABLE specimens (id INTEGER PRIMARY KEY, name TEXT, active_site_id INTEGER)")
+            conn.execute("CREATE TABLE spots (id INTEGER PRIMARY KEY, specimen_id INTEGER, label TEXT)")
             conn.commit()
         finally:
             conn.close()
@@ -91,11 +91,11 @@ def test_deferred_relation_points_the_parent_at_its_own_child(tmp_path, monkeypa
         conn = sqlite3.connect(str(db_path))
         try:
             rows = conn.execute(
-                "SELECT m.name, s.label, s.molecule_id = m.id "
-                "FROM molecules m JOIN binding_sites s ON s.id = m.active_site_id "
+                "SELECT m.name, s.label, s.specimen_id = m.id "
+                "FROM specimens m JOIN spots s ON s.id = m.active_site_id "
                 "ORDER BY m.name"
             ).fetchall()
-            total_sites = conn.execute("SELECT COUNT(*) FROM binding_sites").fetchone()[0]
+            total_sites = conn.execute("SELECT COUNT(*) FROM spots").fetchone()[0]
         finally:
             conn.close()
 
@@ -112,5 +112,5 @@ def test_a_backwards_relation_without_deferred_is_still_a_cycle():
     relations = [dict(relation) for relation in _sink().meta["graph"]["relations"]]
     with pytest.raises(Exception, match="cycle"):
         _ProjectStoreSqliteOps._graph_topological_order(
-            ["molecules", "binding_sites"], relations
+            ["specimens", "spots"], relations
         )

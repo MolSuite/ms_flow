@@ -1,12 +1,12 @@
 """Campaigns: jobs whose stages all run on a cluster, from the first element to the last result.
 
-    @campaign(output=table_sink("docking_results"), volatile=("run_id",))
-    def screen(params, project):
-        return [Stage("vs", dock, shards_of(project)),
-                Stage("top", dock, From("vs", partial(best, n=params.top)), deliver="none"),
-                Stage("off", dock, From("top", against_off_targets))]
+    @campaign(output=table_sink("results"), volatile=("run_id",))
+    def sweep(params, project):
+        return [Stage("all", evaluate, shards_of(project)),
+                Stage("top", evaluate, From("all", partial(best, n=params.top)), deliver="none"),
+                Stage("more", evaluate, From("top", against_other_targets))]
 
-    workspace.submit(screen, params, executor="hpc")      # an executor of kind `queue`
+    workspace.submit(sweep, params, executor="hpc")      # an executor of kind `queue`
 
 A stage runs its task over its source: what the source function gives for the first, and what
 `From(stage, fn, args)` makes there of an earlier stage for the others (`fn` gets what that
@@ -55,7 +55,9 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ms_flow import locations
-from ms_flow.engine.files import Dir, File, swap
+from ms_flow.core.data import catalog
+from ms_flow.core.data.companions import companions
+from ms_flow.engine.files import Dir, File, KeptDir, swap
 from ms_flow.engine.flow import job, task
 from ms_env import HostError
 from ms_flow.remote import RemoteExecutor, _untar, read_usage, unreachable
@@ -89,6 +91,19 @@ class Stage:
     reduce: Optional[Callable] = None
     deliver: str = "stream"
     digests: Optional[dict] = None
+    # The receipts of a result (`ms_flow.runner._There`): the parts its task wrote, committed there
+    # into containers before the result counts, which then names them (`_committed`). Registered in
+    # the project as being there once the stage ends; nothing of them comes here.
+    commit: Optional[Callable] = None
+
+
+def _ray_said(ray: dict | None) -> str:
+    """What the runner said of its Ray, for the note: nothing when it runs without one."""
+    if not ray:
+        return ""
+    gpus = f", {ray['gpus_busy']} of {ray['gpus']} GPUs" if ray.get("gpus") else ""
+    return (f" · Ray: {ray['nodes']} of {ray['nodes_asked']} nodes, {ray['cpus_busy']} of {ray['cpus']} CPUs busy"
+            f"{gpus}, store {ray['store_used_mb']:,} of {ray['store_mb']:,} MB")
 
 
 _LET_GO = 120.0  # seconds a queue has to let a canceled job go before that is an error
@@ -222,17 +237,25 @@ class Campaign:
             carried, made, known, self._shas = {}, {}, dict(stages[0].digests or {}), {}
 
             def carry(mark):
+                kept = isinstance(mark, KeptDir) and self._store and locations.inside(project, mark)
+                if kept:  # in the project's folder there: later campaigns find it where it was left
+                    return KeptDir(self._store + kept)
                 if isinstance(mark, Dir):  # made there, under the campaign's directory, and left there
                     return Dir(made.setdefault(mark, f"out/{len(made)}"))
                 if mark not in carried:
+                    if project is not None and getattr(project, "project_dir", None):
+                        catalog._seal_shipped(project, mark)  # before its hash (I15)
                     sha, path = known.get(mark) or _sha256(mark), self._store and locations.inside(project, mark)
                     carried[mark] = self._store + path if path else f"files/{sha}/{os.path.basename(mark)}"
                     self._shas[carried[mark]] = sha
+                    for companion in companions(mark):  # beside it there, as here (I14)
+                        carried[companion] = f"{carried[mark]}{companion[len(mark):]}"
+                        self._shas[carried[companion]] = _sha256(companion)
                 return File(carried[mark])
 
             listed = [{"name": stage.name, "fn": bound(stage.task),
                        "needs": {need: stage.task.__task__[need] for need in _CHUNK_NEEDS},
-                       "reduce": stage.reduce,
+                       "reduce": stage.reduce, "commit": stage.commit,
                        "from": None if place == 0 else (stage.source.stage, stage.source.fn,
                                                         swap(tuple(stage.source.args), carry))}
                       for place, stage in enumerate(stages)]
@@ -527,6 +550,7 @@ class Campaign:
             self._why_from(said)
             if not self._canceling:
                 self._tell(told, alive)
+                self._keep_up(told.get("files"))
                 if alive and time.monotonic() > self._accounted + _ACCOUNT_EVERY:
                     self._account()
             for name in streamed:
@@ -560,6 +584,7 @@ class Campaign:
                 lost = [name for name in parts if parts[name] < left.get(name, {}).get("parts", 0)]
                 lost += [name for name in errors if errors[name] < left.get(name, {}).get("errors", 0)]
                 if not lost and not reduced:
+                    self._register(left)
                     self._account(final=True)
                     return
                 gone = "it ended there, but what it made is not all there any longer"
@@ -605,6 +630,23 @@ class Campaign:
                 log.warning("campaign %s left the queue at %s%s: queued again", self.dir, now, self._ended_as(state))
                 self._submit()
             self._stop.wait(min(_GLANCE_EVERY, self.remote.poll_s) if time.monotonic() < glancing else self.remote.poll_s)
+
+    def _register(self, left: dict) -> None:
+        """The containers the stages committed there, in the project's catalog as being there (by
+        the executor's name), and brought here unless the executor says not to."""
+        self._keep_up([row for said in left.values() for row in said.get("files") or ()])
+
+    def _keep_up(self, rows) -> None:
+        """`rows` (containers there, as its runner lists them) registered here and, with the
+        executor's `bring`, brought as far as they are made. What does not come now comes next round."""
+        if not rows or self.project is None or not getattr(self.project, "project_dir", None) or not self.executor:
+            return
+        try:
+            ids = locations.register_there(self.project, self.executor, rows)
+            if self.remote.bring:
+                locations.bring(self.project, self.remote, ids, location=self.executor)
+        except Exception as error:  # ponytail: one warning a round while a host or a file misbehaves
+            log.warning("campaign %s: what it made there did not come this round: %s", self.dir, error)
 
     def _glance(self) -> tuple[dict, bool]:
         """Its progress there, and whether its job is in the queue: nothing it made."""
@@ -663,7 +705,8 @@ class Campaign:
             stage = f"stage {told.get('stage')} ({told.get('stages_done', 0) + 1} of {len(self.stages)}): " \
                 if len(self.stages) > 1 else ""
             failed = f", {told['failed']} failed" if told.get("failed") else ""
-            self.note = f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} done{failed}"
+            self.note = (f"running in the queue ({job}): {stage}{told.get('done', 0):,} of {told.get('total', 0):,} "
+                         f"done{failed}{_ray_said(told.get('ray'))}")
         elif alive and not told:
             self.note = f"{self._waiting()} ({job}){self._because()}"
         elif alive:

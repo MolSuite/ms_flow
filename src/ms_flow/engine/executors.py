@@ -51,6 +51,7 @@ knows whether the chunk ran) or `CANCELED`.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import itertools
 import math
@@ -64,11 +65,13 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
 from types import SimpleNamespace
 
+from ..core.data.companions import companions, whole
 from .files import Dir, swap
 
 try:
@@ -255,8 +258,11 @@ class RayExecutor:
     goes through. The functions and what they import have to be installed on every node.
 
     `shared` says that every node sees the disk of this machine, as a cluster started here does.
-    Without it each `File` of an element goes once to Ray's object store and a node keeps its
-    copy in its temporary directory, and what a result names under a `Dir` comes back with it.
+    Without it each `File` of an element goes to Ray's object store in pieces, lands once on each
+    node that reads it, in its temporary directory, until `shutdown`, and the tasks that read it
+    go where it already is when there is room. What a result names under a `Dir` comes back in
+    pieces too, and a thread of this executor writes it, whole or not there, before the result
+    is given.
 
     `names` takes each node's hostname to the name its tasks are shown under in `hosts`; without
     it the nodes are not asked where they are.
@@ -307,8 +313,22 @@ class RayExecutor:
         self._lost = (ray.exceptions.WorkerCrashedError, ray.exceptions.NodeDiedError,
                       ray.exceptions.ObjectLostError, ray.exceptions.OutOfMemoryError)
         # max_retries=0: the engine is the one that runs a chunk again
-        self._run = ray.remote(max_retries=0)(_apply if self.shared else _apply_far)
-        self._sized = {}  # cost -> `_run` asking Ray for that much
+        self._sized = {}  # (cost, node) -> `_run` asking Ray for that much, there
+        if self.shared:
+            self._run = ray.remote(max_retries=0)(_apply)
+            return
+        self._lost += (ray.exceptions.OwnerDiedError,)
+        self._home = uuid.uuid4().hex[:12]  # where the nodes keep what this executor carried or left
+        self._run = ray.remote(max_retries=0)(_apply_far)
+        # What a task leaves that is too large to come with its result comes after it, from one
+        # process on its node that stays (a task would wait for Ray to start one, seconds each
+        # time): piece by piece, each its own object of the store, at most two ahead of the one
+        # being written. Not a streaming generator: waiting for its next piece holds the GIL.
+        self._fetcher = ray.remote(num_cpus=0, max_restarts=0, max_concurrency=4)(_Fetcher)
+        self._fetchers, self._fetchers_lock = {}, threading.Lock()  # node -> its fetcher
+        self._at_nodes, self._turn = {}, itertools.count()  # file id -> nodes it landed on
+        # ponytail: four writers; more once many tasks give back large files at once.
+        self._writer = ThreadPoolExecutor(4, thread_name_prefix="msflow-ray-write")
 
     def bind(self, on_done) -> None:
         self._on_done = on_done
@@ -321,14 +341,20 @@ class RayExecutor:
         )
 
     def submit(self, fn, payload, tag, call=None, cost=(1, 0, 0), owner=None):
-        run = self._sized.get(cost)
-        if run is None:
-            cpu, gpu, mem_mb = cost
-            run = self._sized[cost] = self._run.options(num_cpus=cpu, num_gpus=gpu,
-                                                        memory=int(mem_mb * 2 ** 20) or None)
         dirs, held = [], []  # where it writes, and the files it reads, held until it ends
         if not self.shared:
             payload = swap(payload, partial(self._mark, dirs, held))
+        node = self._near(held)
+        run = self._sized.get((cost, node))
+        if run is None:
+            cpu, gpu, mem_mb = cost
+            near = {}
+            if node is not None:  # soft: a node without room for it now spills it to another
+                from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+                near = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node, soft=True, _spill_on_unavailable=True)}
+            run = self._sized[cost, node] = self._run.options(num_cpus=cpu, num_gpus=gpu,
+                                                              memory=int(mem_mb * 2 ** 20) or None, **near)
         call, index = call or _call, None
         if owner is not None or self._names is not None:
             if self._tally is None:
@@ -341,10 +367,15 @@ class RayExecutor:
                 call = partial(_placed, self._tally, index, call)
         if cost[1]:
             call = partial(_on_cards, None, call)  # Ray names the cards: only which ones, for the log
-        ref = run.remote(call, fn, payload)
+        ref = run.remote(call, fn, payload) if self.shared else run.remote(self._home, call, fn, payload)
         self._flying.add(ref)
         ref.future().add_done_callback(partial(self._finished, tag, ref, index, dirs, held))
         return ref
+
+    def _near(self, held: list):
+        """A node where a file the task reads has landed already, taking turns among them."""
+        nodes = [node for carried in held for node in self._at_nodes.get(carried.id, ())]
+        return nodes[next(self._turn) % len(nodes)] if nodes else None
 
     def progress(self, owner) -> dict:
         self._ask()
@@ -384,20 +415,25 @@ class RayExecutor:
         for ref in list(self._flying):
             self._killed.add(ref)
             self._ray.cancel(ref, force=True)
+        if not self.shared:
+            with self._fetchers_lock:
+                fetchers, self._fetchers = self._fetchers, {}
+            for fetcher in fetchers.values():  # what it was bringing comes back lost
+                self._ray.kill(fetcher)
 
     def _mark(self, dirs: list, held: list, mark):
         if isinstance(mark, Dir):
             if mark not in dirs:
                 dirs.append(str(mark))
             return _Out(dirs.index(mark))
-        at = os.stat(mark)
-        key = (str(mark), at.st_mtime_ns, at.st_size)
+        paths = [str(mark), *companions(mark)]  # a container goes with its index (I14)
+        key = tuple((path, at.st_mtime_ns, at.st_size) for path in paths for at in [os.stat(path)])
         carried = self._carried.get(key)
         if carried is None:
-            with open(mark, "rb") as file:
-                carried = self._carried[key] = _Carried(
-                    os.path.basename(mark), hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest(),
-                    self._ray.put(file.read()))
+            refs = [(os.path.basename(path), [self._ray.put(piece) for piece in _pieces(path)]) for path in paths]
+            id_ = os.path.join(self._home, hashlib.blake2b(repr(key).encode(), digest_size=8).hexdigest())
+            carried = self._carried[key] = _Carried(id_, refs)
+            weakref.finalize(carried, self._at_nodes.pop, id_, None)
         held.append(carried)
         return carried
 
@@ -415,30 +451,106 @@ class RayExecutor:
             if status != DONE:  # as when a pool is killed: the engine knows which one it was after
                 status, error = LOST, error or "stopped with its worker"
         if status == DONE and not self.shared:
-            (result, used), root, files = value
-
-            def here(text):  # a path of the node's directory, as the one it stands for here
-                if not text.startswith(root + os.sep):
-                    return text
-                n, _, rest = text[len(root) + 1:].partition(os.sep)
-                return os.path.join(dirs[int(n)], rest) if rest else dirs[int(n)]
-
-            # ponytail: written on Ray's own thread; a thread of the executor once files get large.
-            for name, data in files.items():
-                target = here(os.path.join(root, name))
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with open(target, "wb") as file:
-                    file.write(data)
-            value = swap(result, here, str), used
+            node, value, root, files = value
+            if node not in self._fetchers:  # ready before a task of that node leaves large files
+                self._fetcher_on(node)
+            for carried in held:
+                nodes = self._at_nodes.setdefault(carried.id, [])
+                if node not in nodes:
+                    nodes.append(node)
+            if files:  # not on Ray's thread
+                self._writer.submit(self._land, tag, dirs, node, value, root, files)
+                return
         result, used = value if status == DONE else (None, 0)
         self._on_done(tag, status, result, error, used)
+
+    def _land(self, tag, dirs: list, node: str, value, root: str, files: list) -> None:
+        """Each file the result names, here: data before index (I14), each whole or not there,
+        then the result. `files` is `[(name, bytes)]`, or `[(name, size)]` for those left on the node."""
+        from ..core.data.shard import _fsync_dir
+
+        def here(text):  # a path of the node's directory, as the one it stands for here
+            if not text.startswith(root + os.sep):
+                return text
+            n, _, rest = text[len(root) + 1:].partition(os.sep)
+            return os.path.join(dirs[int(n)], rest) if rest else dirs[int(n)]
+
+        fetcher = None if isinstance(files[0][1], bytes) else self._fetcher_on(node)
+        ray, folders, target = self._ray, set(), None
+
+        # Here before taken: a get that waits keeps the object store's lock, and freeing a piece
+        # waits for that lock holding the GIL, which stops this whole process a second at a time.
+        def get(ref):
+            ray.wait([ref], fetch_local=True)
+            return ray.get(ref)
+
+        try:
+            for name, data in files:
+                target = here(os.path.join(root, name))
+                folder = os.path.dirname(target)
+                if folder not in folders:
+                    os.makedirs(folder, exist_ok=True)
+                    folders.add(folder)
+                with open(target + ".tmp", "wb") as file:
+                    if fetcher is None:
+                        file.write(data)
+                    else:
+                        ahead, path = collections.deque(), os.path.join(root, name)
+                        for at in range(0, data, _CHUNK):
+                            ahead.append(fetcher.piece.remote(path, at, min(_CHUNK, data - at)))
+                            if len(ahead) > 2:
+                                file.write(get(ahead.popleft()))
+                        while ahead:
+                            file.write(get(ahead.popleft()))
+                    file.flush()
+                    os.fsync(file.fileno())
+                os.replace(target + ".tmp", target)
+                target = None
+            for folder in folders:
+                _fsync_dir(folder)
+        except BaseException as exc:
+            if target is not None and os.path.exists(target + ".tmp"):
+                os.unlink(target + ".tmp")
+            # What Ray could not bring is lost with the node; what could not be written here is an error.
+            status = LOST if isinstance(exc, self._ray.exceptions.RayError) else ERROR
+            return self._on_done(tag, status, None, "".join(traceback.format_exception(exc)), 0)
+        finally:
+            if fetcher is not None:
+                fetcher.drop.remote(root)
+        result, used = value
+        self._on_done(tag, DONE, swap(result, here, str), None, used)
+
+    def _fetcher_on(self, node: str):
+        """The fetcher of `node`, started the first time. Hard affinity: only that node has the
+        files; a node that went away takes its fetcher with it, and its tasks run again."""
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        with self._fetchers_lock:
+            fetcher = self._fetchers.get(node)
+            if fetcher is None:
+                fetcher = self._fetchers[node] = self._fetcher.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node, soft=False)).remote()
+            return fetcher
 
     def cancel(self, handle) -> None:
         self._ray.cancel(handle)
 
     def shutdown(self) -> None:
+        if not self.shared:
+            self._writer.shutdown(wait=True)
+            self._sweep()
         self._ray.shutdown()
         self._over.set()
+
+    def _sweep(self) -> None:
+        """Each node lets go of what it kept of the files this executor carried, and of those its
+        tasks left there."""
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        sweep = self._ray.remote(num_cpus=0, max_retries=0)(_sweep)
+        refs = [sweep.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node["NodeID"], soft=False)).remote(self._home)
+                for node in self._ray.nodes() if node["Alive"]]
+        self._ray.wait(refs, num_returns=len(refs), timeout=30)  # ponytail: a node that does not answer keeps them
 
 
 class _Slots:
@@ -730,26 +842,54 @@ def _told(tally, index, call, fn, payload):
         tally.drop.remote(index)  # ponytail: a task stopped with its worker leaves its number there
 
 
-class _Carried:
-    """A file in Ray's object store."""
+_CHUNK = 64 << 20  # the most of a file in one object of Ray's store
 
-    def __init__(self, name, id, ref):
-        self.name, self.id, self.ref = name, id, ref
+
+def _pieces(path: str):
+    """The file at `path` in pieces of at most `_CHUNK` bytes, each read into the same buffer:
+    whoever takes one copies it before asking for the next."""
+    import numpy as np
+
+    with open(path, "rb", buffering=0) as file:
+        buffer = np.empty(min(os.fstat(file.fileno()).st_size, _CHUNK), np.uint8)
+        while n := file.readinto(buffer):
+            yield buffer[:n]
+
+
+def _sweep(home: str) -> None:
+    shutil.rmtree(os.path.join(tempfile.gettempdir(), "msflow-files", home), ignore_errors=True)
+
+
+class _Carried:
+    """A file in Ray's object store, and its companions: `refs` is `[(name, [ref of each piece])]`,
+    the file first. `id` is unique to the executor that carries it."""
+
+    def __init__(self, id, refs):
+        self.id, self.refs = id, refs
 
     def land(self) -> str:
-        """Its path on this node, which keeps it for the tasks that follow."""
-        # ponytail: nothing takes the copies away but whatever cleans the node's temporary
-        # directory; a sweep at `shutdown` once a cluster that lives for weeks fills its disks.
-        path = os.path.join(tempfile.gettempdir(), "msflow-files", self.id, self.name)
-        if not os.path.exists(path):
-            import ray
+        """Its path on this node, which keeps it for the tasks that follow, until the executor's
+        `shutdown`. Its companions land beside it, after it: the last one there means all of them
+        are. The tasks of a node that want it at once wait for the first to bring it."""
+        import fcntl  # ponytail: POSIX nodes only
 
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            fd, coming = tempfile.mkstemp(dir=os.path.dirname(path))
-            with os.fdopen(fd, "wb") as file:
-                file.write(ray.get(self.ref))
-            os.replace(coming, path)  # whole or not there: another task of this node may be bringing it too
-        return path
+        folder = os.path.join(tempfile.gettempdir(), "msflow-files", self.id)
+        last = os.path.join(folder, self.refs[-1][0])
+        if os.path.exists(last):
+            return os.path.join(folder, self.refs[0][0])
+        os.makedirs(folder, exist_ok=True)
+        with open(folder + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not os.path.exists(last):
+                import ray
+
+                for name, refs in self.refs:
+                    fd, coming = tempfile.mkstemp(dir=folder)
+                    with os.fdopen(fd, "wb") as file:
+                        for ref in refs:  # one piece in memory at a time
+                            file.write(ray.get(ref))
+                    os.replace(coming, os.path.join(folder, name))
+        return os.path.join(folder, self.refs[0][0])
 
 
 class _Out:
@@ -759,9 +899,19 @@ class _Out:
         self.n = n
 
 
-def _apply_far(call, fn, payload):
-    """`_apply` on a node with a disk of its own: the files come first, and what the result names goes back."""
-    root = tempfile.mkdtemp(prefix="msflow-out-")
+_INLINE = 1 << 20  # the files a task leaves come back with its result when they are this, together, at most
+
+
+def _apply_far(home, call, fn, payload):
+    """`_apply` on a node with a disk of its own: the files come first, and what the result names
+    goes back. Returns `(node, value, root, files)`, `files` in the order they are written: data
+    before index (I14). Small, they are `[(name, bytes)]`; larger, `[(name, size)]`, left in
+    `root` for `_Fetcher`."""
+    import ray
+
+    out = os.path.join(tempfile.gettempdir(), "msflow-files", home, "out")
+    os.makedirs(out, exist_ok=True)
+    root, left = tempfile.mkdtemp(dir=out), False
     try:
         def land(mark):
             if isinstance(mark, _Carried):
@@ -774,16 +924,41 @@ def _apply_far(call, fn, payload):
         def take(text):
             if text.startswith(root + os.sep):
                 inside = [os.path.join(folder, name) for folder, _, names in os.walk(text) for name in names]
-                # ponytail: the files go back in memory with the result; a file of the store for
-                # each once a task leaves more than fits there.
-                for path in inside or [text] * os.path.isfile(text):
-                    with open(path, "rb") as file:
-                        files[os.path.relpath(path, root)] = file.read()
+                named = [name for name in whole(text) if os.path.isfile(name)]  # a container, with its index
+                for path in inside or named:
+                    files[os.path.relpath(path, root)] = os.path.getsize(path)
             return text
 
         swap(value[0], take, str)
-        return value, root, files
+        names = sorted(files, key=lambda name: whole(name)[0] != name)
+        node = ray.get_runtime_context().get_node_id()
+        if sum(files.values()) > _INLINE:
+            left = True
+            return node, value, root, [(name, files[name]) for name in names]
+        brought = []
+        for name in names:
+            with open(os.path.join(root, name), "rb") as file:
+                brought.append((name, file.read()))
+        return node, value, root, brought
     finally:
+        if not left:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class _Fetcher:
+    """On a node, what its tasks left there: the files, in pieces, and then the directory."""
+
+    def piece(self, path: str, at: int, n: int):
+        import numpy as np
+
+        buffer = np.empty(n, np.uint8)
+        with open(path, "rb", buffering=0) as file:
+            file.seek(at)
+            if file.readinto(buffer) != n:
+                raise OSError(f"{path} is shorter than its task said")
+        return buffer
+
+    def drop(self, root: str) -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -818,7 +993,7 @@ def _call_whole(fn, payloads):
 
 
 def _peak_mb() -> int:
-    """High-water mark of this worker plus its largest subprocess (the docking binary)."""
+    """High-water mark of this worker plus its largest subprocess (an external binary)."""
     if resource is None:
         return 0
     peak = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -835,6 +1010,10 @@ def _yield_cpu() -> None:
     is lost on a machine with nothing else to run."""
     if hasattr(os, "nice"):  # ponytail: POSIX only; Windows would need SetPriorityClass
         os.nice(WORKER_NICE)
+    # A worker holds the cores its tokens give, no more: `import numpy` started an OpenBLAS thread
+    # per core that burned ~1 s of CPU per process. Set before any task imports numpy; a value the
+    # user set is kept. ponytail: a task with cpu > 1 that wants BLAS threads sets its own.
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 
 def _die_with_parent(parent: int) -> None:

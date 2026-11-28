@@ -22,6 +22,9 @@ the others over what its `From` makes of an earlier one, made once into
 `errors.jsonl` as above, `reduced.json` (what its `reduce` made of its results) and `done` once it
 ended, which says how many parts and lines of errors it left. `progress.json` says which `stage`
 runs and how many are done (`stages_done`), and at the end what each left (`left`).
+A stage with a `commit` has the parts its tasks wrote committed here, by the runner, into
+containers, each folder of them with its catalog (`catalog.db`, `_There`), before each result is written; the result then
+says where they went (`_committed`), and its `done` lists those containers (`files`).
 
 Nothing here listens or connects anywhere: whoever watches reads these files. Without `--ray`
 the elements run in a process pool on this machine; with it, on the Ray cluster at that address
@@ -264,11 +267,206 @@ class _Parts:
                 os.replace(self.open, self.folder / f"part-{self.n:05d}.jsonl")
 
 
+class _There:
+    """The containers the parts of a stage's tasks go into, there, as `catalog_sink` does here: one
+    writer per (folder, generation, roles), each folder of containers with a catalog of its own
+    (`catalog.db` in it, the same ids of generations as the project's), so a folder a campaign
+    keeps for the next ones (a `KeptDir`) is found by them as it was left. The runner is the one
+    process of its job that appends, and a part committed once is not twice (I10): what a task
+    that ran again left goes, so a folder holds containers, not a file per task.
+    ponytail: two campaigns of one project appending to one kept folder at once: the second's
+    commits fail on the writer's lock (Busy), and it goes again later."""
+
+    def __init__(self, home: Path):
+        self.home = Path(home)
+        self.writers, self.dbs, self.paths, self.generations = {}, {}, {}, set()
+        # Commits come on the engine's delivery thread, `files` on the one that tells the progress.
+        self.lock = threading.RLock()
+        # The folders parts came from, and those of the containers, every run of the job: what a
+        # killed task left is known by the first (`tidy`), what the job made by the second (`files`).
+        self.folders = {name: self._read(name) for name in ("part_folders", "container_folders")}
+
+    def _read(self, name: str) -> set:
+        path = self.home / name
+        return set(path.read_text().splitlines()) if path.exists() else set()
+
+    def _note(self, name: str, folders: set) -> None:
+        new = folders - self.folders[name]
+        if new:
+            self.home.mkdir(parents=True, exist_ok=True)
+            with open(self.home / name, "a") as file:
+                file.write("".join(f"{folder}\n" for folder in sorted(new)))
+                file.flush()
+                os.fsync(file.fileno())
+            self.folders[name] |= new
+
+    def _db(self, folder: str):
+        if folder not in self.dbs:
+            from ms_flow.core.database.project import ProjectStore
+
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            self.dbs[folder] = db = ProjectStore()
+            db.connect_path(Path(folder) / "catalog.db", project_dir=Path(folder))
+        return self.dbs[folder]
+
+    def commit(self, receipts: list) -> list:
+        """`receipts` committed: for each, `{part, path, shards}`, the container and its shard
+        numbers in it. A receipt is `{part, path, role, generation_id}` and maybe `folder` (where
+        its containers are: its part's folder by default), or two parts written as one
+        (`catalog.PairWriter`), `path` and `role` its index and `bulk`, `bulk_role` the other."""
+        with self.lock:
+            return self._commit(receipts)
+
+    def _commit(self, receipts: list) -> list:
+        groups: dict = {}
+        for at, receipt in enumerate(receipts):
+            key = (str(receipt.get("folder") or Path(receipt["path"]).parent), receipt.get("generation_id"),
+                   str(receipt["role"]), receipt.get("bulk_role"))
+            groups.setdefault(key, []).append(at)
+        self._note("part_folders", {str(Path(r[name]).parent) for r in receipts for name in ("path", "bulk")
+                                    if r.get(name)})
+        self._note("container_folders", {key[0] for key in groups})
+        where = [None] * len(receipts)
+        for key, places in groups.items():
+            done = self._writer(*key).commit_parts([
+                {"part": str(receipts[at]["part"]), "path": str(receipts[at]["path"]),
+                 **({"bulk": str(receipts[at]["bulk"])} if key[3] else {})} for at in places])
+            for at, receipt in zip(places, done):
+                if "error" in receipt:
+                    raise RuntimeError(f"not committed there: {receipt['error']}")
+                where[at] = self._where(key[0], receipt)
+        return where
+
+    def _writer(self, folder: str, generation_id, role: str, bulk_role):
+        from ms_flow.core.data import catalog
+
+        key = (folder, generation_id, role, bulk_role)
+        if key not in self.writers:
+            db = self._db(folder)
+            if generation_id is not None and (folder, generation_id) not in self.generations:
+                from ms_flow.core.database.project_models import ShardGeneration
+
+                with db.get_session() as session:  # the project's id, so what comes back names it
+                    if session.get(ShardGeneration, int(generation_id)) is None:
+                        session.add(ShardGeneration(id=int(generation_id), step="there"))
+                        session.commit()
+                self.generations.add((folder, generation_id))
+            self.writers[key] = (
+                catalog.PairWriter(db, folder, generation_id=generation_id, roles=(str(bulk_role), role))
+                if bulk_role else catalog.ContainerWriter(db, folder, generation_id=generation_id, role=role))
+        return self.writers[key]
+
+    def _where(self, folder: str, receipt: dict) -> dict:
+        from ms_flow.core.data.catalog import split_shard_id
+        from ms_flow.core.database.project_models import CatalogFile
+
+        def at(ids) -> dict:
+            pairs = [split_shard_id(sid) for sid in ids]
+            file_id = pairs[0][0] if pairs else None  # a part never spans two containers (I18)
+            if file_id is not None and (folder, file_id) not in self.paths:
+                with self._db(folder).get_session() as session:
+                    self.paths[folder, file_id] = session.get(CatalogFile, file_id).path
+            return {"path": self.paths.get((folder, file_id), ""), "shards": [n for _, n in pairs]}
+
+        where = {"part": receipt["part"], **at(receipt["shards"])}
+        if "bulk" in receipt:  # a pair: its other part's shards, named in the index shards' meta
+            bulk = (receipt.get("meta") or {}).get("bulk")
+            if bulk is None:  # committed before: the index says
+                from ms_flow.core.data import container
+
+                mine = set(where["shards"])
+                bulk = [sid for row in container.read_index(where["path"])[1] if row["shard"] in mine
+                        for sid in json.loads(row["meta"] or "{}").get("bulk", ())]
+            where["bulk"] = at(bulk)
+        return where
+
+    def tidy(self) -> int:
+        """Once no task runs: what parts are left in their folders, of tasks a kill cut short (theirs
+        ran again under another name), goes. How many files went."""
+        gone = 0
+        for folder in self.folders["part_folders"]:
+            for path in Path(folder).glob("*"):
+                if path.is_file() and path.name.endswith((".arrows", ".index", ".tmp")):  # a write cut short too
+                    path.unlink(missing_ok=True)
+                    gone += 1
+        return gone
+
+    def files(self) -> list:
+        """The containers of the folders the job committed to, as the rows the project registers
+        them with (`catalog.add_remote`)."""
+        from sqlmodel import select
+
+        from ms_flow.core.data import catalog
+        from ms_flow.core.database.project_models import CatalogFile
+
+        rows = []
+        with self.lock:
+            for folder in sorted(self.folders["container_folders"]):
+                with self._db(folder).get_session() as session:
+                    rows += session.exec(select(CatalogFile).order_by(CatalogFile.id)).all()
+        return [{key: getattr(row, key) for key in ("id", "path", "role", "generation_id", *catalog._COUNTS)}
+                for row in rows]
+
+    def close(self) -> None:
+        with self.lock:
+            for writer in self.writers.values():
+                writer.close()
+            self.writers.clear()
+            for db in self.dbs.values():
+                db.disconnect()
+            self.dbs.clear()
+
+
+def commit_there(home, receipts: list) -> list:
+    """`receipts` committed into the containers of the job in `home`, as its runner does (`_There`)."""
+    there = _There(Path(home))
+    try:
+        return there.commit(list(receipts))
+    finally:
+        there.close()
+
+
+def found_there(folder, part: str) -> dict | None:
+    """Where the part `part` was committed in the containers of `folder` (`{part, path, shards}`), or
+    None: what a task over there asks of a folder an earlier campaign kept, so it does not make it
+    again. From the containers' indexes alone."""
+    from ms_flow.core.data import container
+
+    for path in sorted(Path(folder).glob("*.arrows")):
+        shards = [row["shard"] for row in container.read_index(path)[1] if row["part"] == part and not row["retired"]]
+        if shards:
+            return {"part": part, "path": str(path), "shards": shards}
+    return None
+
+
 _RAN_ON: dict = {}  # what this runner runs with, told with every progress (see `ran_on`)
+_RAY_NODES = 0  # on Ray: how many nodes the job asked for, and its state is told too (`ray_state`)
+
+
+def ray_state(nodes_asked: int) -> dict:
+    """How the Ray this runner drives is: its nodes alive of those the job asked for, CPUs and cards
+    busy of all, and its object store used, in MB. Read here, where the job runs."""
+    import ray
+
+    total, free, mb = ray.cluster_resources(), ray.available_resources(), 1 << 20
+
+    def busy(name):
+        return total.get(name, 0) - free.get(name, 0)
+
+    return {"nodes": sum(1 for node in ray.nodes() if node["Alive"]), "nodes_asked": int(nodes_asked),
+            "cpus": int(total.get("CPU", 0)), "cpus_busy": int(busy("CPU")),
+            "gpus": int(total.get("GPU", 0)), "gpus_busy": int(busy("GPU")),
+            "store_mb": int(total.get("object_store_memory", 0) // mb),
+            "store_used_mb": int(busy("object_store_memory") // mb)}
 
 
 def _tell(home: Path, **progress) -> None:
     told = {**progress, "home": str(home.resolve()), "at": time.time(), "ran_on": _RAN_ON}
+    if _RAY_NODES:
+        try:
+            told["ray"] = ray_state(_RAY_NODES)
+        except Exception:  # what it says of Ray never stops what it says of the job
+            pass
     (home / "progress.tmp").write_text(json.dumps(told))
     os.replace(home / "progress.tmp", home / "progress.json")
 
@@ -282,6 +480,8 @@ def run(home, ray: str | None = None, cpus: int | None = None, nodes: int = 1, g
                            f"{_FORMAT}): submit the job again")
     if ray is not None and nodes > 1:
         _wait_for_nodes(ray, nodes)
+    global _RAY_NODES
+    _RAY_NODES = nodes if ray is not None else 0
     cpus = cpus or usable_cpus()
     if gpus is None:  # the cards the queue gave this job
         gpus = len([card for card in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if card.strip()])
@@ -331,8 +531,8 @@ def _stages(engine, home: Path, spec: dict) -> str:
                     (folder / "elements.json").write_text(json.dumps({"total": total}))
                 total = json.loads((folder / "elements.json").read_text())["total"]
             ended = _run_job(engine, home, folder, step["fn"], source, total, f"stage:{step['name']}", step["needs"],
-                             spec["part_seconds"], last=place == len(stages) - 1, stage=step["name"],
-                             stages_done=place)
+                             spec["part_seconds"], last=place == len(stages) - 1, commit=step.get("commit"),
+                             stage=step["name"], stages_done=place)
             if not ended.startswith("completed"):
                 return ended
             if step["reduce"] is not None:
@@ -341,9 +541,16 @@ def _stages(engine, home: Path, spec: dict) -> str:
                 os.replace(folder / "reduced.tmp", folder / "reduced.json")
             # What it left, for whoever takes it to see that all of it came (and nothing was purged).
             errors = folder / "errors.jsonl"
-            (folder / "done").write_text(json.dumps({
-                "parts": len(list((folder / "results").glob("part-*.jsonl"))),
-                "errors": len(errors.read_text().splitlines()) if errors.exists() else 0}))
+            left = {"parts": len(list((folder / "results").glob("part-*.jsonl"))),
+                    "errors": len(errors.read_text().splitlines()) if errors.exists() else 0}
+            if step.get("commit") is not None:  # the containers there, for the project to register
+                there = _There(home)
+                try:
+                    there.tidy()
+                    left["files"] = there.files()
+                finally:
+                    there.close()
+            (folder / "done").write_text(json.dumps(left, default=str))
         if (folder / "errors.jsonl").exists():
             status = "completed_with_errors"
     try:
@@ -384,10 +591,21 @@ def _returns_data(fn, batched, payload):
 
 
 def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key: str, needs: dict,
-             part_seconds: float, last: bool = True, **said) -> str:
+             part_seconds: float, last: bool = True, commit=None, **said) -> str:
     """Run `fn` over the elements in `source` as the job `key` of the journal, its results and
-    errors to `folder`. Only the `last` job of a run says it completed: the next run would do nothing."""
+    errors to `folder`. Only the `last` job of a run says it completed: the next run would do nothing.
+    `commit`: what makes the receipts of a result (see `_There`); they are committed there before
+    the result is written, which then says where they went (`_committed`)."""
     index_of, parts = {}, _Parts(folder / "results", part_seconds)
+    there = _There(home) if commit is not None else None
+
+    def delivered(pairs):
+        lines = []
+        for key, result in pairs:
+            if there is not None:
+                result = {**result, "_committed": there.commit(commit(result))}
+            lines.append(_line([index_of[key], result], "a result"))
+        parts.write(lines)
 
     def here(mark):
         if isinstance(mark, Dir) and not os.path.isabs(mark):
@@ -410,13 +628,15 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
 
     def tell(now, running):
         status = now.status if last or not now.status.startswith("completed") else "running"
+        # What it committed there so far: whoever follows it registers and brings it as it grows.
+        made = {"files": there.files()} if there is not None else {}
         _tell(home, total=now.chunks_total, done=now.chunks_done, failed=now.chunks_failed, running=running,
-              status=status, error=None if now.status in _GOING else now.error, **said)
+              status=status, error=None if now.status in _GOING else now.error, **said, **made)
 
     job = engine.submit(
         "run", partial(_returns_data, fn, needs.get("batched", False)), elements(), total=total, journal="journal",
         key=key,
-        on_results=lambda pairs: parts.write([_line([index_of[key], result], "a result") for key, result in pairs]),
+        on_results=delivered,
         on_error=failed, **needs)
     try:
         while True:
@@ -431,6 +651,9 @@ def _run_job(engine, home: Path, folder: Path, fn, source: Path, total: int, key
         parts.roll(force=True)
         tell(engine.status(job), 0)
         raise
+    finally:
+        if there is not None:
+            there.close()
 
 
 def main(argv=None) -> int:

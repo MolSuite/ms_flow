@@ -208,8 +208,8 @@ def summarize(records: list[dict]) -> list[dict]:
 
 VOL_BASE = "2026-10-15"  # the hand-run the volumes plan (08) must reproduce
 VOL_MARGIN_PCT = 10.0  # "Hecho cuando" of V0
-VOL_COLS = (("import_s", "import s"), ("durable_s", "import + sync s"), ("size_mb", "size MB"), ("files", "files"), ("get_mol_p50_us", "get_mol p50 µs"),
-            ("get_mol_p99_us", "get_mol p99 µs"), ("stream_all_current_s", "stream all s"),
+VOL_COLS = (("import_s", "import s"), ("durable_s", "import + sync s"), ("size_mb", "size MB"), ("files", "files"), ("get_spc_p50_us", "get_mol p50 µs"),
+            ("get_spc_p99_us", "get_mol p99 µs"), ("stream_all_current_s", "stream all s"),
             ("stream_all_current_s_cold", "stream all s, cold"), ("random_s", "random read s"),
             ("random_s_cold", "random read s, cold"), ("update_5000_s", "update 5000 s"))
 VOL_DRIFT = (("import_s", "import s"), ("stream_all_current_s", "stream all s"))
@@ -520,7 +520,7 @@ td.b, th.b { border-left: 1px solid var(--border); }
 
 <div class="card" id="volumes-card" hidden>
   <h2>Volumes</h2>
-  <p class="sub"><code>bench_volumes.py</code> stores molecule payloads two ways and times the same reads on both: SQLite blobs
+  <p class="sub"><code>bench_volumes.py</code> stores specimen payloads two ways and times the same reads on both: SQLite blobs
     (<b>RT</b>) against append-only volumes (serial: <b>HT</b> no fsync, <b>H</b> fsync per shard; parallel: <b>VP</b> the parent
     writes, <b>VC</b> one segment per chunk, <b>PJ</b> a real ms_flow job whose rows carry <code>Payload</code>s, <b>PJZ</b>/<b>PJD</b> the same with zstd, without and with a dictionary per series; <b>PS</b> the real <code>PayloadStore</code> with one fsync per commit, <b>PSN</b> the same
     without it). <b>Warm</b> reads run right after the import, with the data in the page cache;
@@ -666,7 +666,7 @@ function jobs() {
 
 function reads() {
   const c = D.volumes.reads, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
-  document.getElementById('reads').innerHTML = !c.length ? '' : `<h3>Reading everything cold (V3)</h3><table><tr><th class="l">Run</th><th>molecules</th>`
+  document.getElementById('reads').innerHTML = !c.length ? '' : `<h3>Reading everything cold (V3)</h3><table><tr><th class="l">Run</th><th>specimens</th>`
     + `<th class="b">PJ job source s</th><th>vs VP</th><th>PJ export s</th><th>vs VP</th><th>VP reader s</th><th>MB read from the disk</th></tr>`
     + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td class="b">${f(r.source)}</td><td>${pc(r.source_vs_vp_pct)}</td>`
       + `<td>${f(r.export)}</td><td>${pc(r.export_vs_vp_pct)}</td><td>${f(r.VP)}</td><td>${f(r.disk_mb)}</td></tr>`).join('') + '</table>'
@@ -675,7 +675,7 @@ function reads() {
 
 function codecs() {
   const c = D.volumes.codecs, f = v => v == null ? '' : num(v), pc = v => v == null ? '' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(1)} %`;
-  document.getElementById('codecs').innerHTML = !c.length ? '' : `<h3>Codecs (V5)</h3><table><tr><th class="l">Run</th><th class="l">Variant</th><th class="l">Codec</th><th>molecules</th>`
+  document.getElementById('codecs').innerHTML = !c.length ? '' : `<h3>Codecs (V5)</h3><table><tr><th class="l">Run</th><th class="l">Variant</th><th class="l">Codec</th><th>specimens</th>`
     + `<th class="b">import + sync s</th><th>vs PJ</th><th>raw MB</th><th>stored MB</th><th>ratio</th><th>job source s, cold</th><th>vs PJ</th><th>export s, cold</th><th>vs PJ</th></tr>`
     + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td class="l">${esc(r.variant)}</td><td class="l">${esc(r.codec)}</td><td>${f(r.n)}</td>`
       + `<td class="b">${f(r.durable)}</td><td>${pc(r.durable_vs_pj_pct)}</td><td>${f(r.raw_mb)}</td><td>${f(r.stored_mb)}</td><td>${f(r.ratio)}</td>`
@@ -685,12 +685,12 @@ function codecs() {
 
 function maintenance() {
   const c = D.volumes.maintenance, f = v => v == null ? '' : num(v);
-  document.getElementById('maintenance').innerHTML = !c.length ? '' : `<h3>Maintenance (V4)</h3><table><tr><th class="l">Run</th><th>molecules</th><th>volume MB</th>`
+  document.getElementById('maintenance').innerHTML = !c.length ? '' : `<h3>Maintenance (V4)</h3><table><tr><th class="l">Run</th><th>specimens</th><th>volume MB</th>`
     + `<th>full check s, cold</th><th>released</th><th>release s</th><th class="b">compact s, cold</th><th>MB/s</th><th>volumes</th><th>MB read</th><th>MB written</th></tr>`
     + c.map(r => `<tr><td class="l">${esc(r.label)}</td><td>${f(r.n)}</td><td>${f(r.volume_mb)}</td><td>${f(r.check_full_s_cold)}</td><td>${f(r.released)}</td>`
       + `<td>${f(r.release_s)}</td><td class="b">${f(r.compact_s_cold)}</td><td>${f(r.compact_mb_s)}</td><td>${f(r.compacted_volumes)}</td>`
       + `<td>${f(r.compact_read_mb)}</td><td>${f(r.compact_written_mb)}</td></tr>`).join('') + '</table>'
-    + '<p class="note">The PJ job with zstd into smaller volumes, so several get sealed; then <code>check(full=True)</code> reads every needle, half the molecules are deleted and their payloads released, and <code>compact()</code> copies the live needles of the sealed volumes left half dead. MB/s is the live data read by the compaction over its time. Check and compaction start with the files evicted from the page cache.</p>';
+    + '<p class="note">The PJ job with zstd into smaller volumes, so several get sealed; then <code>check(full=True)</code> reads every needle, half the specimens are deleted and their payloads released, and <code>compact()</code> copies the live needles of the sealed volumes left half dead. MB/s is the live data read by the compaction over its time. Check and compaction start with the files evicted from the page cache.</p>';
 }
 
 function table(host) {

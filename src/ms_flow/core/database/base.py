@@ -84,15 +84,59 @@ def create_session_factory(engine):
     )
 
 
-def create_project_tables(engine):
-    all_tables = list(SQLModel.metadata.tables.values())
-    project_tables = [
-        table
-        for table in all_tables
-        if table.name not in MASTER_TABLE_NAMES
-    ]
-    if project_tables:
-        SQLModel.metadata.create_all(engine, tables=project_tables)
+PROJECT_SCHEMA = 2  # the project tables as this version writes them; checked on every open
+
+
+class ProjectSchemaError(RuntimeError):
+    """A project database this version cannot open. It was left as it was."""
+
+
+def create_project_tables(engine, db_path: Path | str | None = None):
+    """The project tables, after checking the project's schema version, in one transaction (D5).
+
+    A database without project tables is new: created at `PROJECT_SCHEMA`. One at that version
+    gets the tables it lacks. Any other version is refused before anything is written: no
+    migration, no table recreated (D5a). SQLite DDL is atomic with this driver only inside a
+    `BEGIN` of our own.
+    """
+    tables = [table for table in SQLModel.metadata.sorted_tables if table.name not in MASTER_TABLE_NAMES]
+    with engine.connect() as conn:
+        raw = conn.connection.driver_connection
+        level = raw.isolation_level
+        raw.isolation_level = None  # our BEGIN, so the DDL (and its after_create seeds) is one transaction
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                _check_project_schema(conn, db_path)
+                SQLModel.metadata.create_all(conn, tables=tables)
+                conn.exec_driver_sql(f"CREATE TABLE IF NOT EXISTS {SCHEMA_VERSION_TABLE} (schema_name TEXT PRIMARY KEY, "
+                                     "version INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                conn.exec_driver_sql(f"INSERT INTO {SCHEMA_VERSION_TABLE} (schema_name, version) VALUES ('project', ?) "
+                                     "ON CONFLICT(schema_name) DO NOTHING", (PROJECT_SCHEMA,))
+            except BaseException:
+                raw.execute("ROLLBACK")
+                raise
+            raw.execute("COMMIT")
+        finally:
+            raw.isolation_level = level
+
+
+def _check_project_schema(conn, db_path) -> None:
+    names = {row[0] for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    version = None
+    if SCHEMA_VERSION_TABLE in names:
+        found = conn.exec_driver_sql(
+            f"SELECT version FROM {SCHEMA_VERSION_TABLE} WHERE schema_name = 'project'").fetchone()
+        version = int(found[0]) if found is not None else None
+    existing = {name for name in names if not name.startswith("sqlite_") and name != SCHEMA_VERSION_TABLE}
+    where = Path(db_path).parent if db_path is not None else "this project"
+    if version is not None and version > PROJECT_SCHEMA:
+        raise ProjectSchemaError(f"{where}: made by a newer version (project schema {version}, "
+                                 f"this one reads {PROJECT_SCHEMA}). Open it with that version.")
+    if version != PROJECT_SCHEMA and existing:
+        raise ProjectSchemaError(f"{where}: made by an older version (project schema {version or 1}, "
+                                 f"this one reads {PROJECT_SCHEMA}) and cannot be opened. "
+                                 "Make a new project and import its data again.")
 
 
 class BaseSQLiteDB(ABC):
@@ -213,3 +257,21 @@ class BaseSQLiteDB(ABC):
             self.engine.dispose()
             self.engine = None
         self._session_factory = None
+
+
+class ProjectTablesDB(BaseSQLiteDB):
+    """A handle on a project database. Every one shares the namespace and the version: a class
+    of its own would read version 0 of the same file."""
+
+    def _create_tables(self):
+        try:
+            create_project_tables(self.engine, self.db_path)
+        except ProjectSchemaError:
+            self.engine.dispose()
+            raise
+
+    def _schema_namespace(self) -> str:
+        return "project"
+
+    def _schema_version(self) -> int:
+        return PROJECT_SCHEMA

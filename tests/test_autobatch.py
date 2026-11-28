@@ -42,7 +42,7 @@ def test_a_slow_task_of_one_grows_only_as_far_as_the_limit_allows():
 
 def test_two_cards_of_different_speed_settle_where_both_get_through_near_the_most():
     """One size for both (as on a Ray cluster), not the slow card's. The cards are the GTX 1660
-    SUPER and 1050 Ti of the M0 runs (Uni-Dock): t(n) = a + b·n each."""
+    SUPER and 1050 Ti of the M0 runs (GPU solver): t(n) = a + b·n each."""
     cards = [lambda n: (n + 31) / 11.4, lambda n: (n + 19) / 4.8]  # seconds for a task of n
 
     def together(size):

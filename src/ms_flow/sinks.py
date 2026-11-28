@@ -192,4 +192,59 @@ def file_sink(
     )
 
 
-__all__ = ["file_sink", "graph_sink", "table_sink"]
+class CatalogWriter:
+    """The writer `catalog_sink` makes: each group of receipts (`catalog.file_row(path, part=...)`)
+    is committed into the containers of its ``(generation, role)``, beside its parts, by one
+    `catalog.ContainerWriter` each, kept until the job ends (it holds their lock). A part that
+    could not be committed stays out: its origin is still to derive, and the job fails at the end.
+    ``tables`` is what the jobs reading the catalog wait for."""
+
+    tables = ("ms_shard_files",)
+
+    def __init__(self, project_db) -> None:
+        self.project_db, self._writers, self.failed = project_db, {}, []
+
+    def write(self, results: list) -> None:
+        from ms_flow.core.data.catalog import ContainerWriter
+
+        groups: dict[tuple[int, str], list[dict]] = {}
+        for result in results:
+            for receipt in (result if isinstance(result, list) else [result]):
+                if not receipt.get("part"):
+                    raise ValueError(f"{receipt.get('path')}: a receipt names its part (catalog.file_row(part=))")
+                groups.setdefault((int(receipt["generation_id"]), str(receipt["role"])), []).append(receipt)
+        for (generation_id, role), receipts in groups.items():
+            writer = self._writers.get((generation_id, role))
+            if writer is None:  # ponytail: the containers of a role live beside its first part
+                writer = self._writers[(generation_id, role)] = ContainerWriter(
+                    self.project_db, Path(receipts[0]["path"]).parent, generation_id=generation_id, role=role)
+            self.failed += [receipt["error"] for receipt in writer.commit_parts(receipts) if receipt.get("error")]
+
+    def finish(self) -> None:
+        self.close()
+        if self.failed:
+            raise RuntimeError(f"{len(self.failed)} part(s) not committed, first: {self.failed[0]}")
+
+    def ended(self, _snapshot) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for writer in self._writers.values():
+            writer.close()
+        self._writers.clear()
+
+
+def catalog_sink():
+    """The output of a step whose tasks each write a part and return its receipt,
+    ``catalog.file_row(path, role=..., generation_id=..., part=...)``: the parts are appended to
+    the containers of their role as the results arrive (`CatalogWriter`), no merge pass. ``part``
+    names the task's unit of work in this submission: a receipt delivered twice commits once, a
+    redo is a new submission. `catalog.sweep` at the job's start deletes what a crash left, and
+    `catalog.underived` is the resume."""
+    def make(_params, project) -> CatalogWriter:
+        return CatalogWriter(project)
+
+    return make
+
+
+__all__ = ["CatalogWriter", "catalog_sink", "file_sink", "graph_sink", "table_sink"]

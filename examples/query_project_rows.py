@@ -12,7 +12,7 @@ sys.path.insert(0, str(_REPO / "src"))  # to run straight from the repo without 
 sys.path.insert(0, str(_REPO / "examples"))
 
 from ms_flow import Workspace  # noqa: E402
-from workers import Label, Molecule, label_ready_molecules  # noqa: E402
+from workers import Label, Specimen, label_ready_specimens  # noqa: E402
 
 
 def main() -> None:
@@ -22,17 +22,17 @@ def main() -> None:
             name="query_demo_project", folder=Path("./query_demo_project").resolve(), activate=True
         )
         ms.project_db.delete(Label)  # the same result on every run
-        ms.project_db.delete(Molecule)
+        ms.project_db.delete(Specimen)
         ms.project_db.insert_batch([
-            Molecule(id=1, name="MolA", status="ready"),
-            Molecule(id=2, name="MolB", status="ready"),
-            Molecule(id=3, name="MolC", status="archived"),
+            Specimen(id=1, name="MolA", status="ready"),
+            Specimen(id=2, name="MolB", status="ready"),
+            Specimen(id=3, name="MolC", status="archived"),
         ])
 
-        # The job reads `molecules` in pages (`Rows`), so the rows never travel in the submit.
-        job_id = ms.submit(label_ready_molecules, executor="thread")
+        # The job reads `specimens` in pages (`Rows`), so the rows never travel in the submit.
+        job_id = ms.submit(label_ready_specimens, executor="thread")
         print(ms.engine.wait(job_id).status)
-        print(ms.project_db.select_rows(Label, fields=("molecule_id", "label"), order=("molecule_id",)))
+        print(ms.project_db.select_rows(Label, fields=("specimen_id", "label"), order=("specimen_id",)))
     finally:
         ms.shutdown()
 

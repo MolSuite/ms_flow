@@ -142,7 +142,7 @@ def test_entity_loader_context_exposes_project_db(tmp_path, monkeypatch):
             name="project_loader_ctx",
             folder=project_dir,
             description="loader ctx test",
-            scope="docking",
+            scope="coupling",
             activate=True,
         )
         loader_ctx = ms.get_entity_loader_context()
@@ -165,8 +165,8 @@ def test_workspace_project_resources_are_resolved_from_active_project(tmp_path, 
     ms = Workspace(
         app_id="testruntime",
         project_resources=(
-            ProjectResourceSpec(key="ligands", relative_path="data/ligands"),
-            ProjectResourceSpec(key="docking_results", relative_path="results/docking"),
+            ProjectResourceSpec(key="guests", relative_path="data/guests"),
+            ProjectResourceSpec(key="coupling_results", relative_path="results/coupling"),
         ),
     )
     try:
@@ -180,26 +180,26 @@ def test_workspace_project_resources_are_resolved_from_active_project(tmp_path, 
         resources = ms.get_project_resource_map()
         loader_ctx = ms.get_project_data_context()
 
-        assert set(resources) == {"docking_results", "ligands"}
-        assert resources["ligands"]["relative_path"] == "data/ligands"
-        assert Path(resources["ligands"]["path"]) == project_dir / "data" / "ligands"
+        assert set(resources) == {"coupling_results", "guests"}
+        assert resources["guests"]["relative_path"] == "data/guests"
+        assert Path(resources["guests"]["path"]) == project_dir / "data" / "guests"
         assert loader_ctx.project_resources == resources
-        assert ms.get_project_resource_path("docking_results", "scores.csv", create_parent=True) == (
-            project_dir / "results" / "docking" / "scores.csv"
+        assert ms.get_project_resource_path("coupling_results", "scores.csv", create_parent=True) == (
+            project_dir / "results" / "coupling" / "scores.csv"
         )
-        assert (project_dir / "results" / "docking").is_dir()
+        assert (project_dir / "results" / "coupling").is_dir()
     finally:
         ms.shutdown()
 
 
 def test_base_runtime_open_project_accepts_owned_project(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    runtime = BaseRuntime("amdockvs")
+    runtime = BaseRuntime("demoapp")
 
     try:
         owned_context = runtime.workspace.create_project(
-            name="dock-owned",
-            folder=tmp_path / "dock-owned",
+            name="couple-owned",
+            folder=tmp_path / "couple-owned",
             description="owned by runtime",
             activate=False,
         )
@@ -208,20 +208,20 @@ def test_base_runtime_open_project_accepts_owned_project(tmp_path, monkeypatch):
 
         assert opened_context.id == owned_context.id
         assert runtime.active_context is not None
-        assert runtime.active_context.app_id == "amdockvs"
+        assert runtime.active_context.app_id == "demoapp"
     finally:
         runtime.shutdown()
 
 
 def test_base_runtime_open_project_rejects_foreign_app_project(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    runtime = BaseRuntime("amdockvs")
+    runtime = BaseRuntime("demoapp")
     foreign_ms = Workspace(app_id="otherapp")
 
     try:
         foreign_context = foreign_ms.create_project(
-            name="dock-foreign",
-            folder=tmp_path / "dock-foreign",
+            name="couple-foreign",
+            folder=tmp_path / "couple-foreign",
             description="foreign app project",
             activate=False,
         )
@@ -237,7 +237,7 @@ def test_base_runtime_open_project_rejects_foreign_app_project(tmp_path, monkeyp
 
 def test_base_runtime_create_or_open_project_ignores_foreign_name_match(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    runtime = BaseRuntime("amdockvs")
+    runtime = BaseRuntime("demoapp")
     foreign_ms = Workspace(app_id="otherapp")
 
     try:
@@ -250,13 +250,13 @@ def test_base_runtime_create_or_open_project_ignores_foreign_name_match(tmp_path
 
         own_context = runtime.create_or_open_project(
             name="shared-name",
-            folder=tmp_path / "amdockvs-project",
+            folder=tmp_path / "demoapp-project",
             description="owned by runtime",
         )
 
         assert own_context.id != foreign_context.id
-        assert own_context.app_id == "amdockvs"
-        assert own_context.path == (tmp_path / "amdockvs-project")
+        assert own_context.app_id == "demoapp"
+        assert own_context.path == (tmp_path / "demoapp-project")
     finally:
         foreign_ms.shutdown()
         runtime.shutdown()
@@ -264,7 +264,7 @@ def test_base_runtime_create_or_open_project_ignores_foreign_name_match(tmp_path
 
 def test_base_runtime_create_or_open_project_rejects_foreign_path_match(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    runtime = BaseRuntime("amdockvs")
+    runtime = BaseRuntime("demoapp")
     foreign_ms = Workspace(app_id="otherapp")
 
     try:
@@ -277,7 +277,7 @@ def test_base_runtime_create_or_open_project_rejects_foreign_path_match(tmp_path
 
         with pytest.raises(ValueError, match="already belongs to project"):
             runtime.create_or_open_project(
-                name="amdockvs-project",
+                name="demoapp-project",
                 folder=tmp_path / "shared-folder",
                 description="should fail",
             )
@@ -290,7 +290,7 @@ def test_base_runtime_create_or_open_project_rejects_foreign_path_match(tmp_path
 
 def test_workspace_open_project_rejects_foreign_project_id(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = Workspace(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="demoapp")
     foreign_ms = Workspace(app_id="otherapp")
 
     try:
@@ -312,7 +312,7 @@ def test_workspace_open_project_rejects_foreign_project_id(tmp_path, monkeypatch
 
 def test_workspace_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = Workspace(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="demoapp")
     foreign_ms = Workspace(app_id="otherapp")
 
     try:
@@ -333,7 +333,7 @@ def test_workspace_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatc
 
         assert found is not None
         assert found.id == own_context.id
-        assert found.app_id == "amdockvs"
+        assert found.app_id == "demoapp"
     finally:
         foreign_ms.shutdown()
         scoped_ms.shutdown()
@@ -341,24 +341,24 @@ def test_workspace_find_project_is_scoped_when_names_repeat(tmp_path, monkeypatc
 
 def test_workspace_scoped_app_id_filters_pagination_at_query_level(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = Workspace(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="demoapp")
 
     try:
         now = datetime.now()
         with scoped_ms.master_db.get_session() as session:
             session.add(
                 Project(
-                    name="amdock-old-1",
-                    path=str(tmp_path / "amdock-old-1"),
-                    app_id="amdockvs",
+                    name="demoapp-old-1",
+                    path=str(tmp_path / "demoapp-old-1"),
+                    app_id="demoapp",
                     updated_at=now - timedelta(minutes=4),
                 )
             )
             session.add(
                 Project(
-                    name="amdock-old-2",
-                    path=str(tmp_path / "amdock-old-2"),
-                    app_id="amdockvs",
+                    name="demoapp-old-2",
+                    path=str(tmp_path / "demoapp-old-2"),
+                    app_id="demoapp",
                     updated_at=now - timedelta(minutes=3),
                 )
             )
@@ -382,15 +382,15 @@ def test_workspace_scoped_app_id_filters_pagination_at_query_level(tmp_path, mon
 
         page = scoped_ms.list_projects(page=1, items_per_page=2)
 
-        assert [project.name for project in page] == ["amdock-old-2", "amdock-old-1"]
-        assert all(project.app_id == "amdockvs" for project in page)
+        assert [project.name for project in page] == ["demoapp-old-2", "demoapp-old-1"]
+        assert all(project.app_id == "demoapp" for project in page)
     finally:
         scoped_ms.shutdown()
 
 
 def test_workspace_scoped_app_id_filters_pagination_across_multiple_pages(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    scoped_ms = Workspace(app_id="amdockvs")
+    scoped_ms = Workspace(app_id="demoapp")
 
     try:
         now = datetime.now()
@@ -398,9 +398,9 @@ def test_workspace_scoped_app_id_filters_pagination_across_multiple_pages(tmp_pa
             for index in range(6):
                 session.add(
                     Project(
-                        name=f"amdock-{index}",
-                        path=str(tmp_path / f"amdock-{index}"),
-                        app_id="amdockvs",
+                        name=f"demoapp-{index}",
+                        path=str(tmp_path / f"demoapp-{index}"),
+                        app_id="demoapp",
                         updated_at=now - timedelta(minutes=20 - index),
                     )
                 )
@@ -418,17 +418,17 @@ def test_workspace_scoped_app_id_filters_pagination_across_multiple_pages(tmp_pa
         page2 = scoped_ms.list_projects(page=2, items_per_page=2)
         page3 = scoped_ms.list_projects(page=3, items_per_page=2)
 
-        assert [project.name for project in page1] == ["amdock-5", "amdock-4"]
-        assert [project.name for project in page2] == ["amdock-3", "amdock-2"]
-        assert [project.name for project in page3] == ["amdock-1", "amdock-0"]
-        assert all(project.app_id == "amdockvs" for project in page1 + page2 + page3)
+        assert [project.name for project in page1] == ["demoapp-5", "demoapp-4"]
+        assert [project.name for project in page2] == ["demoapp-3", "demoapp-2"]
+        assert [project.name for project in page3] == ["demoapp-1", "demoapp-0"]
+        assert all(project.app_id == "demoapp" for project in page1 + page2 + page3)
     finally:
         scoped_ms.shutdown()
 
 
 def test_workspace_scoped_app_id_defaults_project_creation(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    ms = Workspace(app_id="amdockvs")
+    ms = Workspace(app_id="demoapp")
 
     try:
         context = ms.create_project(
@@ -438,20 +438,20 @@ def test_workspace_scoped_app_id_defaults_project_creation(tmp_path, monkeypatch
             activate=False,
         )
 
-        assert context.app_id == "amdockvs"
-        assert context.scope == "amdockvs"
+        assert context.app_id == "demoapp"
+        assert context.scope == "demoapp"
     finally:
         ms.shutdown()
 
 
 def test_app_runtime_exposes_scoped_project_catalog(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
-    runtime = AppRuntime("amdockvs")
+    runtime = AppRuntime("demoapp")
 
     try:
         catalog = runtime.project_catalog
 
-        assert catalog.app_id == "amdockvs"
+        assert catalog.app_id == "demoapp"
         assert runtime.project_catalog is catalog
     finally:
         runtime.shutdown()
@@ -465,7 +465,7 @@ def test_app_runtime_exposes_declarative_app_settings(tmp_path, monkeypatch):
         value_type="integer",
         minimum=1,
     )
-    runtime = AppRuntime("amdockvs", app_settings=(setting,))
+    runtime = AppRuntime("demoapp", app_settings=(setting,))
 
     try:
         assert runtime.app_setting_specs() == (setting,)
@@ -481,22 +481,22 @@ def test_app_runtime_exposes_declarative_app_settings(tmp_path, monkeypatch):
 def test_app_runtime_project_resources_follow_manifest_like_contract(tmp_path, monkeypatch):
     _patch_fake_home(monkeypatch, tmp_path)
     runtime = AppRuntime(
-        "amdockvs",
+        "demoapp",
         project_resources=(
-            ProjectResourceSpec(key="ligands", relative_path="data/ligands"),
-            ProjectResourceSpec(key="receptors", relative_path="data/receptors"),
+            ProjectResourceSpec(key="guests", relative_path="data/guests"),
+            ProjectResourceSpec(key="anchors", relative_path="data/anchors"),
         ),
     )
 
     try:
         runtime.create_project(
-            name="amdock-project",
-            folder=tmp_path / "amdock-project",
+            name="demoapp-project",
+            folder=tmp_path / "demoapp-project",
             description="runtime resource test",
         )
 
-        assert tuple(spec.key for spec in runtime.project_resource_specs()) == ("ligands", "receptors")
-        assert runtime.get_project_resource_path("ligands") == tmp_path / "amdock-project" / "data" / "ligands"
-        assert not (tmp_path / "amdock-project" / "data").exists()
+        assert tuple(spec.key for spec in runtime.project_resource_specs()) == ("guests", "anchors")
+        assert runtime.get_project_resource_path("guests") == tmp_path / "demoapp-project" / "data" / "guests"
+        assert not (tmp_path / "demoapp-project" / "data").exists()
     finally:
         runtime.shutdown()

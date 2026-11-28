@@ -12,6 +12,7 @@ from contextlib import closing
 import pytest
 
 from benchmarks.refactor_optimization import workers
+from ms_flow.engine import engine as engine_module
 from ms_flow.engine import Engine, ProcessExecutor, ThreadExecutor, content_key, launched, report
 
 
@@ -29,6 +30,10 @@ def _echo(payload):
 
 def _nice(payload):
     return os.nice(0)
+
+
+def _blas_threads(payload):
+    return os.environ.get("OPENBLAS_NUM_THREADS")
 
 
 def _card(payload):
@@ -55,7 +60,7 @@ def _half_then_held(payload):
 
 
 def _waits_for_a_program(payload):
-    """What a docking task does: starts a program, tells of it and waits for it."""
+    """What a coupling task does: starts a program, tells of it and waits for it."""
     program = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({payload['s']})"])
     launched(program)
     report(0.5)
@@ -173,6 +178,58 @@ def test_results_are_taken_in_groups_and_done_only_once_taken():
         assert "cannot store 8" in errors[content_key(4)] and "three" in errors[content_key(3)]
 
 
+def _short(payload):
+    time.sleep(0.02)
+    return payload
+
+
+def test_results_arriving_one_by_one_are_held_into_groups():
+    """A callback with a fixed cost (a commit) is called once for several results that arrive one
+    by one; what is held never keeps a worker idle, and the last results are not held (nothing
+    else of the job runs)."""
+    sizes = []
+
+    def write(pairs):
+        sizes.append(len(pairs))
+
+    def timed(**callback):
+        start = time.perf_counter()
+        snap = engine.wait(engine.submit("thread", _short, range(200), window=16, **callback), 30)
+        assert snap.chunks_done == 200
+        return time.perf_counter() - start
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        fed = timed()  # nothing delivered, nothing held: the workers' pace on this machine
+        took = timed(on_results=write)
+        assert sum(sizes) == 200
+        assert len(sizes) <= 200 // 3, sizes  # one at a time before
+        # 200 x 20 ms on 4 threads is 1 s when the workers stay fed; a slow machine (a macOS
+        # runner sleeps long) is measured against itself, not against that second.
+        assert took < 1.5 * fed + 0.5, (took, fed)
+
+
+def _sleep(payload):
+    time.sleep(payload)
+    return payload
+
+
+def test_a_few_results_ending_together_are_not_held_for_more():
+    """Held only while more of the job keep coming: three tasks ending together reach the
+    callback at once, not a `_DELIVER_WAIT` later, though the job still runs a long one."""
+    came = []
+
+    with Engine(cpus=4, mem_mb=0) as engine:
+        engine.register("thread", ThreadExecutor(4))
+        start = time.perf_counter()
+        job = engine.submit("thread", _sleep, [0.05, 0.05, 0.05, 3.0],
+                            on_results=lambda pairs: came.append((time.perf_counter() - start, len(pairs))))
+        while sum(n for _, n in came) < 3 and time.perf_counter() - start < 2.5:
+            time.sleep(0.01)
+        assert sum(n for _, n in came[:3]) == 3 and came[-1][0] < 0.6, came
+        engine.wait(job, 30)
+
+
 @pytest.mark.parametrize("cost, expected", [
     ({"cpu": 2}, 4),                # 8 CPUs / 2
     ({"mem_mb": 400}, 2),           # 1000 MB / 400
@@ -272,8 +329,8 @@ def test_an_executor_with_a_total_gets_only_the_tasks_it_has_room_for():
 
 
 def test_a_cpu_job_runs_beside_a_gpu_job_on_what_the_gpu_job_leaves():
-    """Two Ray nodes, one GPU each: a GPU docking held every CPU in waiting tasks, and a CPU
-    docking sent after it waited for all of them. It runs now on the CPUs the GPU job leaves."""
+    """Two Ray nodes, one GPU each: a GPU coupling held every CPU in waiting tasks, and a CPU
+    coupling sent after it waited for all of them. It runs now on the CPUs the GPU job leaves."""
     costed, lock = _Costed(), threading.Lock()
     costed.total = (4, 1, 0)
     running, both = {"gpu": 0, "cpu": 0}, []
@@ -298,12 +355,12 @@ def test_a_cpu_job_runs_beside_a_gpu_job_on_what_the_gpu_job_leaves():
     assert any(seen["gpu"] and seen["cpu"] == 3 for seen in both)  # side by side, on all that is left
 
 def test_content_key_is_the_same_in_another_process():
-    payload = {"ligand": "CCO", "receptor": ["1abc", 7], "box": (1.5, 2.0)}
+    payload = {"guest": "CCO", "anchor": ["1abc", 7], "box": (1.5, 2.0)}
     code = f"from ms_flow.engine import content_key; print(content_key({payload!r}).hex())"
     other = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
     assert other.stdout.strip() == content_key(payload).hex() and len(content_key(payload)) == 16
-    assert content_key({"ligand": "CCN"}) != content_key({"ligand": "CCO"})
+    assert content_key({"guest": "CCN"}) != content_key({"guest": "CCO"})
     assert content_key(threading.Lock()) != content_key(threading.Lock())  # unknown content: never equal
 
 
@@ -464,7 +521,7 @@ class _CountingPool(ProcessExecutor):
 
 
 @pytest.mark.slow
-def test_short_chunks_share_a_task_and_long_ones_do_not():
+def test_short_chunks_share_a_task_and_long_ones_do_not(monkeypatch):
     results, errors = {}, {}
     with Engine(cpus=4, mem_mb=0) as engine:
         pool = _CountingPool(4)
@@ -479,7 +536,10 @@ def test_short_chunks_share_a_task_and_long_ones_do_not():
         assert len(results) == 4999 and results[content_key(payloads[8])] == {"idx": 8}
         assert pool.tasks < 1000 and engine.tokens.free[0] == 4
 
-        pool.tasks = 0  # a chunk worth a task of its own gets one
+        # A chunk worth a task of its own gets one. A loaded machine (the suite in parallel) makes
+        # trips of several ms, and 100 of them outlast 0.2 s: the engine rightly packs two then.
+        monkeypatch.setattr(engine_module, "_TRIPS", 1)
+        pool.tasks = 0
         long = engine.wait(engine.submit("process", workers.nap, [{"idx": i, "s": 0.2} for i in range(40)]), 120)
         assert (long.status, long.chunks_done, pool.tasks) == ("completed", 40, 40)
 
@@ -544,6 +604,23 @@ def test_workers_give_the_cpu_way_to_the_app():
             got.clear()
             engine.wait(engine.submit("process", _nice, [0], thread=thread, on_result=got.__setitem__), 60)
             assert list(got.values()) == [min(19, os.nice(0) + WORKER_NICE)]
+
+
+def test_a_worker_keeps_numpy_to_one_blas_thread_unless_told(monkeypatch):
+    """`import numpy` started 15 OpenBLAS threads that burned ~1 s of CPU per process
+    (2026-11-25), on cores the tasks of the engine and the user's programs hold."""
+    for told, expected in ((None, "1"), ("3", "3")):
+        if told is None:
+            monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+        else:
+            monkeypatch.setenv("OPENBLAS_NUM_THREADS", told)
+        got = {}
+        with Engine(cpus=2, mem_mb=0) as engine:
+            engine.register("process", ProcessExecutor(2))
+            for thread in (False, True):
+                got.clear()
+                engine.wait(engine.submit("process", _blas_threads, [0], thread=thread, on_result=got.__setitem__), 60)
+                assert list(got.values()) == [expected], (told, thread)
 
 
 @pytest.mark.slow
@@ -813,7 +890,7 @@ def test_the_same_jobs_on_ray(tmp_path):
 def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
     gate = threading.Event()
 
-    def names(label, payloads=({"engine": "vina", "pairs": [{"receptor": 1, "ligand": 2}]},)):
+    def names(label, payloads=({"engine": "solver", "pairs": [{"anchor": 1, "guest": 2}]},)):
         job_id = engine.submit("thread", lambda payload: gate.wait(30), list(payloads), label=label)
         deadline = time.monotonic() + 30
         while not (tasks := engine.tasks(job_id)):
@@ -824,7 +901,7 @@ def test_a_label_names_the_chunks_of_a_job_where_they_are_shown():
     with Engine(cpus=2, mem_mb=0) as engine:
         engine.register("thread", ThreadExecutor(8))
         try:
-            assert names("{engine}-R{pairs[0][receptor]}-L{pairs[0][ligand]}") == ["vina-R1-L2"]  # a template
+            assert names("{engine}-R{pairs[0][anchor]}-L{pairs[0][guest]}") == ["solver-R1-L2"]  # a template
             assert names(lambda payload: f"{len(payload['pairs'])} pairs") == ["1 pairs"]  # or a function
             assert names("chunk {}", [7]) == ["chunk 7"]  # a payload that is not a dict fills the template whole
             assert names("{nothing}") == names(None)  # one that does not fit: the short repr, as without it

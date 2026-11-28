@@ -115,7 +115,7 @@ def lab_engine(tmp, ex):
 
 def run(params, tmp, ex=None, seconds=600, during=None, **options):
     with lab_engine(tmp, ex or far()) as engine:
-        job = Flow(engine, None).submit(lab_tasks.screen, params, executor="far", journal="j", **options)
+        job = Flow(engine, None).submit(lab_tasks.sweep, params, executor="far", journal="j", **options)
         if during:
             threading.Thread(target=during, args=(engine, job), daemon=True).start()
         return engine.wait(job, seconds)
@@ -244,7 +244,7 @@ def test_a_file_spoiled_there_is_sent_again(request, said):
 
     ex.remote.fault(SUBMIT, 1, gone)
     with lab_engine(said, ex) as engine:
-        Flow(engine, None).submit(lab_tasks.screen, p, executor="far", journal="j")
+        Flow(engine, None).submit(lab_tasks.sweep, p, executor="far", journal="j")
         until(lambda: ex.remote.down_until, 120)
     lab(f"for f in {FAR}/c*-*/files/*/said.txt; do echo garbage > $f; done")
     assert run(p, said).status == "completed"
@@ -254,7 +254,7 @@ def test_a_file_spoiled_there_is_sent_again(request, said):
 def test_a_campaign_closed_mid_run_is_taken_up_again(request, said):
     p = params(request, n=20)
     with lab_engine(said, far()) as engine:
-        Flow(engine, None).submit(lab_tasks.screen, p, executor="far", journal="j")
+        Flow(engine, None).submit(lab_tasks.sweep, p, executor="far", journal="j")
         until(lambda: len(lab_tasks.GOT) >= 3)
     time.sleep(10)
     assert run(p, said).status == "completed"
@@ -307,12 +307,12 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(request, said, monke
         flow = Flow(engine, project)
         there = locations.root(ex, project)
         ex.remote.fault(f"mkdir -p {there}", 10 ** 9)  # never fails: counts the sendings to the project's folder
-        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert engine.wait(flow.submit(lab_tasks.sweep, params(request), executor="far"), 600).status == "completed"
         assert {r["said"] for r in lab_tasks.GOT} == {"from here"}
         assert getattr(ex, "_no_rsync", False) == (lab("command -v rsync || :") == "")
         assert lab(f"cat {there}/said.txt") == "from here"
         sendings = ex.remote.rules[0][3]  # 2 without rsync there: the try, and tar
-        assert engine.wait(flow.submit(lab_tasks.screen, params(request), executor="far"), 600).status == "completed"
+        assert engine.wait(flow.submit(lab_tasks.sweep, params(request), executor="far"), 600).status == "completed"
         assert ex.remote.rules[0][3] == sendings  # another campaign found it there
         lab(f"rm {there}/said.txt")
         assert locations.reconcile(project, ex) == ["said.txt"]
@@ -407,3 +407,66 @@ if __name__ == "__main__":  # one client of test_two_clients_of_one_campaign_que
     os.environ["CAMPAIGN_FILE"] = str(Path(sys.argv[2]) / "said.txt")
     snap = run({"n": 8, "nap": 2, "tag": sys.argv[1]}, tempfile.mkdtemp())
     print(json.dumps({"status": snap.status, "error": snap.error, "got": got()}))
+
+
+def test_parts_go_into_containers_there_through_a_kill(request, said):
+    """10 containers of 10 shards, the runner killed mid-run: every part once, none lost, and there
+    the containers, not a file per task."""
+    killed = []
+
+    def kill(engine, job):
+        until(lambda: len(lab_tasks.GOT) >= 20)
+        # The workers' own containers: ssh from the login to a worker is refused in this lab.
+        for name in (["vhpc-sge-sge-1"] if SGE else ["vhpc-molsuite-slurm-worker1-1", "vhpc-molsuite-slurm-worker2-1"]):
+            said = subprocess.run(["docker", "exec", name, "pkill", "-9", "-f", "[m]s_flow.runner"], capture_output=True)
+            killed.append(said.returncode == 0)
+        killed.append(len(lab_tasks.GOT))
+
+    with lab_engine(said, far()) as engine:
+        job = Flow(engine, None).submit(lab_tasks.committing, params(request, n=100, nap=0.5), executor="far",
+                                        journal="j")
+        threading.Thread(target=kill, args=(engine, job), daemon=True).start()
+        assert engine.wait(job, 900).status == "completed"
+    by_n = {}
+    for result in lab_tasks.GOT:  # a result the kill caught between its line and its note comes twice
+        assert by_n.setdefault(result["n"], result["_committed"]) == result["_committed"]
+    assert any(killed[:-1]) and killed[-1] < 100, f"no runner was killed mid-run: {killed}"
+    assert sorted(by_n) == list(range(100))
+    shards = {}
+    for [entry] in by_n.values():
+        shards.setdefault(entry["path"], []).extend(entry["shards"])
+    assert len(shards) == 10 and all(sorted(numbers) == list(range(10)) for numbers in shards.values())
+    held = json.loads(lab(
+        f"PYTHONPATH={THERE}/flow /opt/venv/bin/python -c 'import json, sys; from ms_flow.core.data import container; "
+        "print(json.dumps({p: [r[\"part\"] for r in container.read_index(p)[1] if not r[\"retired\"]] for p in sys.argv[1:]}))' "
+        + " ".join(sorted(shards))))
+    assert sorted(part for parts in held.values() for part in parts) == sorted(f"p:{n}" for n in range(100))
+    root = os.path.dirname(os.path.dirname(next(iter(shards))))
+    files = lab(f"cd {root} && find . -type f | sort").split()
+    kinds = sorted({name.rsplit(".", 1)[-1] for name in files})
+    assert len(files) == 40 and kinds == ["arrows", "db", "index", "lock"], files  # each key: container, index, lock, catalog
+    assert not [name for name in files if "/parts/" in name]
+
+
+def test_what_a_campaign_commits_there_comes_here_over_ssh(request, said):
+    """With a project open: the containers of the stage are registered here and brought every round
+    over the lab's ssh, and at the end the copies here are those there, byte for byte."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(said / "p")
+    try:
+        with lab_engine(said, far()) as engine:
+            job = Flow(engine, project).submit(lab_tasks.committing, params(request, n=40, nap=0.3), executor="far",
+                                               journal="j")
+            assert engine.wait(job, 600).status == "completed"
+        rows = [row for role in [f"k{k}" for k in range(4)] for row in catalog.files(project, catalog.shard_spec(role=role))]
+        assert len(rows) == 4 and all(not row["location"] for row in rows)
+        assert sum(catalog.count(project, catalog.shard_spec(role=f"k{k}")) for k in range(4)) == 40
+        for row in rows:
+            there = "/" + str(Path(row["path"]).relative_to(said / "p" / "hosts" / "far"))
+            assert lab(f"sha256sum {there}").split()[0] == __import__("hashlib").sha256(
+                Path(row["path"]).read_bytes()).hexdigest()
+    finally:
+        project.disconnect()

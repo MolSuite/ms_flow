@@ -100,7 +100,7 @@ class AppRegistry:
             package_name = str(mod.name)
             if not package_name.startswith(package_prefix):
                 continue
-            # Suite packages: they are libraries, not apps with a manifest.
+            # Suite packages: they are imported packages, not apps with a manifest.
             if package_name in {"ms_flow", "ms_components", "ms_contactmap"}:
                 continue
             manifest_module = f"{package_name}.manifest"

@@ -139,7 +139,7 @@ def build_executor(name: str, settings, host_env=None):
                               runner=config.runner,
                               elements_per_job=config.elements_per_job or None, max_jobs=config.max_jobs or None,
                               poll_s=config.poll_seconds, shared=config.shared_disk, env=env,
-                              keep_after=host.keep_after, grow=_grow(config))
+                              keep_after=host.keep_after, grow=_grow(config), bring=config.bring_while_running)
     from ms_flow.engine import ProcessExecutor
 
     return _batching(ProcessExecutor(_here(hosts[0])[0]), config)
@@ -165,6 +165,7 @@ def _retake(executor, settings, name: str) -> None:
     executor.script = executor.script_for()
     executor.capacity, executor.batch = config.max_jobs or sys.maxsize, config.elements_per_job or sys.maxsize
     executor.poll_s, executor.keep_after = config.poll_seconds, settings.hosts[config.hosts[0]].keep_after
+    executor.bring = config.bring_while_running
     executor.grow = _grow(config)
 
 
@@ -512,6 +513,27 @@ class WorkspaceJobApiMixin:
         slot = None if self._engine is None else self._engine._executors.get(executor)
         nodes = getattr(getattr(slot, "impl", None), "queue_nodes", None)
         return nodes() if nodes is not None else []
+
+    @hosted()
+    def bring_there(self, executor: str, files) -> list[int]:
+        """The containers `files` (catalog ids of the active project) that a campaign left on the
+        queue `executor`, brought here as far as they are made (see `locations.bring`); the ids
+        brought. It asks that machine, so not from a thread that cannot wait."""
+        from ms_flow import locations
+
+        project = self._require_active_project_runtime()
+        return locations.bring(project.project_db, self.engine.executor(executor), list(files), location=executor)
+
+    @hosted()
+    def clean_host(self, executor: str, files=None, confirm: bool = False, dry: bool = False) -> list[dict]:
+        """The copies on the queue `executor` of the active project's containers (or of `files`)
+        removed where a verified copy is here; the others only with `confirm`; with `dry`, only
+        said (see `locations.cleanup`). What each was, `{path, verified, removed}`."""
+        from ms_flow import locations
+
+        project = self._require_active_project_runtime()
+        return locations.cleanup(project.project_db, self.engine.executor(executor), location=executor,
+                                 files=files, confirm=confirm, dry=dry)
 
     @hosted()
     def remove_remote_job(self, executor: str, dir: str) -> None:

@@ -57,6 +57,18 @@ _TASK_SECONDS, _TRIPS, _PACK_MAX = 0.1, 100, 64
 _SHARE, _STEPS = 0.95, 3
 _REMEMBERED = 1000  # ended jobs whose last snapshot the engine still answers for
 _DELIVER_MAX = 256  # results of a job that reach its callback in one go
+# A job's results that arrive one by one wait this long for more of their own (a callback with a
+# fixed cost, a commit, then pays it once for several), unless `_held_most` wait or nothing else
+# of the job runs (its last results are not held). Only while more keep coming: a job whose
+# results stop for `_DELIVER_QUIET` gets what came (a few tasks ending together are not kept).
+_DELIVER_WAIT, _DELIVER_QUIET = 1.0, 0.2
+_NOTHING = object()
+
+
+def _held_most(job) -> int:
+    """Results of a job held at most: half of what its window leaves past a full executor, so a
+    group being written plus the one gathering behind it never keep a worker idle."""
+    return max((job.window - job.slot.impl.capacity) // 2, 1)
 _RECOUNT = 30.0  # seconds between two counts of what a source has left
 _GPU_QUERY = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"]
 _READ_EVERY = 2.0  # seconds between two reads of the machine while jobs hold its CPUs or GPUs
@@ -223,7 +235,7 @@ def ran_on(*modules: str) -> dict:
         except Exception:  # not installed as a distribution (a script, a source tree)
             return ""
 
-    # ponytail: the distribution named as the top module (ms_flow, amdockvs...); one named
+    # ponytail: the distribution named as the top module (ms_flow, an app...); one named
     # otherwise (sklearn of scikit-learn) reads as "". packages_distributions() takes ~1 s.
     packages = {top: of(top) for top in {module.partition(".")[0] for module in modules} if top}
     return {"host": socket.gethostname(), "python": platform.python_version(), "platform": platform.platform(),
@@ -577,7 +589,7 @@ class Engine:
         an executor that keeps a worker for each task and can spare it (the process pool) runs it
         on a thread of one process it keeps for all of them, so no worker holds memory for it.
         `label` is what a chunk goes by in `tasks` and in a failure, in place of a short repr of
-        its payload: a template the payload fills (`"dock-R{receptor}-L{ligand}"`, the keys of a
+        its payload: a template the payload fills (`"eval-T{target}-I{item}"`, the keys of a
         dict payload) or a function `(payload)` that returns the text. It runs here, never in a
         worker, and only for a chunk that is shown.
         `journal` names an attached journal; without it nothing about the job reaches the disk.
@@ -1029,6 +1041,8 @@ class Engine:
                 job.done += 1
                 job.states[n] = DONE_CHUNK
                 job.journal.chunk_finished(job, key, attempt, None)
+                if job.id in self._ended:  # announced already: what `status` says counts it too
+                    self._ended[job.id] = job.snapshot()
             return
         job.open -= 1
         job.states[n] = DONE_CHUNK if error is None else FAILED_CHUNK
@@ -1321,33 +1335,55 @@ class Engine:
     # --- Delivery thread --------------------------------------------------------------
 
     def _deliver(self) -> None:
-        get, get_nowait, held = self._deliveries.get, self._deliveries.get_nowait, []
+        get, get_nowait, monotonic = self._deliveries.get, self._deliveries.get_nowait, time.monotonic
+        held: dict[_Job, list] = {}  # results, as (job, key, attempt, result, n), waiting for more
+        since: dict[_Job, float] = {}
+        last: dict[_Job, float] = {}  # when the newest of them came
+
+        def hand(job: _Job) -> None:  # one call for the callback, one event for the loop
+            batch = held.pop(job)
+            del since[job], last[job]
+            self._events.put((self._on_delivered, job, self._hand_over(job, batch)))
+
         while True:
-            item = held.pop() if held else get()
-            if item is None:
-                return
-            if type(item[0]) is not _Job:
-                fn, args = item
+            if held:
                 try:
-                    fn(*args)
-                except Exception:
-                    log.exception("job callback %r failed", fn)
-                continue
-            # A result, as (job, key, attempt, result), and the ones of its job waiting right behind
-            # it: one call for the callback, one event for the loop.
-            # ponytail: results of two jobs that arrive interleaved go one at a time; a buffer per
-            # job if two jobs of short chunks writing at once turns out to be a common case.
-            job, batch = item[0], [item]
-            while len(batch) < _DELIVER_MAX:
+                    due = min(min(at + _DELIVER_WAIT, last[job] + _DELIVER_QUIET) for job, at in since.items())
+                    item = get(timeout=max(due - monotonic(), 0.0))
+                except queue.Empty:
+                    item = _NOTHING
+            else:
+                item = get()
+            while item is not _NOTHING:  # all that is there now
+                if item is None:
+                    for job in tuple(held):
+                        hand(job)
+                    return
+                if type(item[0]) is not _Job:
+                    for job in tuple(held):  # a callback comes after the results ahead of it
+                        hand(job)
+                    fn, args = item
+                    try:
+                        fn(*args)
+                    except Exception:
+                        log.exception("job callback %r failed", fn)
+                else:
+                    job = item[0]
+                    if job not in held:
+                        held[job], since[job] = [], monotonic()
+                    held[job].append(item)
+                    last[job] = monotonic()
+                    if len(held[job]) >= _DELIVER_MAX:
+                        hand(job)
                 try:
                     item = get_nowait()
                 except queue.Empty:
-                    break
-                if item is None or item[0] is not job:
-                    held.append(item)
-                    break
-                batch.append(item)
-            self._events.put((self._on_delivered, job, self._hand_over(job, batch)))
+                    item = _NOTHING
+            now = monotonic()
+            for job in tuple(held):
+                if (len(held[job]) >= _held_most(job) or now - since[job] >= _DELIVER_WAIT
+                        or now - last[job] >= _DELIVER_QUIET or not job.flying):
+                    hand(job)
 
     @staticmethod
     def _hand_over(job: _Job, batch: list) -> list:

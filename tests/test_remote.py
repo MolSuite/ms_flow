@@ -34,6 +34,11 @@ def _inside(folder) -> list:
     return found
 
 
+def _homes(tmp_path) -> list:
+    """The job folders on the far side; its poller's `.poll.*` files come and go beside them."""
+    return [entry for entry in (tmp_path / "far").iterdir() if not entry.name.startswith(".")]
+
+
 def _until(check, seconds=60):
     deadline = time.monotonic() + seconds
     while not check() and time.monotonic() < deadline:
@@ -61,7 +66,7 @@ def test_results_come_while_it_runs_and_a_job_out_of_the_queue_is_sent_again(tmp
         job = engine.submit("far", workers.nap, [{"s": 0.3, "n": i} for i in range(12)], on_results=got.extend)
         assert _until(lambda: engine.status(job).chunks_done)
         assert engine.status(job).status == "running" and engine.status(job).chunks_done < 12
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         for pid in _inside(home):  # what a queue does to a job whose time ran out
             os.kill(pid, signal.SIGTERM)
         ended = engine.wait(job, 120)
@@ -73,7 +78,7 @@ def test_a_canceled_job_leaves_the_queue_and_nothing_behind(tmp_path):
         engine.register("far", _far(tmp_path, runner="--cpus 1"))
         job = engine.submit("far", workers.nap, [{"s": 0.3, "n": i} for i in range(40)])
         assert _until(lambda: engine.status(job).chunks_done)
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         assert _inside(home)
         engine.cancel(job)
         assert engine.wait(job, 60).status == "canceled"
@@ -81,11 +86,11 @@ def test_a_canceled_job_leaves_the_queue_and_nothing_behind(tmp_path):
 
 
 def test_a_file_an_element_names_goes_with_the_job_once(tmp_path):
-    (tmp_path / "receptor.txt").write_text("here")
+    (tmp_path / "anchor.txt").write_text("here")
     got, far = [], _far(tmp_path, shared=False)
     with Engine(cpus=2) as engine:
         engine.register("far", far)
-        job = engine.submit("far", workers.read, [{"path": File(tmp_path / "receptor.txt"), "n": i} for i in range(6)],
+        job = engine.submit("far", workers.read, [{"path": File(tmp_path / "anchor.txt"), "n": i} for i in range(6)],
                             on_results=got.extend)
         assert engine.wait(job, 120).status == "completed"
     seen = {result["path"] for key, result in got}
@@ -94,14 +99,28 @@ def test_a_file_an_element_names_goes_with_the_job_once(tmp_path):
 
 
 def test_what_a_result_names_in_a_dir_comes_back_to_it(tmp_path):
-    got, poses = [], tmp_path / "poses"
+    got, layouts = [], tmp_path / "layouts"
     with Engine(cpus=2) as engine:
         engine.register("far", _far(tmp_path, shared=False, elements_per_job=4))
-        job = engine.submit("far", workers.leave, [{"out": Dir(poses), "n": i} for i in range(7)], on_results=got.extend)
+        job = engine.submit("far", workers.leave, [{"out": Dir(layouts), "n": i} for i in range(7)], on_results=got.extend)
         assert engine.wait(job, 120).status == "completed"
-    assert sorted(result["made"] for key, result in got) == [str(poses / f"{i}.txt") for i in range(7)]
-    assert [(poses / f"{i}.txt").read_text() for i in range(7)] == [str(i) for i in range(7)]
+    assert sorted(result["made"] for key, result in got) == [str(layouts / f"{i}.txt") for i in range(7)]
+    assert [(layouts / f"{i}.txt").read_text() for i in range(7)] == [str(i) for i in range(7)]
     assert list((tmp_path / "far").iterdir()) == []
+
+
+def test_a_container_goes_and_comes_back_with_its_index(tmp_path):
+    (tmp_path / "in.arrows").write_text("sent")
+    (tmp_path / "in.arrows.index").write_text("its index")
+    got, out = [], tmp_path / "out"
+    with Engine(cpus=2) as engine:
+        engine.register("far", _far(tmp_path, shared=False))
+        job = engine.submit("far", workers.pair, [{"container": File(tmp_path / "in.arrows"), "out": Dir(out), "n": i}
+                                                  for i in range(3)], on_results=got.extend)
+        assert engine.wait(job, 120).status == "completed"
+    assert {result["said"] for key, result in got} == {"sent|its index"}
+    assert sorted(path.name for path in out.iterdir()) == sorted(f"{i}.arrows{end}" for i in range(3) for end in ("", ".index"))
+    assert [(out / f"{i}.arrows.index").read_text() for i in range(3)] == [f"index {i}" for i in range(3)]
 
 
 def test_a_job_that_cannot_run_there_fails_with_what_it_said(tmp_path):
@@ -127,7 +146,7 @@ def test_closing_leaves_a_job_with_a_key_running_and_it_is_taken_up_again(tmp_pa
         job = _napping(engine, tmp_path, got)
         assert _until(lambda: engine.status(job).chunks_done)
     before = len(got)
-    (home,) = (tmp_path / "far").iterdir()
+    (home,) = _homes(tmp_path)
     assert 0 < before < 12 and _inside(home), "still running there, with the engine gone"
 
     with Engine(cpus=2) as engine:  # in other tasks than before: each waits for what is already there
@@ -147,7 +166,7 @@ def test_what_was_left_there_is_listed_and_removed_by_hand(tmp_path):
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])
         assert _until(lambda: engine.status(job).chunks_done)
-        (home,) = (tmp_path / "far").iterdir()
+        (home,) = _homes(tmp_path)
         (row,) = engine.executor("far").jobs_there()
         assert (row["dir"], row["followed"]) == (home.name, True)
         with pytest.raises(ValueError, match="cancel the job"):
@@ -169,7 +188,7 @@ def test_canceling_stops_what_an_earlier_run_left_there(tmp_path):
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])
         assert _until(lambda: engine.status(job).chunks_done)
-    (home,) = (tmp_path / "far").iterdir()
+    (home,) = _homes(tmp_path)
     assert _inside(home)
     with Engine(cpus=2) as engine:
         job = _napping(engine, tmp_path, [])

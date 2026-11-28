@@ -11,7 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session
 
 from ms_flow.core.data.contracts import DataContractError, DbOutputSpec
-from ms_flow.core.database.base import BaseSQLiteDB, create_project_tables
+from ms_flow.core.database.base import BaseSQLiteDB, ProjectTablesDB
 from ms_flow.core.database.project_records import (
     ProjectBulkInsertRequest,
     ProjectBulkInsertResult,
@@ -76,10 +76,7 @@ def resolve_project_store_ops(source: Any) -> "_ProjectStoreSqliteOps":
     return ops
 
 
-class _StandaloneProjectSQLiteDB(BaseSQLiteDB):
-    def _create_tables(self):
-        create_project_tables(self.engine)
-
+class _StandaloneProjectSQLiteDB(ProjectTablesDB):
     def _setup_path_error_message(self) -> str:
         return "project.db no configurada."
 
@@ -334,7 +331,7 @@ class _ProjectStoreSqliteOps:
     ) -> None:
         """Close the "backwards" FKs with one UPDATE per relation, once both sides have ids.
 
-        A parent pointing at a child (molecules.active_binding_site_id -> binding_sites.id) does not
+        A parent pointing at a child (items.active_variant_id -> variants.id) does not
         fit the topological order: the child needs the parent's id for its own FK. Rather than asking
         the caller to invent a stable index to point at the row, everything is inserted and then
         fixed up, inside the same transaction.

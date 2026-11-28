@@ -63,7 +63,7 @@ class _Collect:
 
 
 @campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
-def screen(params, project):
+def sweep(params, project):
     said = Path(os.environ["CAMPAIGN_FILE"])
     out = Dir(said.parent / "work")
     return [Stage("vs", square, [{"n": n, "f": File(said), "out": out, "_cpu_required": 1} for n in range(params.n)],
@@ -71,6 +71,17 @@ def screen(params, project):
             Stage("off", negate, From("vs", list), deliver="none", reduce=count),
             Stage("count", negate, From("off", nothing, (File(said),)), deliver="none"),
             Stage("again", negate, From("vs", list), reduce=count, deliver="reduced")]
+
+
+@task()
+def read_pair(element):
+    return {"n": element["n"], "said": Path(element["c"]).read_text() + "|" + Path(element["c"] + ".index").read_text()}
+
+
+@campaign(output=lambda params, project: _Collect())
+def ship_pairs(params, project):
+    return [Stage("vs", read_pair, [{"c": File(path), "n": n, "_cpu_required": 1}
+                                    for n, path in enumerate(os.environ["CAMPAIGN_PAIRS"].split(":"))])]
 
 
 def _far(tmp_path, **options):
@@ -105,7 +116,7 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
     GOT.clear()
     engine, flow = _engine(tmp_path, _far(tmp_path))
     with engine:
-        ended = engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far", journal="j"), 120)
+        ended = engine.wait(flow.submit(sweep, {"run_id": "a"}, executor="far", journal="j"), 120)
         assert ended.status == "completed_with_errors" and ended.chunks_failed == 1, ended.error
         assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
         assert {row["said"] for row in GOT if row["stage"] == "vs"} == {"from here"}  # the file travelled
@@ -118,13 +129,13 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
 
         # Another run's id is the same campaign: what is there comes again, nothing runs again.
         GOT.clear()
-        again = engine.wait(flow.submit(screen, {"run_id": "b"}, executor="far", journal="j"), 120)
+        again = engine.wait(flow.submit(sweep, {"run_id": "b"}, executor="far", journal="j"), 120)
         assert again.status == "completed_with_errors" and len(GOT) == 6
         assert _dirs(tmp_path) == [first] and (tmp_path / "far" / first / "queue.id").read_text() == queued
 
         # Canceled here, it is canceled there; submitted again, it is a new attempt.
         GOT.clear()
-        slow = flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j")
+        slow = flow.submit(sweep, {"n": 40, "nap": 0.2}, executor="far", journal="j")
         _until(lambda: len(_dirs(tmp_path)) == 2 and GOT)
         engine.cancel(slow)
         assert engine.status(slow).canceling and engine.status(slow).status == "running"  # until it is gone there
@@ -135,26 +146,26 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
         pid = (tmp_path / "far" / canceled / "queue.id").read_text().strip()
         assert subprocess.run(["ps", "-p", pid], capture_output=True).returncode != 0
         GOT.clear()
-        done = engine.wait(flow.submit(screen, {"n": 40, "nap": 0.2}, executor="far", journal="j"), 120)
+        done = engine.wait(flow.submit(sweep, {"n": 40, "nap": 0.2}, executor="far", journal="j"), 120)
         assert done.status == "completed_with_errors" and len([row for row in GOT if row["stage"] == "vs"]) == 39
         assert canceled.endswith("-0") and set(_dirs(tmp_path)) == {first, canceled, canceled[:-1] + "1"}
 
         # Once all of it is here, a directory goes at once with `keep_after` 0.
         engine.executor("far").keep_after = 0
-        assert engine.wait(flow.submit(screen, {"run_id": "c"}, executor="far", journal="j"), 120).chunks_done
+        assert engine.wait(flow.submit(sweep, {"run_id": "c"}, executor="far", journal="j"), 120).chunks_done
         assert first not in _dirs(tmp_path)
 
     # Closed while it runs, it goes on there; submitted again, only what this side has not got comes.
     GOT.clear()
     engine, flow = _engine(tmp_path, _far(tmp_path))
     with engine:
-        flow.submit(screen, {"n": 30, "nap": 0.3}, executor="far", journal="j")
+        flow.submit(sweep, {"n": 30, "nap": 0.3}, executor="far", journal="j")
         _until(lambda: len(GOT) >= 3)
     before = len(GOT)
     assert before < 30  # it was closed halfway
     engine, flow = _engine(tmp_path, _far(tmp_path))
     with engine:
-        resumed = engine.wait(flow.submit(screen, {"n": 30, "nap": 0.3}, executor="far", journal="j"), 120)
+        resumed = engine.wait(flow.submit(sweep, {"n": 30, "nap": 0.3}, executor="far", journal="j"), 120)
         assert resumed.status == "completed_with_errors"
     vs = [row["n"] for row in GOT if row["stage"] == "vs"]
     assert sorted(vs) == [n for n in range(30) if n != 3] and len(GOT) > before  # each one once
@@ -162,10 +173,10 @@ def test_a_campaign_runs_its_stages_there_and_is_found_again_by_its_identity(tmp
 
 _KEYS = """
 import sys
-from {module} import Params, screen, _far
+from {module} import Params, sweep, _far
 from ms_flow.campaign import Campaign
 from ms_flow.engine import content_key
-far = Campaign(_far(__import__("pathlib").Path(sys.argv[1])), screen, Params(n=4, run_id="r"), None)
+far = Campaign(_far(__import__("pathlib").Path(sys.argv[1])), sweep, Params(n=4, run_id="r"), None)
 print(far.key, content_key({{"p": Params(n=4), "f": __import__("ms_flow.engine").engine.File("x")}}).hex())
 far.close()
 """
@@ -188,8 +199,8 @@ def test_a_campaign_asks_the_queue_for_itself_and_stays_the_same_campaign(tmp_pa
     far = RemoteExecutor(workdir=str(tmp_path / "far"), scheduler="slurm", setup="#SBATCH --qos=low\nexport A=1",
                          asks={"partition": "short", "cpus": 4, "modules": ["load gcc"]})
     try:
-        plain = Campaign(far, screen, Params(n=2), None)
-        more = Campaign(far, screen, Params(n=2), None, {"cpus": 16, "time": "2:00:00"})
+        plain = Campaign(far, sweep, Params(n=2), None)
+        more = Campaign(far, sweep, Params(n=2), None, {"cpus": 16, "time": "2:00:00"})
         assert plain.key == more.key
         script = (more._tmp / "job.sh").read_text()
         assert "#SBATCH --partition=short\n#SBATCH --cpus-per-task=16\n#SBATCH --time=2:00:00\n#SBATCH --qos=low\n" \
@@ -233,19 +244,19 @@ def test_a_campaign_whose_results_were_purged_there_goes_again(tmp_path, monkeyp
     monkeypatch.setenv("CAMPAIGN_FILE", str(tmp_path / "said.txt"))
     engine, flow = _engine(tmp_path, _far(tmp_path))
     with engine:
-        assert engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far", journal="j"), 120).chunks_done
+        assert engine.wait(flow.submit(sweep, {"run_id": "a"}, executor="far", journal="j"), 120).chunks_done
         [first] = _dirs(tmp_path)
         for part in (tmp_path / "far" / first / "stages" / "vs" / "results").glob("part-*"):
             part.unlink()  # what a scratch purge does to old files
         GOT.clear()
-        again = engine.wait(flow.submit(screen, {"run_id": "b"}, executor="far", journal="j"), 120)
+        again = engine.wait(flow.submit(sweep, {"run_id": "b"}, executor="far", journal="j"), 120)
         assert again.status == "completed_with_errors", again.error
         assert sorted(row["n"] for row in GOT if row["stage"] == "vs") == [0, 1, 2, 4, 5]
         assert _dirs(tmp_path) == [first, first[:-1] + "1"] and (tmp_path / "far" / first / "lost").exists()
 
         # Its whole directory gone while it runs: canceled there, and a new attempt again.
         GOT.clear()
-        slow = flow.submit(screen, {"n": 20, "nap": 0.2}, executor="far", journal="j")
+        slow = flow.submit(sweep, {"n": 20, "nap": 0.2}, executor="far", journal="j")
         _until(lambda: GOT)
         [running] = set(_dirs(tmp_path)) - {first, first[:-1] + "1"}
         gone = tmp_path / "far" / running  # what its runner writes meanwhile may stop one rmtree
@@ -265,7 +276,7 @@ def test_a_campaign_waits_for_a_host_that_does_not_answer(tmp_path, monkeypatch)
     engine, flow = _engine(tmp_path, far)
     with engine:
         left = _outage(far, 4)
-        job = flow.submit(screen, {"run_id": "a"}, executor="far", journal="j")
+        job = flow.submit(sweep, {"run_id": "a"}, executor="far", journal="j")
         _until(lambda: engine.status(job).unreachable)
         engine.reconnect(job)  # through the campaign it follows
         ended = engine.wait(job, 120)
@@ -296,22 +307,49 @@ def test_the_files_of_a_project_go_once_to_its_folder_there(tmp_path, monkeypatc
     engine.register("far", far)
     flow = Flow(engine, project)
     with engine:
-        assert engine.wait(flow.submit(screen, {"run_id": "a"}, executor="far"), 120).status == "completed_with_errors"
+        assert engine.wait(flow.submit(sweep, {"run_id": "a"}, executor="far"), 120).status == "completed_with_errors"
         there = Path(locations.root(far, project))
         assert (there / "in" / "said.txt").read_text() == "from here" and sent.count("in/said.txt") == 1
         assert {row["said"] for row in GOT if row["stage"] == "vs"} == {"from here"}
         assert list(locations.known(project, locations.host_of(far))) == ["in/said.txt"]
 
         # another campaign of the project finds it there
-        assert engine.wait(flow.submit(screen, {"n": 5}, executor="far"), 120).status == "completed_with_errors"
+        assert engine.wait(flow.submit(sweep, {"n": 5}, executor="far"), 120).status == "completed_with_errors"
         assert sent.count("in/said.txt") == 1 and len(_dirs(tmp_path)) == 2
 
         # gone from there (a purged scratch): reconcile says so, and the next campaign sends it again
         (there / "in" / "said.txt").unlink()
         assert locations.reconcile(project, far) == ["in/said.txt"]
         assert locations.known(project, locations.host_of(far)) == {}
-        assert engine.wait(flow.submit(screen, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
+        assert engine.wait(flow.submit(sweep, {"n": 4}, executor="far"), 120).status == "completed_with_errors"
         assert sent.count("in/said.txt") == 2 and (there / "in" / "said.txt").exists()
+
+
+def test_a_campaign_ships_and_returns_both_files(tmp_path, monkeypatch):
+    """A container goes with its index, from the project's folder and from outside it; the host
+    records both, so a later campaign checks both. Results that name a `Dir` there stay there:
+    what comes back from a queue is `RemoteExecutor._bring`'s (test_remote)."""
+    from ms_flow import locations
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    (tmp_path / "p" / "in").mkdir()
+    pairs = [tmp_path / "p" / "in" / "lib.arrows", tmp_path / "outside.arrows"]
+    for n, path in enumerate(pairs):
+        path.write_text(f"data {n}")
+        Path(f"{path}.index").write_text(f"index {n}")
+    monkeypatch.setenv("CAMPAIGN_PAIRS", ":".join(map(str, pairs)))
+    GOT.clear()
+    far = _far(tmp_path)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    with engine:
+        assert engine.wait(Flow(engine, project).submit(ship_pairs, {}, executor="far"), 120).status == "completed"
+    assert sorted((row["n"], row["said"]) for row in GOT) == [(0, "data 0|index 0"), (1, "data 1|index 1")]
+    assert sorted(locations.known(project, locations.host_of(far))) == ["in/lib.arrows", "in/lib.arrows.index"]
+    project.disconnect()
 
 
 def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(tmp_path, monkeypatch):
@@ -324,7 +362,7 @@ def test_in_its_first_minutes_a_campaign_glances_at_its_progress_between_rounds(
     GOT.clear()
     engine, flow = _engine(tmp_path, _far(tmp_path, poll_s=2))
     with engine:
-        ended = engine.wait(flow.submit(screen, {"n": 12, "nap": 0.3}, executor="far", journal="j"), 120)
+        ended = engine.wait(flow.submit(sweep, {"n": 12, "nap": 0.3}, executor="far", journal="j"), 120)
     assert ended.status == "completed_with_errors", ended.error
     assert {row["n"] for row in GOT if row["stage"] == "vs"} == {n for n in range(12) if n != 3}  # parts on the rounds
     assert len(glances) > 5
@@ -392,3 +430,148 @@ def test_a_job_that_ran_out_asks_for_more_at_most_grow_times(tmp_path):
     assert c._grow("OUT_OF_MEMORY") == ""  # twice already
     c._asks, c._grown, c.remote.asks = {}, 0, {}
     assert c._grow("TIMEOUT") == ""  # it asked for no time: the queue's default, unknown here
+
+
+def test_a_growing_container_is_sealed_before_it_ships(tmp_path, monkeypatch):
+    """A container still taking parts has no stable hash (I15): the campaign seals it first, and the
+    next part goes to another container. One its writer holds open now cannot be shipped."""
+    import hashlib
+
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+    from test_container_writer import _part, _receipt
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    gen = catalog.create_generation(project, step="import")
+    catalog.activate_generation(project, gen)
+    lib, parts = tmp_path / "p" / "lib", tmp_path / "parts"
+    shipped = None
+    try:
+        with catalog.ContainerWriter(project, lib, generation_id=gen, prefix="s:") as writer:
+            writer.commit_parts([_receipt(_part(parts / "0.arrows", 0), "s:0")])
+            [row] = list(catalog.files(project))
+            assert row["status"] == catalog.READY
+            monkeypatch.setenv("CAMPAIGN_PAIRS", row["path"])
+            with pytest.raises(RuntimeError, match="still being written"):
+                Campaign(_far(tmp_path), ship_pairs, {}, project)
+        shipped = Campaign(_far(tmp_path), ship_pairs, {}, project)
+        assert [r["status"] for r in catalog.files(project)] == [catalog.SEALED]
+        sha = hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest()
+        assert sha in shipped._shas.values()
+        with catalog.ContainerWriter(project, lib, generation_id=gen, prefix="s:") as writer:
+            writer.commit_parts([_receipt(_part(parts / "1.arrows", 4), "s:1")])
+        rows = list(catalog.files(project))
+        assert [r["path"] for r in rows][0] == row["path"] and len(rows) == 2
+        assert hashlib.sha256(Path(row["path"]).read_bytes()).hexdigest() == sha
+    finally:
+        if shipped is not None:
+            shipped.close()
+        project.disconnect()
+
+
+@task()
+def leaves_part(element):
+    from benchmarks.refactor_optimization import workers
+
+    return workers.part_of(element)
+
+
+@campaign(output=lambda params, project: _Collect())
+def commits_there(params, project):
+    from benchmarks.refactor_optimization import workers
+
+    out = Dir(Path(os.environ["CAMPAIGN_OUT"]))
+    return [Stage("all", leaves_part, [{"n": n, "log": os.environ["CAMPAIGN_LOG"], "out": out, "_cpu_required": 1}
+                                       for n in range(8)], commit=workers.receipts_of)]
+
+
+def test_connect_registers_without_copying_data(tmp_path, monkeypatch):
+    """The parts of a stage go into containers there; once it ends, the project lists them as
+    being on that executor, with their counts, and holds none of their bytes."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    monkeypatch.setenv("CAMPAIGN_OUT", str(tmp_path / "p" / "made"))
+    monkeypatch.setenv("CAMPAIGN_LOG", str(tmp_path / "log"))
+    GOT.clear()
+    far = _far(tmp_path, bring=False)  # registered only: bringing is its own test
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    try:
+        with engine:
+            job = Flow(engine, project).submit(commits_there, {}, executor="far")
+            assert engine.wait(job, 120).status == "completed"
+        rows = list(catalog.files(project, catalog.shard_spec(role="made")))
+        assert [(row["location"], row["role"], row["n_shards"], row["n_records"]) for row in rows] == [("far", "made", 8, 32)]
+        assert rows[0]["path"].startswith(str(tmp_path / "far")) and os.path.isfile(rows[0]["path"])
+        assert not list((tmp_path / "p").rglob("*.arrows*")), "data came here"
+        assert {entry["path"] for result in GOT for entry in result["_committed"]} == {rows[0]["path"]}
+    finally:
+        project.disconnect()
+
+
+def test_a_job_on_ray_says_how_its_cluster_is():
+    c = Campaign.__new__(Campaign)
+    c.job, c.stages, c.steps = "9", [], []
+    c._why_from(b"123\n")
+    c._tell({"status": "running", "done": 3, "total": 10, "ray": {
+        "nodes": 1, "nodes_asked": 2, "cpus": 8, "cpus_busy": 6, "gpus": 0, "gpus_busy": 0,
+        "store_mb": 2000, "store_used_mb": 120}}, True)
+    assert c.note == ("running in the queue (job 9): 3 of 10 done · Ray: 1 of 2 nodes, 6 of 8 CPUs busy, "
+                      "store 120 of 2,000 MB")
+
+
+@task()
+def leaves_part_slowly(element):
+    from benchmarks.refactor_optimization import workers
+
+    time.sleep(0.4)
+    return workers.part_of(element)
+
+
+@campaign(output=lambda params, project: _Collect())
+def commits_there_slowly(params, project):
+    from benchmarks.refactor_optimization import workers
+
+    out = Dir(Path(os.environ["CAMPAIGN_OUT"]))
+    return [Stage("all", leaves_part_slowly, [{"n": n, "log": os.environ["CAMPAIGN_LOG"], "out": out,
+                                               "_cpu_required": 1} for n in range(24)], commit=workers.receipts_of)]
+
+
+@pytest.mark.parametrize("bring", [True, False])
+def test_what_a_stage_commits_there_comes_here_while_it_runs(tmp_path, monkeypatch, bring):
+    """Every round, what the stage committed there so far is registered here and, unless the
+    executor says not to, brought: the copy here grows with it, a shard at least."""
+    from ms_flow.core.data import catalog
+    from ms_flow.core.database.project import ProjectStore
+
+    project = ProjectStore()
+    project.connect(tmp_path / "p")
+    monkeypatch.setenv("CAMPAIGN_OUT", str(tmp_path / "p" / "made"))
+    monkeypatch.setenv("CAMPAIGN_LOG", str(tmp_path / "log"))
+    far = _far(tmp_path, bring=bring)
+    engine = Engine(cpus=4)
+    engine.register("thread", ThreadExecutor(4))
+    engine.register("far", far)
+    seen_while_running = []
+    try:
+        with engine:
+            job = Flow(engine, project).submit(commits_there_slowly, {}, executor="far")
+            while engine.status(job).status in ("waiting", "running"):
+                rows = list(catalog.files(project, catalog.shard_spec(role="made")))
+                if rows and not rows[0]["location"]:
+                    seen_while_running.append(catalog.count(project, catalog.shard_spec(role="made")))
+                time.sleep(0.2)
+            assert engine.wait(job, 120).status == "completed"
+        [row] = list(catalog.files(project, catalog.shard_spec(role="made")))
+        if bring:
+            assert seen_while_running and 0 < seen_while_running[0] < 24, seen_while_running
+            assert row["location"] == "" and catalog.count(project, catalog.shard_spec(role="made")) == 24
+        else:
+            assert not seen_while_running and row["location"] == "far" and row["n_shards"] == 24
+    finally:
+        project.disconnect()

@@ -41,7 +41,7 @@ def data(key: str) -> bytes:
 def add(store, project, keys, codec="none", dictionary=None):
     """Payloads and the app rows that point to them, in one transaction (I2)."""
     with project.get_session() as session:
-        ids = store.put(session, [Payload(data(k), series="ligands", codec=codec, dictionary=dictionary) for k in keys])
+        ids = store.put(session, [Payload(data(k), series="guests", codec=codec, dictionary=dictionary) for k in keys])
         conn = session.connection()
         for key, pid in zip(keys, ids):
             conn.exec_driver_sql("INSERT INTO app_items (key, payload_id) VALUES (?, ?)", (key, pid))
@@ -141,10 +141,10 @@ def test_compact_follows_order_by(project):
 def test_compact_recompresses_with_the_series_dictionary(project, monkeypatch):
     monkeypatch.setattr(P, "VOLUME_SIZE", 1 << 20)
     store = PayloadStore(project)
-    add(store, project, [f"mol{i}" for i in range(400)], codec="zlib")
+    add(store, project, [f"spc{i}" for i in range(400)], codec="zlib")
     add(store, project, [f"x{i}" for i in range(400)], codec="zstd")
-    dictionary = store.train_dictionary("ligands", samples=400, size=4096)
-    store.release(drop(project, [f"mol{i}" for i in range(0, 400, 2)]))
+    dictionary = store.train_dictionary("guests", samples=400, size=4096)
+    store.release(drop(project, [f"spc{i}" for i in range(0, 400, 2)]))
     with project.engine.begin() as c:  # seal it, as a full volume would be
         c.exec_driver_sql("UPDATE ms_volumes SET state = 'sealed'")
     store.compact(min_dead=0.1)
@@ -219,7 +219,7 @@ def test_corrupt_bytes_are_listed_by_full_check_and_never_returned(project):
 def test_missing_dictionary_is_named_by_check(project):
     store = PayloadStore(project)
     add(store, project, [f"k{i}" for i in range(200)], codec="zstd")
-    dictionary = store.train_dictionary("ligands", samples=200, size=2048)
+    dictionary = store.train_dictionary("guests", samples=200, size=2048)
     pid = add(store, project, ["new"], codec="zstd", dictionary=dictionary)["new"]
     os.unlink(dictionary)
     report = store.check(full=True)

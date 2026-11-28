@@ -1,20 +1,20 @@
 """Tasks and jobs as their author writes them, run on the engine.
 
     @task(cpu=1, retries=1)
-    def dock(pair, params):                 # one element; `params` only if it names it
+    def evaluate(pair, params):             # one element; `params` only if it names it
         return rows
 
-    @job(task=dock, output=table_sink("docking_results"), reads=("ligands",))
-    def docking(params, project):           # the source: gives the elements one by one
+    @job(task=evaluate, output=table_sink("results"), reads=("items",))
+    def evaluation(params, project):        # the source: gives the elements one by one
         yield from pending_pairs(project, params)
 
-    Flow(engine, project).submit(docking, {"exhaustiveness": 8})
+    Flow(engine, project).submit(evaluation, {"effort": 8})
 
 A job may write its results itself: `output` is then a function `(params, project)` that
 returns its writer.
 
     class Shards:
-        tables = ("screening_shards",)      # optional: the jobs reading them wait for this one
+        tables = ("item_shards",)         # optional: the jobs reading them wait for this one
 
         def write(self, results): ...       # what a group of elements returned; nothing left behind if it raises
         def finish(self): ...               # optional: once every element has ended; if it raises, the job fails
@@ -49,8 +49,8 @@ def task(*, cpu: float = 1, gpu: float = 0, mem_mb: float = 0, retries: int = 0,
     executor sizes the tasks in whole multiples of it, from `autobatch` if that is a number,
     unless `autobatch=False` (see `Engine.submit`).
     `label` is what an element goes by in the monitor and in a failure: a template its keys
-    fill (`"dock-R{receptor}-L{ligand}"`) or a function `(element)` that returns the text.
-    `thread` is for a function that only waits for a program it starts (a docking binary): on
+    fill (`"eval-T{target}-I{item}"`) or a function `(element)` that returns the text.
+    `thread` is for a function that only waits for a program it starts (an external binary): on
     this machine it runs on a thread of one process kept for all of them, and no worker is kept
     for it.
     """

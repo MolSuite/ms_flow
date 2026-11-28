@@ -14,17 +14,17 @@ from ms_flow.sinks import graph_sink, table_sink
 
 
 def structure(n: int) -> bytes:
-    return f"molecule {n}\n".encode() * (n % 7 + 1)
+    return f"specimen {n}\n".encode() * (n % 7 + 1)
 
 
 @pytest.fixture
 def project(tmp_path):
     store = ProjectStore.open_at(tmp_path / "project.db")
     with closing(sqlite3.connect(store.db_path)) as conn, conn:  # the app's schema: ms_flow never sees it
-        conn.execute("CREATE TABLE ligands (id INTEGER PRIMARY KEY, n INT NOT NULL,"
+        conn.execute("CREATE TABLE guests (id INTEGER PRIMARY KEY, n INT NOT NULL,"
                      " structure_payload_id INTEGER REFERENCES ms_payloads(id))")
-        conn.execute("CREATE TABLE poses (id INTEGER PRIMARY KEY, ligand_id INT REFERENCES ligands(id),"
-                     " rank INT, pose_payload_id INTEGER REFERENCES ms_payloads(id))")
+        conn.execute("CREATE TABLE layouts (id INTEGER PRIMARY KEY, guest_id INT REFERENCES guests(id),"
+                     " rank INT, layout_payload_id INTEGER REFERENCES ms_payloads(id))")
     yield store
     store.dispose()
 
@@ -55,56 +55,56 @@ def assert_clean(project, referenced):
 
 
 @task()
-def ligand(n: int) -> dict:
-    return {"n": n, "structure_payload_id": Payload(structure(n), kind="sdf", series="ligands")}
+def guest(n: int) -> dict:
+    return {"n": n, "structure_payload_id": Payload(structure(n), kind="csv", series="guests")}
 
 
-@job(task=ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))
-def ligands(params, project):
+@job(task=guest, output=table_sink("guests", columns=("n", "structure_payload_id")))
+def guests(params, project):
     yield from range(params["n"])
 
 
 @task()
-def docked(n: int) -> dict:
-    return {"ligands": {"$ref": "l", "n": n, "structure_payload_id": Payload(structure(n), series="ligands")},
-            "poses": [{"ligand_ref": "l", "rank": rank, "pose_payload_id": Payload(structure(n + rank), series="poses")}
+def coupled(n: int) -> dict:
+    return {"guests": {"$ref": "l", "n": n, "structure_payload_id": Payload(structure(n), series="guests")},
+            "layouts": [{"guest_ref": "l", "rank": rank, "layout_payload_id": Payload(structure(n + rank), series="layouts")}
                       for rank in range(2)]}
 
 
-@job(task=docked, output=graph_sink(
-    nodes=({"name": "ligands", "table": "ligands", "columns": ("n", "structure_payload_id")},
-           {"name": "poses", "table": "poses", "columns": ("ligand_id", "rank", "pose_payload_id")}),
-    relations=({"source_node": "poses", "source_ref_field": "ligand_ref", "target_node": "ligands",
-                "fk_field": "ligand_id"},)))
-def docking(params, project):
+@job(task=coupled, output=graph_sink(
+    nodes=({"name": "guests", "table": "guests", "columns": ("n", "structure_payload_id")},
+           {"name": "layouts", "table": "layouts", "columns": ("guest_id", "rank", "layout_payload_id")}),
+    relations=({"source_node": "layouts", "source_ref_field": "guest_ref", "target_node": "guests",
+                "fk_field": "guest_id"},)))
+def coupling(params, project):
     yield from range(params["n"])
 
 
 def test_a_table_sink_stores_the_payloads_of_its_rows_and_keeps_their_ids(project):
-    run(project, ligands, {"n": 40})
-    stored = rows(project, "SELECT n, structure_payload_id FROM ligands")
+    run(project, guests, {"n": 40})
+    stored = rows(project, "SELECT n, structure_payload_id FROM guests")
     assert len(stored) == 40 and len({pid for _, pid in stored}) == 40
-    assert rows(project, "SELECT COUNT(*), MIN(kind), MAX(kind) FROM ms_payloads") == [(40, "sdf", "sdf")]
+    assert rows(project, "SELECT COUNT(*), MIN(kind), MAX(kind) FROM ms_payloads") == [(40, "csv", "csv")]
     got = project.payloads.get_many([pid for _, pid in stored])
     assert all(got[pid] == structure(n) for n, pid in stored)
 
 
 def test_a_graph_sink_stores_the_payloads_of_every_node(project):
-    run(project, docking, {"n": 20})
-    poses = rows(project, "SELECT l.n, p.rank, l.structure_payload_id, p.pose_payload_id"
-                          " FROM poses p JOIN ligands l ON l.id = p.ligand_id")
-    assert len(poses) == 40 and rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(60,)]
-    for n, rank, ligand_pid, pose_pid in poses:
-        assert project.payloads.get(ligand_pid) == structure(n)
-        assert project.payloads.get(pose_pid) == structure(n + rank)
+    run(project, coupling, {"n": 20})
+    layouts = rows(project, "SELECT l.n, p.rank, l.structure_payload_id, p.layout_payload_id"
+                          " FROM layouts p JOIN guests l ON l.id = p.guest_id")
+    assert len(layouts) == 40 and rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(60,)]
+    for n, rank, guest_pid, layout_pid in layouts:
+        assert project.payloads.get(guest_pid) == structure(n)
+        assert project.payloads.get(layout_pid) == structure(n + rank)
     series = rows(project, "SELECT v.series, COUNT(*) FROM ms_payloads p JOIN ms_volumes v ON v.id = p.volume_id"
                            " GROUP BY v.series ORDER BY v.series")
-    assert series == [("ligands", 20), ("poses", 40)]
+    assert series == [("guests", 20), ("layouts", 40)]
 
 
 @task()
 def as_is(n: int) -> dict:
-    same = Payload(structure(n), kind="sdf", series="ligands")  # the input already is the current form
+    same = Payload(structure(n), kind="csv", series="guests")  # the input already is the current form
     return {"n": n, "original_payload_id": same, "structure_payload_id": same}
 
 
@@ -122,7 +122,7 @@ def test_one_payload_in_two_columns_is_stored_once(project):
     assert rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(5,)]
 
 
-@job(task=task()(workers.structure), output=table_sink("ligands", columns=("n", "structure_payload_id")))
+@job(task=task()(workers.structure), output=table_sink("guests", columns=("n", "structure_payload_id")))
 def anywhere(params, project):
     yield from range(params["n"])
 
@@ -148,13 +148,13 @@ def test_every_executor_leaves_the_same_rows_and_bytes(tmp_path):
     for name in ("process", "thread", "ray", "remote"):
         project = ProjectStore.open_at(tmp_path / name / "project.db")
         with closing(sqlite3.connect(project.db_path)) as conn, conn:
-            conn.execute("CREATE TABLE ligands (id INTEGER PRIMARY KEY, n INT NOT NULL,"
+            conn.execute("CREATE TABLE guests (id INTEGER PRIMARY KEY, n INT NOT NULL,"
                          " structure_payload_id INTEGER REFERENCES ms_payloads(id))")
         with Engine(cpus=2, mem_mb=0) as engine:
             engine.register(name, _executor(name, tmp_path / name))
             job_id = Flow(engine, project).submit(anywhere, {"n": 30}, executor=name)
             assert engine.wait(job_id, 180).status == "completed", name
-        stored = rows(project, "SELECT n, structure_payload_id FROM ligands ORDER BY n")
+        stored = rows(project, "SELECT n, structure_payload_id FROM guests ORDER BY n")
         got = project.payloads.get_many([pid for _, pid in stored])
         seen[name] = [(n, got[pid]) for n, pid in stored]
         assert rows(project, "SELECT COUNT(*) FROM ms_payloads") == [(30,)], name
@@ -167,10 +167,10 @@ def test_every_executor_leaves_the_same_rows_and_bytes(tmp_path):
 def fails_on_fives(n: int) -> dict:
     if n % 5 == 0:
         raise RuntimeError("no structure")
-    return ligand(n)
+    return guest(n)
 
 
-@job(task=fails_on_fives, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+@job(task=fails_on_fives, output=table_sink("guests", columns=("n", "structure_payload_id")))
 def some_fail(params, project):
     yield from range(params["n"])
 
@@ -178,16 +178,16 @@ def some_fail(params, project):
 def test_a_task_that_fails_leaves_nothing(project):  # F1
     ended = run(project, some_fail, {"n": 20}, status="completed_with_errors")
     assert ended.chunks_failed == 4
-    assert sorted(n for (n,) in rows(project, "SELECT n FROM ligands")) == [n for n in range(20) if n % 5]
+    assert sorted(n for (n,) in rows(project, "SELECT n FROM guests")) == [n for n in range(20) if n % 5]
     assert_clean(project, 16)
 
 
 @task()
 def no_number_on_fives(n: int) -> dict:
-    return {**ligand(n), "n": None if n % 5 == 0 else n}
+    return {**guest(n), "n": None if n % 5 == 0 else n}
 
 
-@job(task=no_number_on_fives, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+@job(task=no_number_on_fives, output=table_sink("guests", columns=("n", "structure_payload_id")))
 def some_rejected(params, project):
     yield from range(params["n"])
 
@@ -198,12 +198,12 @@ def test_a_write_that_fails_leaves_the_volume_as_it_was_and_no_rows(project):  #
     assert_clean(project, 16)
 
     before = {path.name: path.stat().st_size for path in project.payloads.directory.iterdir()}
-    bad = {"ligands": {"$ref": "l", "n": 1, "structure_payload_id": Payload(b"x" * 1000, series="ligands")},
-           "poses": {"ligand_id": 999_999, "rank": 0, "pose_payload_id": Payload(b"y" * 1000, series="poses")}}
+    bad = {"guests": {"$ref": "l", "n": 1, "structure_payload_id": Payload(b"x" * 1000, series="guests")},
+           "layouts": {"guest_id": 999_999, "rank": 0, "layout_payload_id": Payload(b"y" * 1000, series="layouts")}}
     with pytest.raises(Exception, match="FOREIGN KEY"):  # the second node fails after the first one is in
-        project.persist_output_spec(docking.__job__["output"], bad)
+        project.persist_output_spec(coupling.__job__["output"], bad)
     assert {path.name: path.stat().st_size for path in project.payloads.directory.iterdir()} == before
-    assert_clean(project, 16)  # and the "poses" volume made for this write is gone
+    assert_clean(project, 16)  # and the "layouts" volume made for this write is gone
 
 
 def test_the_bytes_are_synced_before_their_rows_commit(project, monkeypatch):  # F6: the order I1 needs
@@ -216,13 +216,13 @@ def test_the_bytes_are_synced_before_their_rows_commit(project, monkeypatch):  #
     monkeypatch.setattr(payloads, "_datasync", lambda fd: (log.append("sync"), sync(fd)))
     monkeypatch.setattr(payloads, "_fsync_dir", lambda path: (log.append("dir"), sync_dir(path)))
     event.listen(project.engine, "commit", lambda conn: log.append("commit"))
-    run(project, docking, {"n": 30})
+    run(project, coupling, {"n": 30})
 
     groups = "".join(entry[0] for entry in log).split("c")  # each commit and what came before it
     assert log[-1] == "commit" and groups[-1] == ""
-    assert all(group.startswith("ss") for group in groups[:-1])  # the ligands and the poses volume
+    assert all(group.startswith("ss") for group in groups[:-1])  # the guests and the layouts volume
     assert groups[0] == "ssd"  # their files were new: the directory too
-    assert rows(project, "SELECT COUNT(*) FROM poses") == [(60,)]
+    assert rows(project, "SELECT COUNT(*) FROM layouts") == [(60,)]
 
 
 _FULL_DISK = """
@@ -240,11 +240,11 @@ print(json.dumps({"failed": ended.chunks_failed, "error": ended.error}))
 
 
 @task()
-def big_ligand(n: int) -> dict:
-    return {"n": n, "structure_payload_id": Payload(bytes([n]) * 100_000, series="ligands", codec="none")}  # fills the disk
+def big_guest(n: int) -> dict:
+    return {"n": n, "structure_payload_id": Payload(bytes([n]) * 100_000, series="guests", codec="none")}  # fills the disk
 
 
-@job(task=big_ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+@job(task=big_guest, output=table_sink("guests", columns=("n", "structure_payload_id")))
 def big(params, project):
     yield from range(params["n"])
 
@@ -259,27 +259,27 @@ def test_a_full_disk_fails_the_elements_clearly_and_leaves_nothing_half(project)
                          text=True, timeout=120)
     assert out.returncode == 0, out.stderr
     ended = json.loads(out.stdout.splitlines()[-1])
-    written = rows(project, "SELECT COUNT(*) FROM ligands")[0][0]
+    written = rows(project, "SELECT COUNT(*) FROM guests")[0][0]
     assert 0 < written < 40 and ended["failed"] == 40 - written  # a 1 MB file fits ten of them
     assert "cannot write payloads to" in ended["error"] and "File too large" in ended["error"]
     assert_clean(project, written)
     assert all(project.payloads.get(pid) == bytes([n]) * 100_000
-               for n, pid in rows(project, "SELECT n, structure_payload_id FROM ligands"))
+               for n, pid in rows(project, "SELECT n, structure_payload_id FROM guests"))
 
 
 @task()
-def slow_ligand(n: int) -> dict:
+def slow_guest(n: int) -> dict:
     import time
 
     time.sleep(0.05)  # results in many groups, and the 4th past the journal's first write (every 50 ms)
-    return ligand(n)
+    return guest(n)
 
 
-@job(task=slow_ligand, output=table_sink("ligands", columns=("n", "structure_payload_id")))
+@job(task=slow_guest, output=table_sink("guests", columns=("n", "structure_payload_id")))
 def resumable(params, project):
-    """Skips the ligands already stored: the idempotency an app owes a job that may run again (F5)."""
+    """Skips the guests already stored: the idempotency an app owes a job that may run again (F5)."""
     with closing(sqlite3.connect(project.db_path)) as conn:
-        done = {n for (n,) in conn.execute("SELECT n FROM ligands")}
+        done = {n for (n,) in conn.execute("SELECT n FROM guests")}
     yield from (n for n in range(params["n"]) if n not in done)
 
 
@@ -312,7 +312,7 @@ def test_a_writer_killed_anywhere_opens_clean_and_resumes_to_one_payload_per_row
                          timeout=120)
     assert out.returncode == 137, out.stdout + out.stderr
 
-    committed = rows(project, "SELECT COUNT(*) FROM ligands")[0][0]
+    committed = rows(project, "SELECT COUNT(*) FROM guests")[0][0]
     assert 0 < committed < 60
     assert_clean(project, committed)  # the uncommitted tail of the killed writer is cut on open
 
@@ -321,7 +321,7 @@ def test_a_writer_killed_anywhere_opens_clean_and_resumes_to_one_payload_per_row
         engine.register("thread", ThreadExecutor(2))
         again = engine.wait(Flow(engine, project).resume("cut", journal="project"), 60)
         assert again.status == "completed", again.error
-    assert rows(project, "SELECT COUNT(*), COUNT(DISTINCT n) FROM ligands") == [(60, 60)]
+    assert rows(project, "SELECT COUNT(*), COUNT(DISTINCT n) FROM guests") == [(60, 60)]
     assert_clean(project, 60)
-    got = project.payloads.get_many([pid for _, pid in rows(project, "SELECT n, structure_payload_id FROM ligands")])
+    got = project.payloads.get_many([pid for _, pid in rows(project, "SELECT n, structure_payload_id FROM guests")])
     assert sorted(got.values()) == sorted(structure(n) for n in range(60))

@@ -44,15 +44,15 @@ def test_backend_wire_roundtrip_specs():
             meta={
                 "graph": {
                     "nodes": [
-                        {"name": "molecules", "table": "molecules", "columns": ("name", "kind")},
-                        {"name": "ligands", "table": "ligands", "columns": ("molecule_id", "active")},
+                        {"name": "specimens", "table": "specimens", "columns": ("name", "kind")},
+                        {"name": "guests", "table": "guests", "columns": ("specimen_id", "active")},
                     ],
                     "relations": [
                         {
-                            "source_node": "ligands",
-                            "source_ref_field": "molecule_ref",
-                            "target_node": "molecules",
-                            "fk_field": "molecule_id",
+                            "source_node": "guests",
+                            "source_ref_field": "specimen_ref",
+                            "target_node": "specimens",
+                            "fk_field": "specimen_id",
                         },
                     ],
                 },
@@ -71,13 +71,13 @@ def test_backend_wire_roundtrip_specs():
     assert isinstance(restored["out"], FileOutputSpec)
     assert isinstance(restored["graph"], DbOutputSpec)
     assert restored["graph"].mode == "graph"
-    assert restored["graph"].meta["graph"]["nodes"][0]["name"] == "molecules"
-    assert restored["graph"].meta["graph"]["relations"][0]["fk_field"] == "molecule_id"
+    assert restored["graph"].meta["graph"]["nodes"][0]["name"] == "specimens"
+    assert restored["graph"].meta["graph"]["relations"][0]["fk_field"] == "specimen_id"
 
 
 def test_db_input_spec_supports_friendly_aliases_and_roundtrip():
     spec = DbInputSpec(
-        table="molecules",
+        table="specimens",
         fields=("id", "name"),
         filters={"score__gte": 2.5},
         order=("-score", "id"),
@@ -96,7 +96,7 @@ def test_db_input_spec_supports_friendly_aliases_and_roundtrip():
 
 def test_data_bridge_materializes_file_specs(tmp_path):
     sample = tmp_path / "sample.txt"
-    sample.write_text("ligand-001", encoding="utf-8")
+    sample.write_text("guest-001", encoding="utf-8")
     blob = tmp_path / "blob.bin"
     blob.write_bytes(b"\x00\x01")
 
@@ -109,7 +109,7 @@ def test_data_bridge_materializes_file_specs(tmp_path):
     wired = to_wire_value(payload)
 
     materialized = bridge.materialize_payload(wired, DataContext(project_dir=tmp_path))
-    assert materialized["name"] == "ligand-001"
+    assert materialized["name"] == "guest-001"
     assert materialized["blob"] == b"\x00\x01"
     assert materialized["inline"] == {"ok": True}
 
@@ -119,10 +119,10 @@ def test_data_bridge_reads_and_writes_sqlite(tmp_path):
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        cur.execute("CREATE TABLE molecules (id INTEGER PRIMARY KEY, name TEXT)")
+        cur.execute("CREATE TABLE specimens (id INTEGER PRIMARY KEY, name TEXT)")
         cur.execute("CREATE TABLE results (id INTEGER PRIMARY KEY, score REAL)")
-        cur.execute("INSERT INTO molecules (id, name) VALUES (?, ?)", (1, "MolA"))
-        cur.execute("INSERT INTO molecules (id, name) VALUES (?, ?)", (2, "MolB"))
+        cur.execute("INSERT INTO specimens (id, name) VALUES (?, ?)", (1, "MolA"))
+        cur.execute("INSERT INTO specimens (id, name) VALUES (?, ?)", (2, "MolB"))
         conn.commit()
     finally:
         conn.close()
@@ -130,7 +130,7 @@ def test_data_bridge_reads_and_writes_sqlite(tmp_path):
     bridge = DataBridge()
     ctx = DataContext(project_dir=tmp_path)
     rows = bridge.resolve_input(
-        DbInputSpec(table="molecules", columns=("id", "name"), where={"id": 2}, db_role="custom", db_path=str(db_path)),
+        DbInputSpec(table="specimens", columns=("id", "name"), where={"id": 2}, db_role="custom", db_path=str(db_path)),
         ctx,
     )
     assert rows == [{"id": 2, "name": "MolB"}]
@@ -157,10 +157,10 @@ def test_data_bridge_writes_graph_output_with_autoincrement_relations(tmp_path):
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        cur.execute("CREATE TABLE molecules (id INTEGER PRIMARY KEY, name TEXT, kind TEXT)")
-        cur.execute("CREATE TABLE receptors (id INTEGER PRIMARY KEY, molecule_id INTEGER, source TEXT)")
-        cur.execute("CREATE TABLE ligands (id INTEGER PRIMARY KEY, molecule_id INTEGER, active INTEGER)")
-        cur.execute("CREATE TABLE complexes (id INTEGER PRIMARY KEY, receptor_id INTEGER, ligand_id INTEGER, label TEXT)")
+        cur.execute("CREATE TABLE specimens (id INTEGER PRIMARY KEY, name TEXT, kind TEXT)")
+        cur.execute("CREATE TABLE anchors (id INTEGER PRIMARY KEY, specimen_id INTEGER, source TEXT)")
+        cur.execute("CREATE TABLE guests (id INTEGER PRIMARY KEY, specimen_id INTEGER, active INTEGER)")
+        cur.execute("CREATE TABLE complexes (id INTEGER PRIMARY KEY, anchor_id INTEGER, guest_id INTEGER, label TEXT)")
         conn.commit()
     finally:
         conn.close()
@@ -173,78 +173,78 @@ def test_data_bridge_writes_graph_output_with_autoincrement_relations(tmp_path):
         meta={
             "graph": {
                 "nodes": [
-                    {"name": "molecules", "table": "molecules", "columns": ("name", "kind")},
-                    {"name": "receptors", "table": "receptors", "columns": ("molecule_id", "source")},
-                    {"name": "ligands", "table": "ligands", "columns": ("molecule_id", "active")},
-                    {"name": "complexes", "table": "complexes", "columns": ("receptor_id", "ligand_id", "label")},
+                    {"name": "specimens", "table": "specimens", "columns": ("name", "kind")},
+                    {"name": "anchors", "table": "anchors", "columns": ("specimen_id", "source")},
+                    {"name": "guests", "table": "guests", "columns": ("specimen_id", "active")},
+                    {"name": "complexes", "table": "complexes", "columns": ("anchor_id", "guest_id", "label")},
                 ],
                 "relations": [
                     {
-                        "source_node": "receptors",
-                        "source_ref_field": "molecule_ref",
-                        "target_node": "molecules",
-                        "fk_field": "molecule_id",
+                        "source_node": "anchors",
+                        "source_ref_field": "specimen_ref",
+                        "target_node": "specimens",
+                        "fk_field": "specimen_id",
                     },
                     {
-                        "source_node": "ligands",
-                        "source_ref_field": "molecule_ref",
-                        "target_node": "molecules",
-                        "fk_field": "molecule_id",
-                    },
-                    {
-                        "source_node": "complexes",
-                        "source_ref_field": "receptor_ref",
-                        "target_node": "receptors",
-                        "fk_field": "receptor_id",
+                        "source_node": "guests",
+                        "source_ref_field": "specimen_ref",
+                        "target_node": "specimens",
+                        "fk_field": "specimen_id",
                     },
                     {
                         "source_node": "complexes",
-                        "source_ref_field": "ligand_ref",
-                        "target_node": "ligands",
-                        "fk_field": "ligand_id",
+                        "source_ref_field": "anchor_ref",
+                        "target_node": "anchors",
+                        "fk_field": "anchor_id",
+                    },
+                    {
+                        "source_node": "complexes",
+                        "source_ref_field": "guest_ref",
+                        "target_node": "guests",
+                        "fk_field": "guest_id",
                     },
                 ],
             },
         },
     )
     payload = {
-        "molecules": [
-            {"$ref": "mol_rec_1", "name": "rec-a", "kind": "protein"},
-            {"$ref": "mol_lig_1", "name": "lig-a", "kind": "small_molecule"},
+        "specimens": [
+            {"$ref": "spc_rec_1", "name": "rec-a", "kind": "large"},
+            {"$ref": "spc_gst_1", "name": "gst-a", "kind": "small"},
         ],
-        "receptors": [
-            {"$ref": "rec_1", "molecule_ref": "mol_rec_1", "source": "cocrystal"},
+        "anchors": [
+            {"$ref": "rec_1", "specimen_ref": "spc_rec_1", "source": "observed"},
         ],
-        "ligands": [
-            {"$ref": "lig_1", "molecule_ref": "mol_lig_1", "active": 1},
+        "guests": [
+            {"$ref": "gst_1", "specimen_ref": "spc_gst_1", "active": 1},
         ],
         "complexes": [
-            {"$ref": "cx_1", "receptor_ref": "rec_1", "ligand_ref": "lig_1", "label": "ref-complex"},
+            {"$ref": "cx_1", "anchor_ref": "rec_1", "guest_ref": "gst_1", "label": "ref-complex"},
         ],
     }
 
     bridge = DataBridge()
     receipt = bridge.persist_output(graph_spec, payload, DataContext(project_dir=tmp_path))
     assert receipt["rows"] == 5
-    assert receipt["nodes"] == {"molecules": 2, "receptors": 1, "ligands": 1, "complexes": 1}
+    assert receipt["nodes"] == {"specimens": 2, "anchors": 1, "guests": 1, "complexes": 1}
 
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, name, kind FROM molecules ORDER BY id ASC")
-        molecules = cur.fetchall()
-        cur.execute("SELECT id, molecule_id, source FROM receptors ORDER BY id ASC")
-        receptors = cur.fetchall()
-        cur.execute("SELECT id, molecule_id, active FROM ligands ORDER BY id ASC")
-        ligands = cur.fetchall()
-        cur.execute("SELECT id, receptor_id, ligand_id, label FROM complexes ORDER BY id ASC")
+        cur.execute("SELECT id, name, kind FROM specimens ORDER BY id ASC")
+        specimens = cur.fetchall()
+        cur.execute("SELECT id, specimen_id, source FROM anchors ORDER BY id ASC")
+        anchors = cur.fetchall()
+        cur.execute("SELECT id, specimen_id, active FROM guests ORDER BY id ASC")
+        guests = cur.fetchall()
+        cur.execute("SELECT id, anchor_id, guest_id, label FROM complexes ORDER BY id ASC")
         complexes = cur.fetchall()
     finally:
         conn.close()
 
-    assert molecules == [(1, "rec-a", "protein"), (2, "lig-a", "small_molecule")]
-    assert receptors == [(1, 1, "cocrystal")]
-    assert ligands == [(1, 2, 1)]
+    assert specimens == [(1, "rec-a", "large"), (2, "gst-a", "small")]
+    assert anchors == [(1, 1, "observed")]
+    assert guests == [(1, 2, 1)]
     assert complexes == [(1, 1, 1, "ref-complex")]
 
 
@@ -253,11 +253,11 @@ def test_data_bridge_reads_sqlite_with_friendly_filters_order_and_offset(tmp_pat
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        cur.execute("CREATE TABLE molecules (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
-        cur.execute("INSERT INTO molecules (id, name, score) VALUES (1, 'MolA', 1.0)")
-        cur.execute("INSERT INTO molecules (id, name, score) VALUES (2, 'MolB', 2.0)")
-        cur.execute("INSERT INTO molecules (id, name, score) VALUES (3, 'MolC', 3.0)")
-        cur.execute("INSERT INTO molecules (id, name, score) VALUES (4, 'LigD', 4.0)")
+        cur.execute("CREATE TABLE specimens (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
+        cur.execute("INSERT INTO specimens (id, name, score) VALUES (1, 'MolA', 1.0)")
+        cur.execute("INSERT INTO specimens (id, name, score) VALUES (2, 'MolB', 2.0)")
+        cur.execute("INSERT INTO specimens (id, name, score) VALUES (3, 'MolC', 3.0)")
+        cur.execute("INSERT INTO specimens (id, name, score) VALUES (4, 'LigD', 4.0)")
         conn.commit()
     finally:
         conn.close()
@@ -266,7 +266,7 @@ def test_data_bridge_reads_sqlite_with_friendly_filters_order_and_offset(tmp_pat
     ctx = DataContext(project_dir=tmp_path)
     rows = bridge.resolve_input(
         DbInputSpec(
-            table="molecules",
+            table="specimens",
             fields=("id", "name"),
             filters={"name__contains": "M", "score__gte": 2.0},
             order=("-score",),
@@ -281,34 +281,34 @@ def test_data_bridge_reads_sqlite_with_friendly_filters_order_and_offset(tmp_pat
 
 
 def test_data_bridge_transport_planner_stages_remote_without_shared_fs(tmp_path):
-    sample = tmp_path / "ligands.smi"
-    sample.write_text("CCO ligand_1\n", encoding="utf-8")
+    sample = tmp_path / "guests.smi"
+    sample.write_text("CCO guest_1\n", encoding="utf-8")
     bridge = DataBridge()
-    payload = to_wire_value({"ligands": FileInputSpec(str(sample), fmt="text")})
+    payload = to_wire_value({"guests": FileInputSpec(str(sample), fmt="text")})
     profile = ExecutorTransportProfile(backend="ray", mode="external", shared_fs=False)
 
     materialized = bridge.materialize_payload(payload, DataContext(project_dir=tmp_path), executor_profile=profile)
-    transfer = materialized["ligands"]["__molsuite_ray_file_input__"]
+    transfer = materialized["guests"]["__molsuite_ray_file_input__"]
     assert transfer["path"] == str(sample)
     assert transfer["delivery"] == "content"
 
 
 def test_data_bridge_transport_planner_accepts_remote_with_shared_fs(tmp_path):
-    sample = tmp_path / "ligands.smi"
-    sample.write_text("CCO ligand_1\n", encoding="utf-8")
+    sample = tmp_path / "guests.smi"
+    sample.write_text("CCO guest_1\n", encoding="utf-8")
     bridge = DataBridge()
-    payload = to_wire_value({"ligands": FileInputSpec(str(sample), fmt="text")})
+    payload = to_wire_value({"guests": FileInputSpec(str(sample), fmt="text")})
     profile = ExecutorTransportProfile(backend="ray", mode="external", shared_fs=True)
 
     materialized = bridge.materialize_payload(payload, DataContext(project_dir=tmp_path), executor_profile=profile)
-    assert materialized["ligands"] == "CCO ligand_1\n"
+    assert materialized["guests"] == "CCO guest_1\n"
 
 
 def test_data_bridge_hpc_staged_copy_requires_wdir(tmp_path):
-    sample = tmp_path / "ligands.smi"
-    sample.write_text("CCO ligand_1\n", encoding="utf-8")
+    sample = tmp_path / "guests.smi"
+    sample.write_text("CCO guest_1\n", encoding="utf-8")
     bridge = DataBridge()
-    payload = to_wire_value({"ligands": FileInputSpec(str(sample), fmt="text")})
+    payload = to_wire_value({"guests": FileInputSpec(str(sample), fmt="text")})
     profile = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=False)
 
     with pytest.raises(DataContractError):
@@ -316,38 +316,38 @@ def test_data_bridge_hpc_staged_copy_requires_wdir(tmp_path):
 
 
 def test_data_bridge_hpc_staged_copy_returns_remote_path(tmp_path):
-    sample = tmp_path / "ligands.smi"
-    sample.write_text("CCO ligand_1\n", encoding="utf-8")
+    sample = tmp_path / "guests.smi"
+    sample.write_text("CCO guest_1\n", encoding="utf-8")
     hpc_wdir = tmp_path / "hpc_wdir"
     bridge = DataBridge()
-    payload = to_wire_value({"ligands": FileInputSpec(str(sample), fmt="text")})
+    payload = to_wire_value({"guests": FileInputSpec(str(sample), fmt="text")})
     profile = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=False)
     ctx = DataContext(project_dir=tmp_path, extras={"hpc_wdir": str(hpc_wdir), "job_id": "job1", "chunk_id": "c1"})
 
     materialized = bridge.materialize_payload(payload, ctx, executor_profile=profile)
-    staged_path = Path(materialized["ligands"])
+    staged_path = Path(materialized["guests"])
     assert staged_path.exists()
-    assert staged_path.read_text(encoding="utf-8") == "CCO ligand_1\n"
+    assert staged_path.read_text(encoding="utf-8") == "CCO guest_1\n"
 
 
 def test_data_bridge_hpc_output_dir_stays_in_the_working_directory(tmp_path):
-    """Results a cluster job produces are left on the cluster: copying a whole screening run
+    """Results a cluster job produces are left on the cluster: copying a whole sweeping run
     back is the cost the cluster was chosen to avoid. Only selected hits travel, inline."""
     hpc_wdir = tmp_path / "hpc_wdir"
     bridge = DataBridge()
-    payload = to_wire_value({"output_dir": ProjectOutputDirSpec("results/docking/screening")})
+    payload = to_wire_value({"output_dir": ProjectOutputDirSpec("results/coupling/sweeping")})
     profile = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=False)
     ctx = DataContext(project_dir=tmp_path, extras={"hpc_wdir": str(hpc_wdir)})
 
     target = Path(bridge.materialize_payload(payload, ctx, executor_profile=profile)["output_dir"])
-    assert target == hpc_wdir / "outputs" / "results/docking/screening"
+    assert target == hpc_wdir / "outputs" / "results/coupling/sweeping"
     assert target.is_dir()
     assert not (tmp_path / "results").exists()
 
     # A shared filesystem has nothing to avoid: the project tree is already reachable.
     shared = ExecutorTransportProfile(backend="hpc", mode="external", shared_fs=True)
     local = bridge.materialize_payload(payload, ctx, executor_profile=shared)["output_dir"]
-    assert Path(local) == tmp_path / "results/docking/screening"
+    assert Path(local) == tmp_path / "results/coupling/sweeping"
 
 
 def test_data_bridge_transport_planner_allows_bytes_without_shared_fs():
@@ -362,21 +362,21 @@ def test_data_bridge_materializes_db_inputs_before_remote_dispatch(tmp_path):
     db_path = tmp_path / "project.db"
     conn = sqlite3.connect(str(db_path))
     try:
-        conn.execute("CREATE TABLE molecules (id INTEGER PRIMARY KEY, name TEXT)")
-        conn.execute("INSERT INTO molecules (id, name) VALUES (1, 'MolA')")
+        conn.execute("CREATE TABLE specimens (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO specimens (id, name) VALUES (1, 'MolA')")
         conn.commit()
     finally:
         conn.close()
 
     bridge = DataBridge()
     payload = to_wire_value(
-        {"molecules": DbInputSpec(table="molecules", columns=("id", "name"), db_role="custom", db_path=str(db_path))}
+        {"specimens": DbInputSpec(table="specimens", columns=("id", "name"), db_role="custom", db_path=str(db_path))}
     )
     profile = ExecutorTransportProfile(backend="ray", mode="external", shared_fs=False)
 
     materialized = bridge.materialize_payload(payload, DataContext(project_dir=tmp_path), executor_profile=profile)
 
-    assert materialized == {"molecules": [{"id": 1, "name": "MolA"}]}
+    assert materialized == {"specimens": [{"id": 1, "name": "MolA"}]}
 
 
 def test_data_bridge_uses_injected_output_backend_for_non_project_db():
@@ -399,7 +399,7 @@ def test_data_bridge_uses_injected_project_output_persister_without_sqlite_assum
         return {"backend": "project-fake", "rows": 2}
 
     bridge = DataBridge(project_output_persister=_fake_project_persister)
-    spec = DbOutputSpec(table="molecules", columns=("id",), db_role="project")
+    spec = DbOutputSpec(table="specimens", columns=("id",), db_role="project")
 
     receipt = bridge.persist_output(spec, [{"id": 1}, {"id": 2}], DataContext())
 
@@ -409,7 +409,10 @@ def test_data_bridge_uses_injected_project_output_persister_without_sqlite_assum
 
 
 def test_sqlite_backend_project_writes_delegate_to_project_store(tmp_path):
+    from ms_flow.core.database.project_store_ops import _StandaloneProjectSQLiteDB
+
     db_path = tmp_path / "project.db"
+    _StandaloneProjectSQLiteDB(db_path).dispose()  # a project at the current schema, then a table of the app's
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE results (id INTEGER)")

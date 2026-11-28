@@ -1,11 +1,11 @@
 # Payloads
 
-A payload is the bytes of one entity: an SDF, a PDBQT, a pose. Payloads live in
+A payload is the bytes of one entity: an CSV, a TSV, a layout. Payloads live in
 append-only volume files under `volumes/`, next to `project.db`. The `ms_payloads`
 table says where each one is. Your tables keep only an id:
 
 ```sql
-CREATE TABLE ligands (
+CREATE TABLE guests (
     id INTEGER PRIMARY KEY,
     name TEXT,
     structure_payload_id INTEGER REFERENCES ms_payloads(id)
@@ -30,19 +30,19 @@ from ms_flow.sinks import table_sink
 
 @task()
 def prepare(name: str) -> dict:
-    sdf = build_sdf(name)  # your code
-    return {"name": name, "structure_payload_id": Payload(sdf, kind="sdf", series="ligands")}
+    csv = build_csv(name)  # your code
+    return {"name": name, "structure_payload_id": Payload(csv, kind="csv", series="guests")}
 
 
-@job(task=prepare, output=table_sink("ligands", columns=("name", "structure_payload_id")))
-def import_ligands(params, project):
+@job(task=prepare, output=table_sink("guests", columns=("name", "structure_payload_id")))
+def import_guests(params, project):
     yield from params["names"]
 ```
 
 `graph_sink` works the same way, in any node.
 
 - `series` groups payloads with the same lifetime, so they share volumes and
-  compact well together. Use one series per kind of data (`"ligands"`, `"poses"`).
+  compact well together. Use one series per kind of data (`"guests"`, `"layouts"`).
 - `codec` is `"zstd"` (the default), `"zlib"` or `"none"`. Use `"none"` for
   data that is already compressed.
 - The payload is compressed when it is pickled, so the compression happens in
@@ -54,11 +54,11 @@ leaves a row that points to missing bytes.
 ## Compression dictionaries
 
 A zstd dictionary trained on a series compresses small records much better:
-5.9× against 4.3× without it on real SDF records. It is also faster. Train one
+5.9× against 4.3× without it on real CSV records. It is also faster. Train one
 when a series has enough payloads (10 000 are sampled across the whole series):
 
 ```python
-project.payloads.train_dictionary("ligands")
+project.payloads.train_dictionary("guests")
 ```
 
 A job hands the dictionary to its tasks as a `File`. Executors without the
@@ -67,14 +67,14 @@ project's disk carry it once per job:
 ```python
 @task()
 def prepare(element: dict) -> dict:
-    sdf = build_sdf(element["name"])
+    csv = build_csv(element["name"])
     return {"name": element["name"], "structure_payload_id":
-            Payload(sdf, series="ligands", dictionary=element["dictionary"])}
+            Payload(csv, series="guests", dictionary=element["dictionary"])}
 
 
-@job(task=prepare, output=table_sink("ligands", columns=("name", "structure_payload_id")))
-def import_ligands(params, project):
-    dictionary = project.payloads.dictionary("ligands")  # None until one is trained
+@job(task=prepare, output=table_sink("guests", columns=("name", "structure_payload_id")))
+def import_guests(params, project):
+    dictionary = project.payloads.dictionary("guests")  # None until one is trained
     return [{"name": name, "dictionary": dictionary} for name in params["names"]]
 ```
 
@@ -101,9 +101,9 @@ from ms_flow.payloads import with_payloads
 from ms_flow.query import QuerySpec, Rows
 
 
-@job(task=dock, output=...)
-def docking(params, project):
-    rows = Rows(project, QuerySpec(table="ligands"))
+@job(task=couple, output=...)
+def coupling(params, project):
+    rows = Rows(project, QuerySpec(table="guests"))
     return with_payloads(project, rows, {"structure_payload_id": "structure"})
 ```
 
@@ -111,7 +111,7 @@ Rows are read 500 at a time in disk order, so memory stays bounded however big
 the table is. A program that only reads paths gets a file in two ways:
 
 - `store.materialize(payload_id, directory, suffix)` writes the payload once
-  and returns it as a `File`. Use it for a receptor shared by every task.
+  and returns it as a `File`. Use it for a anchor shared by every task.
 - `scratch_file(data, suffix)` is a context manager. It gives a temporary file
   (in `/dev/shm` when it has room) and deletes it on leaving.
 
@@ -124,7 +124,7 @@ Delete your rows, then release the payload ids they held:
 ```python
 with sqlite3.connect(project.db_path) as conn:
     ids = [r[0] for r in conn.execute(
-        "DELETE FROM ligands WHERE name LIKE 'tmp%' RETURNING structure_payload_id")]
+        "DELETE FROM guests WHERE name LIKE 'tmp%' RETURNING structure_payload_id")]
 project.payloads.release(ids)
 ```
 
@@ -137,7 +137,7 @@ once, without copying anything.
 | Call | What it does |
 |---|---|
 | `check(full=False)` | Returns a `Report`: missing volumes, references past a file's end, unreferenced payloads, empty volumes, dead share per volume, missing dictionaries, orphan files. `full=True` also reads and verifies every payload. `report.ok` means every referenced payload is readable; `report.clean` also means there is nothing to clean up. |
-| `compact(min_dead=0.5, order_by=None)` | Copies the live payloads of sealed volumes that are at least half dead (or small) into new volumes, then deletes the old ones. Ids do not change. `order_by` is SQL that returns payload ids in the order you want them next to each other on disk (`SELECT structure_payload_id FROM ligands ORDER BY score`). |
+| `compact(min_dead=0.5, order_by=None)` | Copies the live payloads of sealed volumes that are at least half dead (or small) into new volumes, then deletes the old ones. Ids do not change. `order_by` is SQL that returns payload ids in the order you want them next to each other on disk (`SELECT structure_payload_id FROM guests ORDER BY score`). |
 | `repair()` | Clears what crashes leave behind: unreferenced payloads, orphan volume files, empty volumes. Never deletes a referenced payload. Returns a new `check()`. |
 
 Compaction can run while other processes read. A reader whose volume
@@ -153,7 +153,7 @@ flow.submit(compaction())
 The compaction job waits for jobs writing payloads to finish, and jobs reading
 payloads wait for it.
 
-On a 100 000-molecule project (225 MB stored), a cold `check(full=True)` takes
+On a 100 000-specimen project (225 MB stored), a cold `check(full=True)` takes
 4.3 s. Compaction copies live data at about 34 MB/s, limited by the disk.
 
 ## Reference

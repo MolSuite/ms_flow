@@ -72,16 +72,16 @@ def _rows(project, sql, params=()):
 
 def test_put_writes_volume_header_and_needles(project):
     store = PayloadStore(project)
-    ids = _put(store, project, [Payload(b"abc", kind="sdf", series="ligands"), Payload(b"", series="ligands")])
+    ids = _put(store, project, [Payload(b"abc", kind="csv", series="guests"), Payload(b"", series="guests")])
     store.close()
     (vid, off, length, crc, kind), second = _rows(
         project, 'SELECT volume_id, "offset", length, crc32, kind FROM ms_payloads ORDER BY id'
     )
     raw = store.path(vid).read_bytes()
     magic, version, _, header_vid, series = struct.unpack_from("<5sBHQ16s", raw)
-    assert (magic, version, header_vid, series.rstrip(b"\0")) == (b"MSVOL", 1, vid, b"ligands")
+    assert (magic, version, header_vid, series.rstrip(b"\0")) == (b"MSVOL", 1, vid, b"guests")
     assert struct.unpack_from("<IIIHH", raw, off) == (zlib.crc32(b"abc"), 3, 3, 0, 0)
-    assert raw[off + 16 : off + 16 + length] == b"abc" and crc == zlib.crc32(b"abc") and kind == "sdf"
+    assert raw[off + 16 : off + 16 + length] == b"abc" and crc == zlib.crc32(b"abc") and kind == "csv"
     assert second[1] == off + 16 + 3 and second[2] == 0  # a 0-byte payload is a bare needle
     assert len(raw) == second[1] + 16
     assert _rows(project, "SELECT state, size FROM ms_volumes") == [("active", len(raw))]
@@ -104,10 +104,10 @@ def test_volume_switches_at_size_and_large_payload_goes_alone(project, monkeypat
 
 def test_one_active_volume_per_series(project):
     store = PayloadStore(project)
-    _put(store, project, [Payload(b"a", series="ligands"), Payload(b"b", series="poses"), Payload(b"c", series="ligands")])
+    _put(store, project, [Payload(b"a", series="guests"), Payload(b"b", series="layouts"), Payload(b"c", series="guests")])
     store.close()
     assert _rows(project, "SELECT volume_id FROM ms_payloads ORDER BY id") == [(1,), (2,), (1,)]
-    assert _rows(project, "SELECT series FROM ms_volumes ORDER BY id") == [("ligands",), ("poses",)]
+    assert _rows(project, "SELECT series FROM ms_volumes ORDER BY id") == [("guests",), ("layouts",)]
 
 
 def test_volume_file_left_by_a_dead_transaction_is_never_reused(project):
@@ -363,10 +363,10 @@ def test_two_writing_processes_and_a_reader_see_only_committed_bytes(project):
 
 def test_referencing_columns_come_from_the_app_schema(project):
     conn = _app_table(project.db_path)
-    conn.execute("CREATE TABLE poses (id INTEGER PRIMARY KEY, pose_payload_id INTEGER REFERENCES ms_payloads(id), n INTEGER)")
+    conn.execute("CREATE TABLE layouts (id INTEGER PRIMARY KEY, layout_payload_id INTEGER REFERENCES ms_payloads(id), n INTEGER)")
     conn.close()
     store = PayloadStore(project)
-    assert sorted(store.referencing_columns()) == [("app_items", "structure_payload_id"), ("poses", "pose_payload_id")]
+    assert sorted(store.referencing_columns()) == [("app_items", "structure_payload_id"), ("layouts", "layout_payload_id")]
     store.close()
 
 
@@ -378,7 +378,7 @@ import sys
 
 
 def test_payload_pickles_its_bytes_once_and_loads_without_sql():
-    item = Payload(os.urandom(100_000), kind="sdf", series="ligands")
+    item = Payload(os.urandom(100_000), kind="csv", series="guests")
     blob = pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
     assert pickle.loads(blob) == item.packed()
     assert len(blob) - len(item.data) < 200  # the bytes once, plus the class and two names

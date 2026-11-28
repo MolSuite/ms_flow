@@ -38,7 +38,39 @@ class _Collect:
 
 
 @campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
-def screen(params, project):
+def sweep(params, project):
     said = Path(os.environ["CAMPAIGN_FILE"])
     return [Stage("vs", square, [{"n": n, "f": File(said), "out": Dir(said.parent / "work"), "_cpu_required": 1}
                                  for n in range(params.n)])]
+
+
+@task()
+def leave_part(element):
+    """A task that leaves a part of one shard of 4 records in the folder of its key (one of ten)."""
+    import uuid
+
+    import pyarrow as pa
+
+    from ms_flow.core.data.shard import write_table
+
+    time.sleep(element["nap"])
+    n = element["n"]
+    parts = Path(element["out"], f"k{n // 10}", "parts")
+    parts.mkdir(parents=True, exist_ok=True)
+    path = parts / f"{n}-{uuid.uuid4().hex[:8]}.arrows"
+    write_table(path, pa.table({"x": list(range(4 * n, 4 * n + 4))}), base_id=4 * n)
+    return {"n": n, "part": str(path), "host": os.uname().nodename}
+
+
+def receipts(result):
+    """What `leave_part` left, as the receipt committed there into its key's container."""
+    folder = Path(result["part"]).parent.parent
+    return [{"part": f"p:{result['n']}", "path": result["part"], "role": folder.name, "generation_id": None,
+             "folder": str(folder)}]
+
+
+@campaign(params_model=Params, output=lambda params, project: _Collect(), volatile=("run_id",))
+def committing(params, project):
+    said = Path(os.environ["CAMPAIGN_FILE"])
+    return [Stage("vs", leave_part, [{"n": n, "nap": params.nap, "out": Dir(said.parent / "made"), "_cpu_required": 1}
+                                     for n in range(params.n)], commit=receipts)]

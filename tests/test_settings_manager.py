@@ -166,41 +166,41 @@ def test_app_setting_defaults_and_project_overrides_are_persisted(tmp_path, monk
         value_type="integer",
         minimum=1,
     )
-    sm.register_app_settings("testdock", (spec,))
+    sm.register_app_settings("testcouple", (spec,))
 
-    assert sm.get_app_setting("testdock", "preview_limit") == 50
-    assert sm.app_setting_specs("testdock") == (spec,)
+    assert sm.get_app_setting("testcouple", "preview_limit") == 50
+    assert sm.app_setting_specs("testcouple") == (spec,)
 
     project_dir = fake_home / "project-with-app-setting"
     project_dir.mkdir(parents=True)
     sm.set_project(project_dir)
-    sm.update_app_setting("testdock", "preview_limit", 75)
+    sm.update_app_setting("testcouple", "preview_limit", 75)
 
-    assert sm.get_app_setting("testdock", "preview_limit") == 75
+    assert sm.get_app_setting("testcouple", "preview_limit") == 75
     saved = toml.load(project_dir / "config.toml")
-    assert saved["applications"]["testdock"]["preview_limit"] == 75
+    assert saved["applications"]["testcouple"]["preview_limit"] == 75
 
     sm.clear_project()
-    assert sm.get_app_setting("testdock", "preview_limit") == 50
+    assert sm.get_app_setting("testcouple", "preview_limit") == 50
 
 
 def test_app_setting_rejects_invalid_values_without_persisting_them(tmp_path, monkeypatch):
     sm, _ = _build_manager(tmp_path, monkeypatch)
     sm.register_app_settings(
-        "testdock",
+        "testcouple",
         (AppSettingSpec(key="preview_limit", default=50, value_type="integer", minimum=1),),
     )
 
     try:
-        sm.update_app_setting("testdock", "preview_limit", 0)
+        sm.update_app_setting("testcouple", "preview_limit", 0)
     except ValueError as exc:
         assert "must be >= 1" in str(exc)
     else:
         raise AssertionError("Expected invalid app setting value to be rejected.")
 
-    assert sm.get_app_setting("testdock", "preview_limit") == 50
+    assert sm.get_app_setting("testcouple", "preview_limit") == 50
     saved = toml.load(sm.global_path)
-    assert saved.get("applications", {}).get("testdock", {}).get("preview_limit") is None
+    assert saved.get("applications", {}).get("testcouple", {}).get("preview_limit") is None
 
 
 def test_empty_legacy_contract_removes_historical_values(tmp_path, monkeypatch):
@@ -209,12 +209,12 @@ def test_empty_legacy_contract_removes_historical_values(tmp_path, monkeypatch):
     config_path = fake_home / ".molsuite" / "config.toml"
     config_path.parent.mkdir(parents=True)
     with config_path.open("w", encoding="utf-8") as handle:
-        toml.dump({"applications": {"testdock": {"preview_limit": 60}}}, handle)
+        toml.dump({"applications": {"testcouple": {"preview_limit": 60}}}, handle)
 
     sm = SettingsManager()
-    assert sm.register_app_settings("testdock", ()) == ()
-    assert "testdock" not in sm.settings.applications
-    assert "testdock" not in toml.load(config_path).get("applications", {})
+    assert sm.register_app_settings("testcouple", ()) == ()
+    assert "testcouple" not in sm.settings.applications
+    assert "testcouple" not in toml.load(config_path).get("applications", {})
 
 
 def test_legacy_keys_are_migrated_and_rewritten(tmp_path, monkeypatch, caplog):

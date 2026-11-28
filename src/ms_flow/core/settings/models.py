@@ -125,6 +125,9 @@ class ExecutorConfig(BaseModel):
     elements_per_job: int = _asked(0, "how many elements go in each job of the queue. 0 is all of them.", ge=0)
     max_jobs: int = _asked(0, "how many jobs it has in the queue at once. 0 is any number.", ge=0)
     poll_seconds: float = _asked(30, "how often the queue is asked.", gt=0)
+    bring_while_running: bool = _asked(True, "what a campaign's steps keep there is brought here every time the "
+                                             "queue is asked, as far as it is made. Off: it stays there until "
+                                             "brought by hand.", title="Bring results while it runs")
     shared_disk: Optional[bool] = _of(
         "queue", None, "whether the other side sees the disk of this machine. Unset: only on `local`.")
     # How the tasks of a job that names a `batch` grow (`loky`, `ray`); see `Engine.submit(autobatch=)`.

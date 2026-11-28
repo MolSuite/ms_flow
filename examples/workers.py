@@ -20,8 +20,8 @@ class Result(SQLModel, table=True):
     double_value: int
 
 
-class Molecule(SQLModel, table=True):
-    __tablename__ = "molecules"
+class Specimen(SQLModel, table=True):
+    __tablename__ = "specimens"
     id: int | None = Field(default=None, primary_key=True)
     name: str
     status: str
@@ -30,7 +30,7 @@ class Molecule(SQLModel, table=True):
 class Label(SQLModel, table=True):
     __tablename__ = "labels"
     id: int | None = Field(default=None, primary_key=True)
-    molecule_id: int
+    specimen_id: int
     label: str
 
 
@@ -45,10 +45,10 @@ def double_values(params, project):
 
 
 @task()
-def label_molecule(molecule: dict) -> dict:
-    return {"molecule_id": molecule["id"], "label": molecule["name"].upper()}
+def label_specimen(specimen: dict) -> dict:
+    return {"specimen_id": specimen["id"], "label": specimen["name"].upper()}
 
 
-@job(task=label_molecule, output=table_sink("labels", columns=("molecule_id", "label")))
-def label_ready_molecules(params, project):
-    return Rows(project, QuerySpec(table="molecules", fields=("id", "name"), filters={"status": "ready"}))
+@job(task=label_specimen, output=table_sink("labels", columns=("specimen_id", "label")))
+def label_ready_specimens(params, project):
+    return Rows(project, QuerySpec(table="specimens", fields=("id", "name"), filters={"status": "ready"}))

@@ -31,7 +31,7 @@ def test_project_logging_writes_to_project_log_file(tmp_path):
     manager.start()
     manager.set_project_logging(project_dir)
 
-    project_logger = manager.get_project_logger("dock")
+    project_logger = manager.get_project_logger("couple")
     project_logger.info("project-message-001")
     manager.stop()
 
@@ -104,7 +104,7 @@ def test_channel_level_configuration_is_respected(tmp_path):
 
 def test_logging_manager_supports_custom_root_namespace(tmp_path):
     log_dir = tmp_path / "logs"
-    manager = LoggingManager(global_log_dir=log_dir, root_namespace="amdockvs")
+    manager = LoggingManager(global_log_dir=log_dir, root_namespace="demoapp")
     manager.start()
 
     app_logger = manager.get_app_logger("ui")
@@ -112,7 +112,7 @@ def test_logging_manager_supports_custom_root_namespace(tmp_path):
     manager.stop()
 
     app_log_text = (log_dir / "app.log").read_text()
-    assert "amdockvs.app.ui" in app_log_text
+    assert "demoapp.app.ui" in app_log_text
     assert "host-aware-message" in app_log_text
 
 
