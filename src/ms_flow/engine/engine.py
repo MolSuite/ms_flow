@@ -1040,6 +1040,8 @@ class Engine:
                 job.done += 1
                 job.states[n] = DONE_CHUNK
                 job.journal.chunk_finished(job, key, attempt, None)
+                if job.id in self._ended:  # announced already: what `status` says counts it too
+                    self._ended[job.id] = job.snapshot()
             return
         job.open -= 1
         job.states[n] = DONE_CHUNK if error is None else FAILED_CHUNK
